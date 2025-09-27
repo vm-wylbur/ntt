@@ -80,7 +80,7 @@ echo "[$(date -Iseconds)] Running PostgreSQL COPY command..." >&2
 
 # Use temporary file to capture both output and exit code
 TEMP_OUTPUT="/tmp/ntt-copy-output-$$"
-if sed -e 's/\r/\\r/g' -e 's/\n/\\n/g' -e 's/\x00/\n/g' < "$FILE" | \
+if perl -pe 'BEGIN{$/=\1} s/\\/\\\\/g; s/\r/\\r/g; s/\n/\\n/g; s/\0/\n/g' < "$FILE" | \
     sudo -u "${SUDO_USER:-$USER}" psql "$DB_URL" -c "
 COPY $TEMP_TABLE(mode,dev,ino,nlink,size,mtime,path)
 FROM STDIN
