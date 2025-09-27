@@ -55,7 +55,7 @@ chmod 644 "$OUT" 2>/dev/null || true
 
 ROWS=$(cat /tmp/ntt-count-$$ && rm -f /tmp/ntt-count-$$)
 log enum_complete "{\"rows\": $ROWS, \"out\": \"$OUT\"}"
-echo "✓ Enumeration complete: $ROWS records written to $(basename "$OUT")" >&2
+echo "[$(date -Iseconds)] ✓ Enumeration complete: $ROWS records written to $(basename "$OUT")" >&2
 log done "{\"rows\": $ROWS, \"exit\": 0}"
 
 # Make log file world readable

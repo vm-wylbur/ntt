@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Author: PB and Claude and Kimi
+# Author: PB, Claude, Kimi
 # Date: 2025-09-26
 # License: (c) HRDAG, 2025, GPL-2 or newer
 #
@@ -194,7 +194,7 @@ run_loader() {
   local raw="$2"
 
   log loader_spawn "{\"raw\": \"$raw\"}"
-  ntt-loader "$medium_hash" "$raw"
+  ntt-loader "$raw" "$medium_hash"
 }
 
 run_copy_workers() {
@@ -301,7 +301,7 @@ handle_load_only_mode() {
     fail "Invalid filename format: expected hash.raw, got $filename"
   fi
 
-  echo "Loading raw file: $raw_file (medium_hash: $medium_hash)" >&2
+  echo "[$(date -Iseconds)] Loading raw file: $raw_file (medium_hash: $medium_hash)" >&2
   log load_only_start "{\"raw_file\": \"$raw_file\", \"medium_hash\": \"$medium_hash\"}"
 
   # Run loader directly (no enum, no copy workers)
@@ -319,9 +319,9 @@ Usage:
   sudo $0 --load-only /path/to/file.raw              # Load .raw into database
 
 Current implementation status:
+  ❌ TODO: Device imaging, mounting, health checks
   ✅ WORKING: Directory enumeration → .raw files → PostgreSQL loading
   ✅ WORKING: .raw file loading into database
-  ❌ TODO: Device imaging, mounting, health checks
   ❌ TODO: Copy workers (file copying/deduplication)
 
 Modes:

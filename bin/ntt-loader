@@ -74,19 +74,28 @@ EXPECTED_RECORDS=$(jq -rs --arg file "$FILE" '
 ' "$ENUM_LOG")
 echo "[$(date -Iseconds)] Expecting $EXPECTED_RECORDS records (from enum log)..." >&2
 
-# Ultra-safe CRLF check using Perl (more reliable than grep)
-if perl -n0777 -e 'exit 1 if /\r\n/' "$FILE"; then
-  echo "[$(date -Iseconds)] ✓ No CRLF sequences found in raw file" >&2
-else
-  fail "Raw file contains CRLF sequences - cannot use CRLF as record delimiter"
-fi
+# Escape literal CR/LF in data, then convert null to LF for PostgreSQL
+echo "[$(date -Iseconds)] Starting data conversion (escape CR/LF, null → LF)..." >&2
+echo "[$(date -Iseconds)] Running PostgreSQL COPY command..." >&2
 
-# Convert null to CRLF - less likely to appear in filenames than single LF
-COPY_RESULT=$(sed 's/\x00/\r\n/g' < "$FILE" | sudo -u "${SUDO_USER:-$USER}" psql "$DB_URL" -c "
+# Use temporary file to capture both output and exit code
+TEMP_OUTPUT="/tmp/ntt-copy-output-$$"
+if sed -e 's/\r/\\r/g' -e 's/\n/\\n/g' -e 's/\x00/\n/g' < "$FILE" | \
+    sudo -u "${SUDO_USER:-$USER}" psql "$DB_URL" -c "
 COPY $TEMP_TABLE(mode,dev,ino,nlink,size,mtime,path)
 FROM STDIN
 WITH (FORMAT text, DELIMITER E'\\034', NULL '');
-" 2>&1) || fail "Failed to load raw data into temp table"
+" > "$TEMP_OUTPUT" 2>&1; then
+  echo "[$(date -Iseconds)] PostgreSQL COPY command completed" >&2
+  COPY_RESULT=$(cat "$TEMP_OUTPUT")
+else
+  echo "[$(date -Iseconds)] PostgreSQL COPY command failed" >&2
+  echo "PostgreSQL COPY error:" >&2
+  cat "$TEMP_OUTPUT" >&2
+  rm -f "$TEMP_OUTPUT"
+  fail "Failed to load raw data into temp table"
+fi
+rm -f "$TEMP_OUTPUT"
 
 # Extract actual imported count from PostgreSQL output
 ACTUAL_RECORDS=$(echo "$COPY_RESULT" | grep "COPY" | grep -o '[0-9]*' | tail -1)
