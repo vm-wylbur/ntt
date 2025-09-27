@@ -74,8 +74,12 @@ EXPECTED_RECORDS=$(jq -rs --arg file "$FILE" '
 ' "$ENUM_LOG")
 echo "[$(date -Iseconds)] Expecting $EXPECTED_RECORDS records (from enum log)..." >&2
 
-
-
+# Ultra-safe CRLF check using Perl (more reliable than grep)
+if perl -n0777 -e 'exit 1 if /\r\n/' "$FILE"; then
+  echo "[$(date -Iseconds)] ✓ No CRLF sequences found in raw file" >&2
+else
+  fail "Raw file contains CRLF sequences - cannot use CRLF as record delimiter"
+fi
 
 # Convert null to CRLF - less likely to appear in filenames than single LF
 COPY_RESULT=$(sed 's/\x00/\r\n/g' < "$FILE" | sudo -u "${SUDO_USER:-$USER}" psql "$DB_URL" -c "

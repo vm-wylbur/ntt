@@ -201,11 +201,11 @@ run_copy_workers() {
   local medium_hash="$1"
   local workers="${2:-8}"
 
-  log copy_spawn "{\"workers\": $workers}"
-  for ((w=1; w<=workers; w++)); do
-    ntt-copy-worker --id "$w" --medium-hash "$medium_hash" &
-  done
-  wait
+  echo "[$(date -Iseconds)] Copy workers not implemented yet - skipping file copying" >&2
+  log copy_spawn "{\"workers\": 0, \"status\": \"not_implemented\", \"msg\": \"ntt-copy-worker not yet implemented\"}"
+
+  # TODO: Implement ntt-copy-worker for actual file copying/deduplication
+  # This would copy files from source to destination with hash-based deduplication
 }
 
 cleanup_image() {
@@ -314,19 +314,25 @@ handle_load_only_mode() {
 usage() {
   cat <<EOF
 Usage:
-  sudo $0 /dev/sdX [--image-first] [--force] [--enum-only]
-  sudo $0 /path/to/directory [--force] [--enum-only]
-  sudo $0 --load-only /path/to/file.raw
+  sudo $0 /dev/sdX [--enum-only] [--force]           # Device enumeration (PARTIAL)
+  sudo $0 /path/to/directory [--enum-only] [--force] # Directory enumeration
+  sudo $0 --load-only /path/to/file.raw              # Load .raw into database
 
-Auto-detects mode based on target:
-  /dev/*    Process as block device
-  other     Process as directory path
+Current implementation status:
+  ✅ WORKING: Directory enumeration → .raw files → PostgreSQL loading
+  ✅ WORKING: .raw file loading into database
+  ❌ TODO: Device imaging, mounting, health checks
+  ❌ TODO: Copy workers (file copying/deduplication)
+
+Modes:
+  /path/to/dir   Enumerate directory, optionally load to database
+  /dev/sdX       Enumerate device (basic - no imaging/mounting yet)
+  --load-only    Load existing .raw file into PostgreSQL
 
 Options:
-  --image-first  Force imaging before enumeration (device mode only)
+  --enum-only    Stop after enumeration (.raw file creation)
   --force        Bypass duplicate checking
-  --enum-only    Only run enumeration, skip loader and copy workers
-  --load-only    Load existing .raw file into database
+  --load-only    Load mode: process existing .raw file
 EOF
   exit 1
 }
