@@ -44,8 +44,8 @@ fi
 # ---------- enumerate ----------
 log start "{\"mnt\": \"$MNT\", \"medium_hash\": \"$MEDIUM_HASH\", \"out\": \"$OUT\"}"
 
-# %m fs-type, %D dev, %i ino, %n nlink, %s size, %T@ mtime-epoch, %p path
-find "$MNT" -xdev -printf '%m\034%D\034%i\034%n\034%s\034%T@\034%p\0' \
+# %m fs-type, %D dev, %i ino, %n nlink, %s size, %Ts mtime-epoch-seconds, %p path
+find "$MNT" -xdev -printf '%m\034%D\034%i\034%n\034%s\034%Ts\034%p\0' \
 | tee >(tr -cd '\0' | wc -c > /tmp/ntt-count-$$) \
 | pv -0 -l -f \
 > "$OUT"

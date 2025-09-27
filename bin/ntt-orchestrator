@@ -18,6 +18,14 @@ if [[ $EUID -ne 0 ]]; then
    exit 1
 fi
 
+# ---------- source config ----------
+if [[ -f ~/.config/ntt/ntt.env ]]; then
+  source ~/.config/ntt/ntt.env
+else
+  # Fallback: use original user when running under sudo
+  export PGUSER="${SUDO_USER:-$USER}"
+fi
+
 # ---------- config ----------
 DB_URL="${NTT_DB_URL:-postgres:///copyjob}"
 IMAGE_ROOT="${NTT_IMAGE_ROOT:-/data/fast/images}"
@@ -275,12 +283,40 @@ handle_directory_mode() {
   fi
 }
 
+# ---------- load-only mode handler ----------
+handle_load_only_mode() {
+  local raw_file="$1"
+
+  # Check if raw file exists
+  if [[ ! -f "$raw_file" ]]; then
+    fail "Raw file not found: $raw_file"
+  fi
+
+  # Extract medium_hash from filename (remove path and .raw extension)
+  local filename=$(basename "$raw_file")
+  local medium_hash="${filename%.raw}"
+
+  # Validate it looks like a hash
+  if [[ ! "$medium_hash" =~ ^[a-f0-9]{16,64}$ ]]; then
+    fail "Invalid filename format: expected hash.raw, got $filename"
+  fi
+
+  echo "Loading raw file: $raw_file (medium_hash: $medium_hash)" >&2
+  log load_only_start "{\"raw_file\": \"$raw_file\", \"medium_hash\": \"$medium_hash\"}"
+
+  # Run loader directly (no enum, no copy workers)
+  ntt-loader "$raw_file" "$medium_hash"
+
+  log load_only_done "{\"medium_hash\": \"$medium_hash\", \"exit\": 0}"
+}
+
 # ---------- argparse ----------
 usage() {
   cat <<EOF
 Usage:
   sudo $0 /dev/sdX [--image-first] [--force] [--enum-only]
   sudo $0 /path/to/directory [--force] [--enum-only]
+  sudo $0 --load-only /path/to/file.raw
 
 Auto-detects mode based on target:
   /dev/*    Process as block device
@@ -290,32 +326,43 @@ Options:
   --image-first  Force imaging before enumeration (device mode only)
   --force        Bypass duplicate checking
   --enum-only    Only run enumeration, skip loader and copy workers
+  --load-only    Load existing .raw file into database
 EOF
   exit 1
 }
 
 # Parse arguments
 [[ $# -ge 1 ]] || usage
-TARGET="$1"
-shift
 
-# Parse flags
-IMAGE_FIRST=false
-FORCE=false
-ENUM_ONLY=false
+# Check for --load-only mode first
+if [[ "$1" == "--load-only" ]]; then
+  [[ $# -eq 2 ]] || usage
+  LOAD_ONLY_MODE=true
+  LOAD_ONLY_FILE="$2"
+else
+  LOAD_ONLY_MODE=false
+  TARGET="$1"
+  shift
 
-for arg in "$@"; do
-  case $arg in
-    --image-first) IMAGE_FIRST=true ;;
-    --force)       FORCE=true ;;
-    --enum-only)   ENUM_ONLY=true ;;
-    *) usage ;;
-  esac
-done
+  # Parse flags
+  IMAGE_FIRST=false
+  FORCE=false
+  ENUM_ONLY=false
+
+  for arg in "$@"; do
+    case $arg in
+      --image-first) IMAGE_FIRST=true ;;
+      --force)       FORCE=true ;;
+      --enum-only)   ENUM_ONLY=true ;;
+      *) usage ;;
+    esac
+  done
+fi
 
 # ---------- main ----------
-# Auto-detect mode based on target path
-if [[ "$TARGET" == /dev/* ]]; then
+if [[ "$LOAD_ONLY_MODE" == "true" ]]; then
+  handle_load_only_mode "$LOAD_ONLY_FILE"
+elif [[ "$TARGET" == /dev/* ]]; then
   handle_device_mode "$TARGET" "$IMAGE_FIRST" "$FORCE" "$ENUM_ONLY"
 else
   handle_directory_mode "$TARGET" "$FORCE" "$ENUM_ONLY"

@@ -13,6 +13,7 @@ FILE=${1:?file.raw required}
 MEDIUM_HASH=${2:?medium_hash required}
 DB_URL=${NTT_DB_URL:-postgres:///copyjob}
 LOG_JSON=${NTT_LOADER_LOG:-/var/log/ntt/loader.jsonl}
+ENUM_LOG=${NTT_ENUM_LOG:-/var/log/ntt/enum.jsonl}
 
 mkdir -p "$(dirname "$LOG_JSON")"
 chmod 755 "$(dirname "$LOG_JSON")" 2>/dev/null || true
@@ -33,60 +34,108 @@ fail() {
   exit 1
 }
 
-# ---------- 1. streaming COPY into temp table ----------
-echo "Creating temp table..." >&2
+# ---------- 1. create working table ----------
+TABLE_NAME="tmp_path_$$"
+echo "[$(date -Iseconds)] Creating working table..." >&2
 log start "{\"file\": \"$FILE\", \"medium_hash\": \"$MEDIUM_HASH\"}"
 
-psql "$DB_URL" -c "
-CREATE TEMP TABLE tmp_path (
-  medium_hash text,
+# Create temp table that matches raw file format
+TEMP_TABLE="raw_$$"
+sudo -u "${SUDO_USER:-$USER}" psql "$DB_URL" -c "
+CREATE TABLE $TEMP_TABLE (
+  mode        text,
   dev         bigint,
   ino         bigint,
   nlink       int,
   size        bigint,
   mtime       bigint,
   path        text
-) ON COMMIT DROP;
-" || fail "Failed to create temp table"
+);
 
-# ---------- 2. raw → temp (034 delimiter) ----------
-echo "Loading raw data into temp table..." >&2
+CREATE TABLE $TABLE_NAME (
+  medium_hash text,
+  dev         bigint,
+  ino         bigint,
+  nlink       int,
+  size        bigint,
+  mtime       numeric,
+  path        text
+);
+" || fail "Failed to create working tables"
+
+# ---------- 2. raw → working table (034 delimiter) ----------
+echo "[$(date -Iseconds)] Loading raw data into working table..." >&2
 log load_start "{\"file\": \"$FILE\"}"
 
-psql "$DB_URL" -c "
-COPY tmp_path(medium_hash,dev,ino,nlink,size,mtime,path)
+# Get expected record count from enum log instead of re-counting
+EXPECTED_RECORDS=$(jq -rs --arg file "$FILE" '
+  map(select(.stage == "enum_complete" and .out == $file)) |
+  sort_by(.ts) | last | .rows // "unknown"
+' "$ENUM_LOG")
+echo "[$(date -Iseconds)] Expecting $EXPECTED_RECORDS records (from enum log)..." >&2
+
+
+
+
+# Convert null to CRLF - less likely to appear in filenames than single LF
+COPY_RESULT=$(sed 's/\x00/\r\n/g' < "$FILE" | sudo -u "${SUDO_USER:-$USER}" psql "$DB_URL" -c "
+COPY $TEMP_TABLE(mode,dev,ino,nlink,size,mtime,path)
 FROM STDIN
-WITH (FORMAT text, DELIMITER E'\\x1C', NULL '');
-" < "$FILE" || fail "Failed to load raw data into temp table"
+WITH (FORMAT text, DELIMITER E'\\034', NULL '');
+" 2>&1) || fail "Failed to load raw data into temp table"
+
+# Extract actual imported count from PostgreSQL output
+ACTUAL_RECORDS=$(echo "$COPY_RESULT" | grep "COPY" | grep -o '[0-9]*' | tail -1)
+echo "[$(date -Iseconds)] PostgreSQL imported $ACTUAL_RECORDS records" >&2
+
+# Sanity check: compare expected vs actual
+if [[ "$EXPECTED_RECORDS" != "$ACTUAL_RECORDS" ]]; then
+  echo "WARNING: Record count mismatch! Expected: $EXPECTED_RECORDS, Actual: $ACTUAL_RECORDS" >&2
+  log warning "{\"expected\": $EXPECTED_RECORDS, \"actual\": $ACTUAL_RECORDS, \"msg\": \"record_count_mismatch\"}"
+fi
+
+# Transfer data to working table with medium_hash
+sudo -u "${SUDO_USER:-$USER}" psql "$DB_URL" -c "
+INSERT INTO $TABLE_NAME (medium_hash,dev,ino,nlink,size,mtime,path)
+SELECT '$MEDIUM_HASH', dev, ino, nlink, size, mtime, path
+FROM $TEMP_TABLE;
+" || fail "Failed to transfer data to working table"
 
 # ---------- 3. dedupe into real tables ----------
-echo "Deduplicating into final tables..." >&2
+echo "[$(date -Iseconds)] Deduplicating into final tables..." >&2
 log dedupe_start "{\"medium_hash\": \"$MEDIUM_HASH\"}"
 
-psql "$DB_URL" -c "
+sudo -u "${SUDO_USER:-$USER}" psql "$DB_URL" -c "
 -- medium row (if new)
 INSERT INTO medium (medium_hash, added_at)
 SELECT DISTINCT medium_hash, now()
-FROM   tmp_path
+FROM   $TABLE_NAME
 ON CONFLICT DO NOTHING;
 
 -- inode rows (unique by medium_hash,dev,ino)
 INSERT INTO inode (medium_hash,dev,ino,nlink,size,mtime)
 SELECT medium_hash,dev,ino,MAX(nlink),MAX(size),MAX(mtime)
-FROM   tmp_path
+FROM   $TABLE_NAME
 GROUP  BY medium_hash,dev,ino
 ON CONFLICT (medium_hash,dev,ino) DO NOTHING;
 
 -- path rows (unique by full path)
 INSERT INTO path (medium_hash,dev,ino,path)
 SELECT medium_hash,dev,ino,path
-FROM   tmp_path
+FROM   $TABLE_NAME
 ON CONFLICT (medium_hash,dev,ino,path) DO NOTHING;
 " || fail "Failed to deduplicate into final tables"
 
-# ---------- 4. summary ----------
-ROWS=$(psql "$DB_URL" -t -A -c "SELECT count(*) FROM path WHERE medium_hash='$MEDIUM_HASH'" || echo "unknown")
-echo "✓ Loading complete: $ROWS paths loaded for medium $MEDIUM_HASH" >&2
-log done "{\"rows\": $ROWS, \"exit\": 0}"
+# ---------- 4. cleanup and summary ----------
+ROWS=$(sudo -u "${SUDO_USER:-$USER}" psql "$DB_URL" -t -A -c "SELECT count(*) FROM path WHERE medium_hash='$MEDIUM_HASH'" 2>/dev/null | grep -o '[0-9]*' | head -1 || echo "unknown")
+
+# Drop the working tables
+sudo -u "${SUDO_USER:-$USER}" psql "$DB_URL" -c "DROP TABLE $TABLE_NAME, $TEMP_TABLE;" 2>/dev/null || true
+if [[ "$ACTUAL_RECORDS" == "0" ]]; then
+  echo "[$(date -Iseconds)] ✓ Loading complete: $ROWS paths total for medium $MEDIUM_HASH (no new records - already loaded)" >&2
+else
+  echo "[$(date -Iseconds)] ✓ Loading complete: $ROWS paths loaded for medium $MEDIUM_HASH" >&2
+fi
+log done "{\"rows\": \"$ROWS\", \"exit\": 0}"
 
 exit 0
