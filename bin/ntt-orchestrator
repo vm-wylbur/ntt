@@ -38,6 +38,7 @@ log() {
 }
 
 fail() {
+  echo "Error: $1" >&2
   log error "{\"msg\": \"$1\"}"
   exit 1
 }
@@ -73,10 +74,9 @@ identify_path() {
     fail "Path $path not found or not a directory"
   fi
 
-  # Generate unique hash from path + timestamp for each enumeration job
-  local timestamp=$(date +%s%N)
-  local medium_human="$(basename "$path")_${timestamp:0:10}"
-  local medium_hash=$(echo -n "${path}_${timestamp}" | b3sum | cut -d' ' -f1 | cut -c1-32)
+  # Generate hash from path only (consistent across runs)
+  local medium_human="$(basename "$path")"
+  local medium_hash=$(echo -n "$path" | b3sum | cut -d' ' -f1 | cut -c1-32)
 
   log identify "{\"medium_human\": \"$medium_human\", \"medium_hash\": \"$medium_hash\", \"path\": \"$path\"}"
 
@@ -253,6 +253,12 @@ handle_directory_mode() {
   local identify_result=$(identify_path "$path")
   local medium_hash="${identify_result%%:*}"
   local medium_human="${identify_result#*:}"
+
+  # Check if raw file already exists
+  RAW="$RAW_ROOT/${medium_hash}.raw"
+  if [[ -f "$RAW" ]] && ! "$force"; then
+    fail "Raw file already exists: $RAW (use --force to overwrite)"
+  fi
 
   check_duplicate "$medium_hash" "$force"
 
