@@ -2,23 +2,23 @@
 
 ## Quick start
 1. create DB
-   createdb copyjob
-   psql copyjob &lt; bin/sql/00-schema.sql
+   `createdb copyjob`
+   `psql copyjob < bin/sql/00-schema.sql`
 
 2. set env (edit ~/.config/ntt/ntt.env)
-   export NTT_DB_URL="postgres:///copyjob"
-   export NTT_IMAGE_ROOT="/data/fast/images"
-   export NTT_RAW_ROOT="/data/fast/raw"
-   export NTT_DST_ROOT="/data/cold/dst"
-   export NTT_LOG_JSON="/var/log/ntt/orchestrator.jsonl"
+   `export NTT_DB_URL="postgres:///copyjob"`
+   `export NTT_IMAGE_ROOT="/data/fast/images"`
+   `export NTT_RAW_ROOT="/data/fast/raw"`
+   `export NTT_DST_ROOT="/data/cold/dst"`
+   `export NTT_LOG_JSON="/var/log/ntt/orchestrator.jsonl"`
 
 3. source it
-   source ~/.config/ntt/ntt.env
+   `source ~/.config/ntt/ntt.env`
 
 4. run first disk
-   ./bin/ntt-orchestrator manual /dev/sdX
+   `sudo ./bin/ntt-orchestrator /dev/sdX`
 
 5. watch JSON
-   jq -c . /var/log/ntt/orchestrator.jsonl
+   `jq -c . /var/log/ntt/orchestrator.jsonl`
 
 <!-- done -->
