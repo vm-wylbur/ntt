@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Author: PB and Claude and Kimi
+# Date: 2025-09-26
+# License: (c) HRDAG, 2025, GPL-2 or newer
+#
+# ------
+# ntt/bin/ntt-enum
+#
+# NTT raw enumerator – outputs one NUL-rec per dirent
+set -euo pipefail
+
+# ---------- argparse ----------
+usage() {
+  echo "Usage: $0 MOUNT_POINT MEDIUM_HASH OUT.raw"
+  exit 1
+}
+[[ $# -eq 3 ]] || usage
+MNT="$1"; MEDIUM_HASH="$2"; OUT="$3"
+
+# ---------- env / config ----------
+LOG_JSON="${NTT_LOG_JSON:-/var/log/ntt/enum.jsonl}"
+mkdir -p "$(dirname "$LOG_JSON")"
+mkdir -p "$(dirname "$OUT")"
+
+# ---------- JSON helper ----------
+log() {
+  jq -cn --arg ts "$(date -Iseconds)" \
+        --arg stage "$1" \
+        --argjson extra "$2" \
+        '$extra + {ts: $ts, stage: $stage}' \
+  >> "$LOG_JSON"
+}
+
+# ---------- sanity checks ----------
+if [[ ! -d "$MNT" ]]; then
+  log error "{\"msg\": \"mount point not found\", \"mnt\": \"$MNT\"}"
+  exit 1
+fi
+
+# ---------- enumerate ----------
+log start "{\"mnt\": \"$MNT\", \"medium_hash\": \"$MEDIUM_HASH\", \"out\": \"$OUT\"}"
+
+# %m fs-type, %D dev, %i ino, %n nlink, %s size, %T@ mtime-epoch, %p path
+find "$MNT" -xdev -printf '%m\034%D\034%i\034%n\034%s\034%T@\034%p\0' \
+| pv -0 -l \
+> "$OUT"
+
+ROWS=$(wc -c < "$OUT" | xargs -I {} bash -c 'echo $(( {} / 24 ))' )  # rough NUL count
+log done "{\"rows\": $ROWS, \"exit\": 0}"
+
+exit 0

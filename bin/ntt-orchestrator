@@ -1,7 +1,22 @@
 #!/usr/bin/env bash
-# NTT ingest dispatcher – manual entry point
+# Author: PB and Claude and Kimi
+# Date: 2025-09-26
+# License: (c) HRDAG, 2025, GPL-2 or newer
+#
+# ------
+# ntt/bin/ntt-orchestrator
+#
+# NTT ingest dispatcher – supports both device and directory modes
+# Note: Must be run with sudo/root privileges for device operations
 set -euo pipefail
 PATH="/home/pball/projects/ntt/bin:$PATH"
+
+# Check if running as root
+if [[ $EUID -ne 0 ]]; then
+   echo "Error: This script must be run with sudo or as root" >&2
+   echo "Usage: sudo $0 <target> [options]" >&2
+   exit 1
+fi
 
 # ---------- config ----------
 DB_URL="${NTT_DB_URL:-postgres:///copyjob}"
@@ -11,23 +26,7 @@ DST_ROOT="${NTT_DST_ROOT:-/data/cold/dst}"
 LOG_JSON="${NTT_LOG_JSON:-/var/log/ntt/orchestrator.jsonl}"
 mkdir -p "$(dirname "$LOG_JSON")"
 
-# ---------- argparse ----------
-usage() {
-  echo "Usage: $0 manual /dev/sdX [--image-first] [--force]"
-  exit 1
-}
-[[ $# -ge 2 ]] || usage
-MODE="$1"; DEV="$2"; shift 2
-IMAGE_FIRST=false; FORCE=false
-for arg in "$@"; do
-  case $arg in
-    --image-first) IMAGE_FIRST=true ;;
-    --force)       FORCE=true ;;
-    *) usage ;;
-  esac
-done
-
-# ---------- helpers ----------
+# ---------- logging functions ----------
 log() {
   jq -cn --arg ts "$(date -Iseconds)" \
         --arg stage "$1" \
@@ -41,91 +40,274 @@ fail() {
   exit 1
 }
 
-# ---------- identify medium ----------
-if [[ ! -e "$DEV" ]]; then
-  fail "Device $DEV not found"
-fi
+# ---------- identification functions ----------
+identify_device() {
+  local dev="$1"
 
-MODEL=$(lsblk -no MODEL "$DEV" | tr -s ' ' '_')
-SERIAL=$(lsblk -no SERIAL "$DEV" | tr -s ' ' '_')
-medium_human="${MODEL:-unknown}_${SERIAL:-unknown}"
-
-SIG_FILE="/tmp/ntt-sig-$$"
-head -c 1M "$DEV" > "$SIG_FILE"
-tail -c 1M "$DEV" >> "$SIG_FILE"
-medium_hash=$(blake3sum < "$SIG_FILE" | cut -d' ' -f1)
-rm -f "$SIG_FILE"
-
-log identify "{\"medium_human\": \"$medium_human\", \"medium_hash\": \"$medium_hash\", \"dev\": \"$DEV\"}"
-
-# ---------- duplicate gate ----------
-if ! "$FORCE"; then
-  EXISTS=$(psql "$DB_URL" -t -A -c "SELECT 1 FROM medium WHERE medium_hash='$medium_hash'")
-  if [[ -n $EXISTS ]]; then
-    log skip "{\"reason\": \"already ingested\"}"
-    exit 2
+  if [[ ! -e "$dev" ]]; then
+    fail "Device $dev not found"
   fi
-fi
 
-# ---------- health gate ----------
-SMART_FAIL=$(smartctl -H "$DEV" | grep -c "FAILED")
-PROPRIETARY=$(smartctl -i "$DEV" | grep -Ei "G-RAID|hardware-raid" | wc -l)
-REMOVABLE=$(lsblk -no HOTPLUG "$DEV")
+  MODEL=$(lsblk -no MODEL "$dev" | tr -s ' ' '_')
+  SERIAL=$(lsblk -no SERIAL "$dev" | tr -s ' ' '_')
+  local medium_human="${MODEL:-unknown}_${SERIAL:-unknown}"
 
-if [[ $SMART_FAIL -gt 0 ]] || [[ $PROPRIETARY -gt 0 ]] || [[ "$REMOVABLE" == "1" ]]; then
-  IMAGE_FIRST=true
-fi
-log health "{\"image_first\": $IMAGE_FIRST, \"smart_fail\": $SMART_FAIL, \"proprietary\": $PROPRIETARY}"
+  SIG_FILE="/tmp/ntt-sig-$$"
+  head -c 1M "$dev" > "$SIG_FILE"
+  tail -c 1M "$dev" >> "$SIG_FILE"
+  local medium_hash=$(b3sum < "$SIG_FILE" | cut -d' ' -f1)
+  rm -f "$SIG_FILE"
 
-# ---------- insert medium ----------
-psql "$DB_URL" -c "INSERT INTO medium (medium_hash, medium_human, health)
-                   VALUES ('$medium_hash', '$medium_human', '${IMAGE_FIRST}')
-                   ON CONFLICT DO NOTHING;"
+  log identify "{\"medium_human\": \"$medium_human\", \"medium_hash\": \"$medium_hash\", \"dev\": \"$dev\"}"
 
-# ---------- branch: image or direct enum ----------
-if "$IMAGE_FIRST"; then
-  IMG="$IMAGE_ROOT/${medium_hash}.img"
-  MAP="$IMAGE_ROOT/${medium_hash}.map"
-  log imager_spawn "{\"img\": \"$IMG\", \"map\": \"$MAP\"}"
-  ntt-imager "$DEV" "$IMG" "$MAP"        # blocks until done
-  LOOP=$(losetup -f --show -r "$IMG")
-  mkdir -p "/mnt/ntt/${medium_hash}"
-  mount -o ro,nodev,nosuid,noatime "$LOOP" "/mnt/ntt/${medium_hash}"
-  MNT="/mnt/ntt/${medium_hash}"
-else
-  MNT="/mnt/medium/${medium_hash}"
-  mkdir -p "$MNT"
-  mount -o ro,nodev,nosuid,noatime "$DEV" "$MNT"
-fi
+  # Return values via echo
+  echo "$medium_hash:$medium_human"
+}
 
-# ---------- enumerate ----------
-RAW="$RAW_ROOT/${medium_hash}.raw"
-log enum_spawn "{\"mnt\": \"$MNT\", \"raw\": \"$RAW\"}"
-ntt-enum "$MNT" "$medium_hash" "$RAW"
+identify_path() {
+  local path="$1"
 
-# ---------- load ----------
-log loader_spawn "{\"raw\": \"$RAW\"}"
-ntt-loader "$medium_hash" "$RAW"
+  if [[ ! -d "$path" ]]; then
+    fail "Path $path not found or not a directory"
+  fi
 
-# ---------- copy workers ----------
-log copy_spawn "{\"workers\": 8}"
-for w in {1..8}; do
-  ntt-copy-worker --id "$w" --medium-hash "$medium_hash" &
+  # Generate unique hash from path + timestamp for each enumeration job
+  local timestamp=$(date +%s%N)
+  local medium_human="$(basename "$path")_${timestamp:0:10}"
+  local medium_hash=$(echo -n "${path}_${timestamp}" | b3sum | cut -d' ' -f1 | cut -c1-32)
+
+  log identify "{\"medium_human\": \"$medium_human\", \"medium_hash\": \"$medium_hash\", \"path\": \"$path\"}"
+
+  # Return values via echo
+  echo "$medium_hash:$medium_human"
+}
+
+# ---------- health check functions ----------
+check_device_health() {
+  local dev="$1"
+
+  local SMART_FAIL=$(smartctl -H "$dev" 2>/dev/null | grep -c "FAILED" || echo 0)
+  local PROPRIETARY=$(smartctl -i "$dev" 2>/dev/null | grep -Ei "G-RAID|hardware-raid" | wc -l || echo 0)
+  local REMOVABLE=$(lsblk -no HOTPLUG "$dev" 2>/dev/null || echo 0)
+
+  local IMAGE_FIRST=false
+  if [[ $SMART_FAIL -gt 0 ]] || [[ $PROPRIETARY -gt 0 ]] || [[ "$REMOVABLE" == "1" ]]; then
+    IMAGE_FIRST=true
+  fi
+
+  log health "{\"image_first\": $IMAGE_FIRST, \"smart_fail\": $SMART_FAIL, \"proprietary\": $PROPRIETARY}"
+
+  # Return the value
+  echo "$IMAGE_FIRST"
+}
+
+# ---------- database functions ----------
+check_duplicate() {
+  local medium_hash="$1"
+  local force="$2"
+
+  if ! "$force"; then
+    EXISTS=$(psql "$DB_URL" -t -A -c "SELECT 1 FROM medium WHERE medium_hash='$medium_hash'" 2>/dev/null || echo "")
+    if [[ -n $EXISTS ]]; then
+      log skip "{\"reason\": \"already ingested\"}"
+      exit 2
+    fi
+  fi
+}
+
+insert_medium() {
+  local medium_hash="$1"
+  local medium_human="$2"
+  local health="${3:-false}"
+
+  psql "$DB_URL" -c "INSERT INTO medium (medium_hash, medium_human, health)
+                     VALUES ('$medium_hash', '$medium_human', '${health}')
+                     ON CONFLICT DO NOTHING;" 2>/dev/null || true
+}
+
+# ---------- mount/unmount functions ----------
+mount_device() {
+  local dev="$1"
+  local medium_hash="$2"
+  local image_first="$3"
+
+  if "$image_first"; then
+    IMG="$IMAGE_ROOT/${medium_hash}.img"
+    MAP="$IMAGE_ROOT/${medium_hash}.map"
+    log imager_spawn "{\"img\": \"$IMG\", \"map\": \"$MAP\"}"
+    ntt-imager "$dev" "$IMG" "$MAP"
+    LOOP=$(losetup -f --show -r "$IMG")
+    mkdir -p "/mnt/ntt/${medium_hash}"
+    mount -o ro,nodev,nosuid,noatime "$LOOP" "/mnt/ntt/${medium_hash}"
+    MNT="/mnt/ntt/${medium_hash}"
+  else
+    MNT="/mnt/medium/${medium_hash}"
+    mkdir -p "$MNT"
+    mount -o ro,nodev,nosuid,noatime "$dev" "$MNT"
+  fi
+
+  echo "$MNT"
+}
+
+unmount_device() {
+  local mnt="$1"
+  local image_first="$2"
+  local medium_hash="$3"
+
+  if "$image_first"; then
+    umount "$mnt" 2>/dev/null || true
+    IMG="$IMAGE_ROOT/${medium_hash}.img"
+    LOOP=$(losetup -j "$IMG" | cut -d: -f1)
+    [[ -n "$LOOP" ]] && losetup -d "$LOOP"
+  else
+    umount "$mnt" 2>/dev/null || true
+  fi
+}
+
+# ---------- processing functions ----------
+run_enum() {
+  local mnt="$1"
+  local medium_hash="$2"
+
+  RAW="$RAW_ROOT/${medium_hash}.raw"
+  log enum_spawn "{\"mnt\": \"$mnt\", \"raw\": \"$RAW\"}"
+  ntt-enum "$mnt" "$medium_hash" "$RAW"
+
+  echo "$RAW"
+}
+
+run_loader() {
+  local medium_hash="$1"
+  local raw="$2"
+
+  log loader_spawn "{\"raw\": \"$raw\"}"
+  ntt-loader "$medium_hash" "$raw"
+}
+
+run_copy_workers() {
+  local medium_hash="$1"
+  local workers="${2:-8}"
+
+  log copy_spawn "{\"workers\": $workers}"
+  for ((w=1; w<=workers; w++)); do
+    ntt-copy-worker --id "$w" --medium-hash "$medium_hash" &
+  done
+  wait
+}
+
+cleanup_image() {
+  local medium_hash="$1"
+
+  COPIED=$(psql "$DB_URL" -t -A -c \
+    "SELECT count(*) FILTER (WHERE copied) = count(*) FROM inode WHERE medium_hash='$medium_hash'" 2>/dev/null || echo 0)
+  if [[ $COPIED -eq 1 ]]; then
+    rm -f "$IMAGE_ROOT/${medium_hash}.img" "$IMAGE_ROOT/${medium_hash}.map"
+    log image_delete "{\"reason\": \"all_inodes_copied\"}"
+  fi
+}
+
+# ---------- mode handlers ----------
+handle_device_mode() {
+  local dev="$1"
+  local image_first="$2"
+  local force="$3"
+  local enum_only="$4"
+
+  # Identify and check health
+  local identify_result=$(identify_device "$dev")
+  local medium_hash="${identify_result%%:*}"
+  local medium_human="${identify_result#*:}"
+
+  check_duplicate "$medium_hash" "$force"
+  local IMAGE_FIRST=$(check_device_health "$dev")
+
+  # Insert into database
+  insert_medium "$medium_hash" "$medium_human" "$IMAGE_FIRST"
+
+  # Mount and process
+  MNT=$(mount_device "$dev" "$medium_hash" "$IMAGE_FIRST")
+  RAW=$(run_enum "$MNT" "$medium_hash")
+
+  # Run full pipeline unless --enum-only
+  if ! "$enum_only"; then
+    run_loader "$medium_hash" "$RAW"
+    run_copy_workers "$medium_hash"
+  fi
+
+  # Cleanup
+  unmount_device "$MNT" "$IMAGE_FIRST" "$medium_hash"
+  [[ "$IMAGE_FIRST" == "true" ]] && cleanup_image "$medium_hash"
+}
+
+handle_directory_mode() {
+  local path="$1"
+  local force="$2"
+  local enum_only="$3"
+
+  # Identify path
+  local identify_result=$(identify_path "$path")
+  local medium_hash="${identify_result%%:*}"
+  local medium_human="${identify_result#*:}"
+
+  check_duplicate "$medium_hash" "$force"
+
+  # Insert into database (no health check for paths)
+  insert_medium "$medium_hash" "$medium_human" "false"
+
+  # Run enum directly on the path
+  RAW=$(run_enum "$path" "$medium_hash")
+
+  # Run full pipeline unless --enum-only
+  if ! "$enum_only"; then
+    run_loader "$medium_hash" "$RAW"
+    run_copy_workers "$medium_hash"
+  fi
+}
+
+# ---------- argparse ----------
+usage() {
+  cat <<EOF
+Usage:
+  sudo $0 /dev/sdX [--image-first] [--force] [--enum-only]
+  sudo $0 /path/to/directory [--force] [--enum-only]
+
+Auto-detects mode based on target:
+  /dev/*    Process as block device
+  other     Process as directory path
+
+Options:
+  --image-first  Force imaging before enumeration (device mode only)
+  --force        Bypass duplicate checking
+  --enum-only    Only run enumeration, skip loader and copy workers
+EOF
+  exit 1
+}
+
+# Parse arguments
+[[ $# -ge 1 ]] || usage
+TARGET="$1"
+shift
+
+# Parse flags
+IMAGE_FIRST=false
+FORCE=false
+ENUM_ONLY=false
+
+for arg in "$@"; do
+  case $arg in
+    --image-first) IMAGE_FIRST=true ;;
+    --force)       FORCE=true ;;
+    --enum-only)   ENUM_ONLY=true ;;
+    *) usage ;;
+  esac
 done
-wait
 
-# ---------- unmount ----------
-if "$IMAGE_FIRST"; then
-  umount "$MNT"
-  losetup -d "$LOOP"
-fi
-
-# ---------- image delete gate ----------
-COPIED=$(psql "$DB_URL" -t -A -c \
-  "SELECT count(*) FILTER (WHERE copied) = count(*) FROM inode WHERE medium_hash='$medium_hash'")
-if [[ $COPIED -eq 1 ]]; then
-  rm -f "$IMG" "$MAP"
-  log image_delete "{\"reason\": \"all_inodes_copied\"}"
+# ---------- main ----------
+# Auto-detect mode based on target path
+if [[ "$TARGET" == /dev/* ]]; then
+  handle_device_mode "$TARGET" "$IMAGE_FIRST" "$FORCE" "$ENUM_ONLY"
+else
+  handle_directory_mode "$TARGET" "$FORCE" "$ENUM_ONLY"
 fi
 
 log done "{\"exit\": 0}"
