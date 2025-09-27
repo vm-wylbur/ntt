@@ -18,7 +18,7 @@ usage() {
 MNT="$1"; MEDIUM_HASH="$2"; OUT="$3"
 
 # ---------- env / config ----------
-LOG_JSON="${NTT_LOG_JSON:-/var/log/ntt/enum.jsonl}"
+LOG_JSON="${NTT_ENUM_LOG:-/var/log/ntt/enum.jsonl}"
 mkdir -p "$(dirname "$LOG_JSON")"
 mkdir -p "$(dirname "$OUT")"
 

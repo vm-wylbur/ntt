@@ -23,7 +23,7 @@ DB_URL="${NTT_DB_URL:-postgres:///copyjob}"
 IMAGE_ROOT="${NTT_IMAGE_ROOT:-/data/fast/images}"
 RAW_ROOT="${NTT_RAW_ROOT:-/data/fast/raw}"
 DST_ROOT="${NTT_DST_ROOT:-/data/cold/dst}"
-LOG_JSON="${NTT_LOG_JSON:-/var/log/ntt/orchestrator.jsonl}"
+LOG_JSON="${NTT_ORCHESTRATOR_LOG:-/var/log/ntt/orchestrator.jsonl}"
 mkdir -p "$(dirname "$LOG_JSON")"
 chmod 755 "$(dirname "$LOG_JSON")" 2>/dev/null || true
 
