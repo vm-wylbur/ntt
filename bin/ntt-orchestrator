@@ -25,6 +25,7 @@ RAW_ROOT="${NTT_RAW_ROOT:-/data/fast/raw}"
 DST_ROOT="${NTT_DST_ROOT:-/data/cold/dst}"
 LOG_JSON="${NTT_LOG_JSON:-/var/log/ntt/orchestrator.jsonl}"
 mkdir -p "$(dirname "$LOG_JSON")"
+chmod 755 "$(dirname "$LOG_JSON")" 2>/dev/null || true
 
 # ---------- logging functions ----------
 log() {
@@ -33,6 +34,7 @@ log() {
         --argjson extra "$2" \
         '$extra + {ts: $ts, stage: $stage}' \
   >> "$LOG_JSON"
+  chmod 644 "$LOG_JSON" 2>/dev/null || true
 }
 
 fail() {
@@ -172,6 +174,9 @@ run_enum() {
   RAW="$RAW_ROOT/${medium_hash}.raw"
   log enum_spawn "{\"mnt\": \"$mnt\", \"raw\": \"$RAW\"}"
   ntt-enum "$mnt" "$medium_hash" "$RAW"
+
+  # Make raw file world readable
+  chmod 644 "$RAW" 2>/dev/null || true
 
   echo "$RAW"
 }

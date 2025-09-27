@@ -22,6 +22,10 @@ LOG_JSON="${NTT_LOG_JSON:-/var/log/ntt/enum.jsonl}"
 mkdir -p "$(dirname "$LOG_JSON")"
 mkdir -p "$(dirname "$OUT")"
 
+# Make directories world readable
+chmod 755 "$(dirname "$LOG_JSON")" 2>/dev/null || true
+chmod 755 "$(dirname "$OUT")" 2>/dev/null || true
+
 # ---------- JSON helper ----------
 log() {
   jq -cn --arg ts "$(date -Iseconds)" \
@@ -45,7 +49,13 @@ find "$MNT" -xdev -printf '%m\034%D\034%i\034%n\034%s\034%T@\034%p\0' \
 | pv -0 -l \
 > "$OUT"
 
+# Make output file world readable
+chmod 644 "$OUT" 2>/dev/null || true
+
 ROWS=$(wc -c < "$OUT" | xargs -I {} bash -c 'echo $(( {} / 24 ))' )  # rough NUL count
 log done "{\"rows\": $ROWS, \"exit\": 0}"
+
+# Make log file world readable
+chmod 644 "$LOG_JSON" 2>/dev/null || true
 
 exit 0

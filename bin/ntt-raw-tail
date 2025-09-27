@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Author: PB, Claude, and Kimi
+# Date: 2025-01-02
+# License: (c) HRDAG, 2025, GPL-2 or newer
+#
+# ------
+# ntt/bin/ntt-raw-tail
+#
+# pretty-print last N records of a .raw file (034 → ' | ', NUL → newline)
+set -euo pipefail
+
+N=${1:-10}                 # default last 10 records
+FILE=${2:-}                # path to .raw file
+[[ -n $FILE && -f $FILE ]] || { echo "Usage: $0 [N] file.raw"; exit 1; }
+
+# tail -c grabs last N *bytes* approximately, then we split on NUL
+tail -c "$(( N * 200 ))" "$FILE" |   # generous bytes per record
+  tr '\0' '\n' |                     # NUL → newline
+  tail -n "$N" |                     # last N lines
+  tr '\034' '|'                      # 034 → ' | '
