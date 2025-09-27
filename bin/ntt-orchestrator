@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# NTT ingest dispatcher – manual entry point
+set -euo pipefail
+PATH="/home/pball/projects/ntt/bin:$PATH"
+
+# ---------- config ----------
+DB_URL="${NTT_DB_URL:-postgres:///copyjob}"
+IMAGE_ROOT="${NTT_IMAGE_ROOT:-/data/fast/images}"
+RAW_ROOT="${NTT_RAW_ROOT:-/data/fast/raw}"
+DST_ROOT="${NTT_DST_ROOT:-/data/cold/dst}"
+LOG_JSON="${NTT_LOG_JSON:-/var/log/ntt/orchestrator.jsonl}"
+mkdir -p "$(dirname "$LOG_JSON")"
+
+# ---------- argparse ----------
+usage() {
+  echo "Usage: $0 manual /dev/sdX [--image-first] [--force]"
+  exit 1
+}
+[[ $# -ge 2 ]] || usage
+MODE="$1"; DEV="$2"; shift 2
+IMAGE_FIRST=false; FORCE=false
+for arg in "$@"; do
+  case $arg in
+    --image-first) IMAGE_FIRST=true ;;
+    --force)       FORCE=true ;;
+    *) usage ;;
+  esac
+done
+
+# ---------- helpers ----------
+log() {
+  jq -cn --arg ts "$(date -Iseconds)" \
+        --arg stage "$1" \
+        --argjson extra "$2" \
+        '$extra + {ts: $ts, stage: $stage}' \
+  >> "$LOG_JSON"
+}
+
+fail() {
+  log error "{\"msg\": \"$1\"}"
+  exit 1
+}
+
+# ---------- identify medium ----------
+if [[ ! -e "$DEV" ]]; then
+  fail "Device $DEV not found"
+fi
+
+MODEL=$(lsblk -no MODEL "$DEV" | tr -s ' ' '_')
+SERIAL=$(lsblk -no SERIAL "$DEV" | tr -s ' ' '_')
+medium_human="${MODEL:-unknown}_${SERIAL:-unknown}"
+
+SIG_FILE="/tmp/ntt-sig-$$"
+head -c 1M "$DEV" > "$SIG_FILE"
+tail -c 1M "$DEV" >> "$SIG_FILE"
+medium_hash=$(blake3sum < "$SIG_FILE" | cut -d' ' -f1)
+rm -f "$SIG_FILE"
+
+log identify "{\"medium_human\": \"$medium_human\", \"medium_hash\": \"$medium_hash\", \"dev\": \"$DEV\"}"
+
+# ---------- duplicate gate ----------
+if ! "$FORCE"; then
+  EXISTS=$(psql "$DB_URL" -t -A -c "SELECT 1 FROM medium WHERE medium_hash='$medium_hash'")
+  if [[ -n $EXISTS ]]; then
+    log skip "{\"reason\": \"already ingested\"}"
+    exit 2
+  fi
+fi
+
+# ---------- health gate ----------
+SMART_FAIL=$(smartctl -H "$DEV" | grep -c "FAILED")
+PROPRIETARY=$(smartctl -i "$DEV" | grep -Ei "G-RAID|hardware-raid" | wc -l)
+REMOVABLE=$(lsblk -no HOTPLUG "$DEV")
+
+if [[ $SMART_FAIL -gt 0 ]] || [[ $PROPRIETARY -gt 0 ]] || [[ "$REMOVABLE" == "1" ]]; then
+  IMAGE_FIRST=true
+fi
+log health "{\"image_first\": $IMAGE_FIRST, \"smart_fail\": $SMART_FAIL, \"proprietary\": $PROPRIETARY}"
+
+# ---------- insert medium ----------
+psql "$DB_URL" -c "INSERT INTO medium (medium_hash, medium_human, health)
+                   VALUES ('$medium_hash', '$medium_human', '${IMAGE_FIRST}')
+                   ON CONFLICT DO NOTHING;"
+
+# ---------- branch: image or direct enum ----------
+if "$IMAGE_FIRST"; then
+  IMG="$IMAGE_ROOT/${medium_hash}.img"
+  MAP="$IMAGE_ROOT/${medium_hash}.map"
+  log imager_spawn "{\"img\": \"$IMG\", \"map\": \"$MAP\"}"
+  ntt-imager "$DEV" "$IMG" "$MAP"        # blocks until done
+  LOOP=$(losetup -f --show -r "$IMG")
+  mkdir -p "/mnt/ntt/${medium_hash}"
+  mount -o ro,nodev,nosuid,noatime "$LOOP" "/mnt/ntt/${medium_hash}"
+  MNT="/mnt/ntt/${medium_hash}"
+else
+  MNT="/mnt/medium/${medium_hash}"
+  mkdir -p "$MNT"
+  mount -o ro,nodev,nosuid,noatime "$DEV" "$MNT"
+fi
+
+# ---------- enumerate ----------
+RAW="$RAW_ROOT/${medium_hash}.raw"
+log enum_spawn "{\"mnt\": \"$MNT\", \"raw\": \"$RAW\"}"
+ntt-enum "$MNT" "$medium_hash" "$RAW"
+
+# ---------- load ----------
+log loader_spawn "{\"raw\": \"$RAW\"}"
+ntt-loader "$medium_hash" "$RAW"
+
+# ---------- copy workers ----------
+log copy_spawn "{\"workers\": 8}"
+for w in {1..8}; do
+  ntt-copy-worker --id "$w" --medium-hash "$medium_hash" &
+done
+wait
+
+# ---------- unmount ----------
+if "$IMAGE_FIRST"; then
+  umount "$MNT"
+  losetup -d "$LOOP"
+fi
+
+# ---------- image delete gate ----------
+COPIED=$(psql "$DB_URL" -t -A -c \
+  "SELECT count(*) FILTER (WHERE copied) = count(*) FROM inode WHERE medium_hash='$medium_hash'")
+if [[ $COPIED -eq 1 ]]; then
+  rm -f "$IMG" "$MAP"
+  log image_delete "{\"reason\": \"all_inodes_copied\"}"
+fi
+
+log done "{\"exit\": 0}"
+exit 0
