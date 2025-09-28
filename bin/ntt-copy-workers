@@ -1,0 +1,162 @@
+#!/bin/bash
+# ntt-copy-workers: Launch K parallel ntt-copier workers with optional limit N
+# Handles ^C signal to cleanly terminate all workers
+# Leaves progress monitoring to separate dashboard script
+
+set -euo pipefail
+
+# Default values
+WORKERS=4
+LIMIT=""
+DRY_RUN=""
+VERBOSE=false
+PIDS=()
+
+# Parse arguments
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [OPTIONS]
+
+Launch parallel ntt-copier workers with signal handling.
+
+Options:
+    -w, --workers K      Number of parallel workers (default: 4)
+    -l, --limit N        Process limit per worker
+    -d, --dry-run N      Dry-run mode with N items per worker
+    -v, --verbose        Show detailed output
+    -h, --help           Show this help
+
+Examples:
+    $(basename "$0") -w 8                    # 8 workers, no limit
+    $(basename "$0") -w 4 -l 100            # 4 workers, 100 items each
+    $(basename "$0") -w 8 -d 50             # 8 workers, dry-run 50 items each
+
+Signal handling:
+    ^C (SIGINT) cleanly terminates all workers
+EOF
+    exit 0
+}
+
+# Parse command line
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -w|--workers)
+            WORKERS="$2"
+            shift 2
+            ;;
+        --workers=*)
+            WORKERS="${1#*=}"
+            shift
+            ;;
+        -l|--limit)
+            LIMIT="$2"
+            shift 2
+            ;;
+        --limit=*)
+            LIMIT="${1#*=}"
+            shift
+            ;;
+        -d|--dry-run)
+            DRY_RUN="$2"
+            shift 2
+            ;;
+        --dry-run=*)
+            DRY_RUN="${1#*=}"
+            shift
+            ;;
+        -v|--verbose)
+            VERBOSE=true
+            shift
+            ;;
+        -h|--help)
+            usage
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            usage
+            ;;
+    esac
+done
+
+# Validate workers is a number
+if ! [[ "$WORKERS" =~ ^[0-9]+$ ]]; then
+    echo "Error: Workers must be a positive integer" >&2
+    exit 1
+fi
+
+# Check for mutual exclusivity
+if [[ -n "$LIMIT" && -n "$DRY_RUN" ]]; then
+    echo "Error: --limit and --dry-run are mutually exclusive" >&2
+    exit 1
+fi
+
+# Build worker command
+WORKER_CMD="sudo -E /home/pball/.local/bin/uv run /home/pball/projects/ntt/bin/ntt-copier.py"
+if [[ -n "$LIMIT" ]]; then
+    WORKER_CMD="$WORKER_CMD --limit=$LIMIT"
+elif [[ -n "$DRY_RUN" ]]; then
+    WORKER_CMD="$WORKER_CMD --dry-run=$DRY_RUN"
+fi
+
+# Signal handler for clean shutdown
+cleanup() {
+    echo -e "\n[$(date '+%H:%M:%S')] Received interrupt signal, stopping workers..."
+
+    # Send SIGTERM to all workers
+    for pid in "${PIDS[@]}"; do
+        if ps -p "$pid" > /dev/null 2>&1; then
+            echo "[$(date '+%H:%M:%S')] Stopping worker $pid"
+            sudo kill -TERM "$pid" 2>/dev/null || true
+        fi
+    done
+
+    # Wait briefly for graceful shutdown
+    sleep 2
+
+    # Force kill any remaining
+    for pid in "${PIDS[@]}"; do
+        if ps -p "$pid" > /dev/null 2>&1; then
+            echo "[$(date '+%H:%M:%S')] Force stopping worker $pid"
+            sudo kill -KILL "$pid" 2>/dev/null || true
+        fi
+    done
+
+    echo "[$(date '+%H:%M:%S')] All workers stopped"
+    exit 0
+}
+
+# Set up signal trap
+trap cleanup SIGINT SIGTERM
+
+# Launch workers
+echo "[$(date '+%H:%M:%S')] Starting $WORKERS workers..."
+if [[ -n "$LIMIT" ]]; then
+    echo "[$(date '+%H:%M:%S')] Limit: $LIMIT items per worker"
+elif [[ -n "$DRY_RUN" ]]; then
+    echo "[$(date '+%H:%M:%S')] Dry-run: $DRY_RUN items per worker"
+fi
+
+for ((i=1; i<=WORKERS; i++)); do
+    WORKER_ID="worker-$(printf '%02d' $i)"
+
+    if $VERBOSE; then
+        echo "[$(date '+%H:%M:%S')] Launching $WORKER_ID"
+    fi
+
+    # Launch worker in background, redirect output to logs
+    $WORKER_CMD --worker-id="$WORKER_ID" \
+        > "/tmp/ntt-${WORKER_ID}.log" 2>&1 &
+
+    PIDS+=($!)
+done
+
+echo "[$(date '+%H:%M:%S')] Launched ${#PIDS[@]} workers with PIDs: ${PIDS[*]}"
+
+# Save PIDs to file for monitoring/stopping
+PID_FILE="/tmp/ntt-workers.pids"
+printf "%s\n" "${PIDS[@]}" > "$PID_FILE"
+
+echo "[$(date '+%H:%M:%S')] Workers launched successfully"
+echo "[$(date '+%H:%M:%S')] PIDs saved to: $PID_FILE"
+echo "[$(date '+%H:%M:%S')] Monitor progress: ntt-dashboard"
+echo "[$(date '+%H:%M:%S')] Stop workers: ntt-stop-workers"

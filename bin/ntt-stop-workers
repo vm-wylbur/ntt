@@ -1,0 +1,160 @@
+#!/bin/bash
+# ntt-stop-workers: Gracefully stop all running ntt-copier workers
+# Reads PIDs from file and performs two-phase shutdown (SIGTERM then SIGKILL)
+
+set -euo pipefail
+
+PID_FILE="/tmp/ntt-workers.pids"
+VERBOSE=false
+
+# Parse arguments
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [OPTIONS]
+
+Gracefully stop all running ntt-copier workers.
+
+Options:
+    -v, --verbose        Show detailed output
+    -h, --help           Show this help
+
+Examples:
+    $(basename "$0")                    # Stop all workers
+    $(basename "$0") -v                 # Stop with verbose output
+
+Process:
+    1. Read worker PIDs from $PID_FILE
+    2. Verify they are ntt-copier processes
+    3. Send SIGTERM for graceful shutdown
+    4. Wait 10 seconds for cleanup
+    5. Send SIGKILL to any remaining processes
+    6. Clean up PID file
+EOF
+    exit 0
+}
+
+# Parse command line
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -v|--verbose)
+            VERBOSE=true
+            shift
+            ;;
+        -h|--help)
+            usage
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            usage
+            ;;
+    esac
+done
+
+# Check if PID file exists
+if [[ ! -f "$PID_FILE" ]]; then
+    echo "[$(date '+%H:%M:%S')] No worker PID file found: $PID_FILE"
+    echo "[$(date '+%H:%M:%S')] No workers to stop"
+    exit 0
+fi
+
+# Read PIDs from file
+readarray -t PIDS < "$PID_FILE"
+
+if [[ ${#PIDS[@]} -eq 0 ]]; then
+    echo "[$(date '+%H:%M:%S')] PID file is empty"
+    rm -f "$PID_FILE"
+    exit 0
+fi
+
+echo "[$(date '+%H:%M:%S')] Found ${#PIDS[@]} worker PIDs in $PID_FILE"
+
+# Verify which processes are still running and are ntt-copier workers
+RUNNING_PIDS=()
+for pid in "${PIDS[@]}"; do
+    # Skip empty lines
+    [[ -z "$pid" ]] && continue
+
+    # Check if process exists
+    if ! ps -p "$pid" > /dev/null 2>&1; then
+        if $VERBOSE; then
+            echo "[$(date '+%H:%M:%S')] PID $pid not running"
+        fi
+        continue
+    fi
+
+    # Verify it's actually an ntt-copier process
+    if ps -p "$pid" -o cmd= | grep -q "ntt-copier.py"; then
+        RUNNING_PIDS+=("$pid")
+        if $VERBOSE; then
+            echo "[$(date '+%H:%M:%S')] Found running worker: PID $pid"
+        fi
+    else
+        if $VERBOSE; then
+            echo "[$(date '+%H:%M:%S')] PID $pid is not an ntt-copier process, skipping"
+        fi
+    fi
+done
+
+if [[ ${#RUNNING_PIDS[@]} -eq 0 ]]; then
+    echo "[$(date '+%H:%M:%S')] No running workers found"
+    rm -f "$PID_FILE"
+    exit 0
+fi
+
+echo "[$(date '+%H:%M:%S')] Stopping ${#RUNNING_PIDS[@]} running workers..."
+
+# Phase 1: Send SIGTERM for graceful shutdown
+echo "[$(date '+%H:%M:%S')] Sending SIGTERM for graceful shutdown..."
+for pid in "${RUNNING_PIDS[@]}"; do
+    if ps -p "$pid" > /dev/null 2>&1; then
+        if $VERBOSE; then
+            echo "[$(date '+%H:%M:%S')] Sending SIGTERM to worker $pid"
+        fi
+        sudo kill -TERM "$pid" 2>/dev/null || true
+    fi
+done
+
+# Wait for graceful shutdown
+echo "[$(date '+%H:%M:%S')] Waiting 10 seconds for graceful shutdown..."
+sleep 10
+
+# Phase 2: Check for remaining processes and force kill
+REMAINING_PIDS=()
+for pid in "${RUNNING_PIDS[@]}"; do
+    if ps -p "$pid" > /dev/null 2>&1; then
+        REMAINING_PIDS+=("$pid")
+    fi
+done
+
+if [[ ${#REMAINING_PIDS[@]} -gt 0 ]]; then
+    echo "[$(date '+%H:%M:%S')] Force stopping ${#REMAINING_PIDS[@]} remaining workers..."
+    for pid in "${REMAINING_PIDS[@]}"; do
+        if $VERBOSE; then
+            echo "[$(date '+%H:%M:%S')] Sending SIGKILL to worker $pid"
+        fi
+        sudo kill -KILL "$pid" 2>/dev/null || true
+    done
+
+    # Final wait
+    sleep 2
+fi
+
+# Verify all workers are stopped
+STILL_RUNNING=0
+for pid in "${RUNNING_PIDS[@]}"; do
+    if ps -p "$pid" > /dev/null 2>&1; then
+        echo "[$(date '+%H:%M:%S')] WARNING: Worker $pid is still running"
+        ((STILL_RUNNING++))
+    fi
+done
+
+if [[ $STILL_RUNNING -eq 0 ]]; then
+    echo "[$(date '+%H:%M:%S')] All workers stopped successfully"
+    rm -f "$PID_FILE"
+else
+    echo "[$(date '+%H:%M:%S')] WARNING: $STILL_RUNNING workers may still be running"
+    echo "[$(date '+%H:%M:%S')] PID file preserved: $PID_FILE"
+    exit 1
+fi
+
+echo "[$(date '+%H:%M:%S')] Done"
