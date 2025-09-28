@@ -314,8 +314,8 @@ handle_load_only_mode() {
 usage() {
   cat <<EOF
 Usage:
-  sudo $0 /dev/sdX [--enum-only] [--force]           # Device enumeration (PARTIAL)
-  sudo $0 /path/to/directory [--enum-only] [--force] # Directory enumeration
+  sudo $0 [--enum-only] [--force] /dev/sdX           # Device enumeration (PARTIAL)
+  sudo $0 [--enum-only] [--force] /path/to/directory # Directory enumeration
   sudo $0 --load-only /path/to/file.raw              # Load .raw into database
 
 Current implementation status:
@@ -340,29 +340,69 @@ EOF
 # Parse arguments
 [[ $# -ge 1 ]] || usage
 
-# Check for --load-only mode first
-if [[ "$1" == "--load-only" ]]; then
-  [[ $# -eq 2 ]] || usage
-  LOAD_ONLY_MODE=true
-  LOAD_ONLY_FILE="$2"
+# Initialize flags
+LOAD_ONLY_MODE=false
+IMAGE_FIRST=false
+FORCE=false
+ENUM_ONLY=false
+TARGET=""
+LOAD_ONLY_FILE=""
+
+# Parse options first
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --load-only)
+      LOAD_ONLY_MODE=true
+      shift
+      # Next argument should be the .raw file
+      if [[ $# -eq 1 ]]; then
+        LOAD_ONLY_FILE="$1"
+        shift
+      else
+        usage
+      fi
+      ;;
+    --image-first)
+      IMAGE_FIRST=true
+      shift
+      ;;
+    --force)
+      FORCE=true
+      shift
+      ;;
+    --enum-only)
+      ENUM_ONLY=true
+      shift
+      ;;
+    -*)
+      echo "Unknown option: $1" >&2
+      usage
+      ;;
+    *)
+      # First non-option argument is the target
+      if [[ -z "$TARGET" && "$LOAD_ONLY_MODE" == false ]]; then
+        TARGET="$1"
+        shift
+        break  # Stop parsing after target is set
+      else
+        # Extra arguments not allowed
+        usage
+      fi
+      ;;
+  esac
+done
+
+# Check for extra arguments after target
+if [[ $# -gt 0 ]]; then
+  echo "Extra arguments not allowed after target: $@" >&2
+  usage
+fi
+
+# Validate arguments
+if [[ "$LOAD_ONLY_MODE" == true ]]; then
+  [[ -n "$LOAD_ONLY_FILE" ]] || usage
 else
-  LOAD_ONLY_MODE=false
-  TARGET="$1"
-  shift
-
-  # Parse flags
-  IMAGE_FIRST=false
-  FORCE=false
-  ENUM_ONLY=false
-
-  for arg in "$@"; do
-    case $arg in
-      --image-first) IMAGE_FIRST=true ;;
-      --force)       FORCE=true ;;
-      --enum-only)   ENUM_ONLY=true ;;
-      *) usage ;;
-    esac
-  done
+  [[ -n "$TARGET" ]] || usage
 fi
 
 # ---------- main ----------
