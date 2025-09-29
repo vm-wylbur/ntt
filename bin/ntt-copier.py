@@ -512,8 +512,24 @@ def run_re_hardlink_mode():
     
     try:
         with conn.cursor() as cur:
-            # Get all blobs
-            query = "SELECT blobid, encode(blobid, 'escape') as hex_hash FROM blobs"
+            # Get only incomplete blobs (where n_hardlinks < expected paths)
+            query = """
+                WITH blob_status AS (
+                    SELECT 
+                        b.blobid,
+                        encode(b.blobid, 'escape') as hex_hash,
+                        COALESCE(b.n_hardlinks, 0) as actual,
+                        COUNT(DISTINCT p.path) as expected
+                    FROM blobs b
+                    JOIN inode i ON i.hash = b.blobid::bytea
+                    JOIN path p ON p.dev = i.dev AND p.ino = i.ino
+                    GROUP BY b.blobid, b.n_hardlinks
+                )
+                SELECT blobid, hex_hash, actual, expected
+                FROM blob_status 
+                WHERE actual < expected
+                ORDER BY expected - actual DESC
+            """
             if LIMIT > 0:
                 query += f" LIMIT {LIMIT}"
             
@@ -521,13 +537,39 @@ def run_re_hardlink_mode():
             blobs = cur.fetchall()
             total = len(blobs)
             
-            logger.info(f"Processing {total} blobs...")
+            if total == 0:
+                logger.success("No incomplete blobs found - all hardlinks are complete!")
+                return 0
+            
+            logger.info(f"Found {total} incomplete blobs to process...")
+            if LIMIT > 0 and total == LIMIT:
+                # There might be more incomplete blobs
+                cur.execute("""
+                    SELECT COUNT(*) as total_incomplete FROM (
+                        WITH blob_status AS (
+                            SELECT 
+                                b.blobid,
+                                COALESCE(b.n_hardlinks, 0) as actual,
+                                COUNT(DISTINCT p.path) as expected
+                            FROM blobs b
+                            JOIN inode i ON i.hash = b.blobid::bytea
+                            JOIN path p ON p.dev = i.dev AND p.ino = i.ino
+                            GROUP BY b.blobid, b.n_hardlinks
+                        )
+                        SELECT 1 FROM blob_status WHERE actual < expected
+                    ) t
+                """)
+                result = cur.fetchone()
+                if result:
+                    logger.info(f"Total incomplete blobs in database: {result['total_incomplete']}")
             
             for i, blob in enumerate(blobs):
                 if i > 0 and i % 100 == 0:
-                    logger.info(f"Progress: {i}/{total} ({i*100/total:.1f}%)")
+                    logger.info(f"Progress: {i}/{total} ({i*100/total:.1f}%) - {stats['hardlinks_created']} links created")
                 
                 hex_hash = blob['hex_hash']
+                if VERBOSE and 'actual' in blob:
+                    logger.debug(f"Processing blob {hex_hash[:12]}... ({blob['actual']}/{blob['expected']} existing)")
                 by_hash_path = BY_HASH_ROOT / hex_hash[:2] / hex_hash[2:4] / hex_hash
                 
                 # Check if by-hash exists
@@ -606,6 +648,12 @@ def run_re_hardlink_mode():
     logger.success(f"Hardlinks existed: {stats['hardlinks_existed']}")
     if stats['errors'] > 0:
         logger.error(f"Errors: {stats['errors']}")
+    
+    # Check if there might be more work
+    if LIMIT > 0 and stats['blobs_processed'] == LIMIT:
+        logger.info("Limit reached - there may be more incomplete blobs")
+        logger.info("Run again to continue processing remaining incomplete blobs")
+    
     logger.success("=" * 60)
     
     # Output processed blobs if requested
