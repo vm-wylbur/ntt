@@ -101,6 +101,12 @@ class NTTDashboard(App):
     .status-error {
         color: yellow;
     }
+    .status-done {
+        color: cyan;
+    }
+    .status-unknown {
+        color: orange;
+    }
 
     .metric-good {
         color: green;
@@ -110,6 +116,27 @@ class NTTDashboard(App):
     }
     .metric-critical {
         color: red;
+    }
+    
+    #worker-title, #system-stats-title, #metrics-title, #queue-title {
+        background: $primary;
+        color: $text;
+        text-style: bold;
+        padding: 1;
+        width: 100%;
+        text-align: center;
+    }
+    
+    #system-stats-panel {
+        margin-top: 2;
+    }
+    
+    #metrics-panel {
+        margin-top: 2;
+    }
+    
+    #queue-panel {
+        margin-top: 2;
     }
     """
 
@@ -127,6 +154,9 @@ class NTTDashboard(App):
         self.current_cpu_load: float = 0.0
         self.current_iowait: float = 0.0
         self.current_cpu_temp: float = 0.0
+        self.current_mem_usage: float = 0.0
+        self.current_mem_pressure: float = 0.0
+        self.inode_dedup_ratio: float = 0.0
 
     def compose(self) -> ComposeResult:
         """Create the main UI layout."""
@@ -162,15 +192,17 @@ class NTTDashboard(App):
     def create_worker_table(self) -> DataTable:
         """Create worker status table."""
         table = DataTable(id="worker-table")
-        table.add_columns("PID", "Worker ID", "Status", "Uptime", "Files", "Rate")
+        table.add_columns("PID", "Worker ID", "Status", "Uptime", "Inodes", "Rate")
         return table
 
     def create_system_stats_display(self) -> Vertical:
         """Create system stats display for CPU and IOwait."""
         return Vertical(
             Label("CPU Load: --", id="cpu-label"),
-            Label("IOwait: --", id="iowait-label"),
             Label("CPU Temp: --", id="temp-label"),
+            Label("IOwait: --", id="iowait-label"),
+            Label("Memory: --", id="mem-label"),
+            Label("Mem Pressure: --", id="pressure-label"),
             id="system-stats-container"
         )
 
@@ -179,7 +211,7 @@ class NTTDashboard(App):
         return Vertical(
             Label("Queue Depth: --", id="queue-label"),
             Label("Processing Rate: --", id="rate-label"),
-            Label("Files Today: --", id="today-label"),
+            Label("Inodes Today: --", id="today-label"),
             Label("Dedup Ratio: --", id="dedup-label"),
             id="metrics-container"
         )
@@ -228,6 +260,11 @@ class NTTDashboard(App):
             
             # Update CPU temperature
             self.current_cpu_temp = await self.get_cpu_temperature()
+            
+            # Update memory stats
+            mem_usage, mem_pressure = await self.get_memory_stats()
+            self.current_mem_usage = mem_usage
+            self.current_mem_pressure = mem_pressure
 
             # Update system metrics (less frequently)
             if self.db_conn:
@@ -259,12 +296,18 @@ class NTTDashboard(App):
                     pid = int(pid_str)
                     worker_id = f"worker-{i+1:02d}"
 
-                    # Check if process is running
+                    # Check if process is running FIRST
                     status = await self.check_process_status(pid)
+                    
+                    # Parse worker log for stats and check if completed
+                    files_processed, current_rate, is_completed = await self.parse_worker_log(worker_id)
+                    
+                    # ONLY mark as 'done' if process is stopped AND work completed
+                    # Never override 'running' status
+                    if status == 'stopped' and is_completed:
+                        status = 'done'
+                    
                     uptime = await self.get_process_uptime(pid)
-
-                    # Parse worker log for stats
-                    files_processed, current_rate = await self.parse_worker_log(worker_id)
 
                     worker_data.append(WorkerStatus(
                         pid=pid,
@@ -315,30 +358,46 @@ class NTTDashboard(App):
         except Exception:
             return "Error"
 
-    async def parse_worker_log(self, worker_id: str) -> tuple[int, float]:
-        """Parse worker log file to extract files processed and current rate."""
+    async def parse_worker_log(self, worker_id: str) -> tuple[int, float, bool]:
+        """Parse worker log file to extract files processed, current rate, and completion status."""
         try:
             import re
             log_file = Path(f"/tmp/ntt-{worker_id}.log")
 
             if not log_file.exists():
-                return 0, 0.0
+                return 0, 0.0, False
 
             loop = asyncio.get_event_loop()
 
             def parse_log():
                 try:
-                    # Only read the last 20 lines to avoid processing entire file
+                    # Only read the last 30 lines to check for completion
                     with open(log_file, 'r') as f:
                         lines = f.readlines()
 
-                    # Only check last 20 lines for performance
-                    recent_lines = lines[-20:] if len(lines) > 20 else lines
+                    # Check last 30 lines for performance
+                    recent_lines = lines[-30:] if len(lines) > 30 else lines
 
                     # Look for the most recent heartbeat line
                     # Format: "17:18:24 [INFO] Heartbeat: 6783 files, 5101.4 MB, 85.0 MB/s, 0 errors"
                     files_processed = 0
                     current_rate = 0.0
+                    is_completed = False
+
+                    # Check for completion patterns in recent lines
+                    for line in recent_lines:
+                        # Check for successful completion indicators
+                        # Note: "processing limit reached" alone doesn't mean done - worker may continue
+                        if any(phrase in line.lower() for phrase in [
+                            'worker complete',
+                            'completed successfully',
+                            'finished processing',
+                            'all files processed',
+                            'worker exiting',
+                            'shutting down gracefully',
+                            'work complete'
+                        ]):
+                            is_completed = True
 
                     for line in reversed(recent_lines):
                         if 'Heartbeat:' in line:
@@ -346,20 +405,74 @@ class NTTDashboard(App):
                             match = re.search(r'Heartbeat: (\d+) files, [\d.]+\s*MB, ([\d.]+)\s*MB/s', line)
                             if match:
                                 files_processed = int(match.group(1))
-                                # Convert MB/s to approximate files/s (rough estimate)
+                                # Convert MB/s to approximate inodes/s (rough estimate)
                                 mb_per_sec = float(match.group(2))
-                                current_rate = mb_per_sec * 10  # Very rough files/sec estimate
+                                current_rate = mb_per_sec * 10  # Very rough inodes/sec estimate
                                 break
 
-                    return files_processed, current_rate
+                    return files_processed, current_rate, is_completed
 
                 except Exception:
-                    return 0, 0.0
+                    return 0, 0.0, False
 
             return await loop.run_in_executor(None, parse_log)
 
         except Exception:
-            return 0, 0.0
+            return 0, 0.0, False
+
+    async def get_memory_stats(self) -> tuple[float, float]:
+        """Get memory usage and pressure statistics."""
+        try:
+            loop = asyncio.get_event_loop()
+            
+            def read_memory_info():
+                try:
+                    with open('/proc/meminfo', 'r') as f:
+                        meminfo = {}
+                        for line in f:
+                            parts = line.split()
+                            if len(parts) >= 2:
+                                key = parts[0].rstrip(':')
+                                # Value is in kB, convert to bytes
+                                value = int(parts[1]) * 1024
+                                meminfo[key] = value
+                    
+                    # Calculate memory usage percentage
+                    total = meminfo.get('MemTotal', 0)
+                    available = meminfo.get('MemAvailable', 0)
+                    
+                    if total == 0:
+                        return 0.0, 0.0
+                    
+                    used = total - available
+                    usage_pct = (used / total) * 100
+                    
+                    # Calculate memory pressure
+                    # Pressure is high when available memory is low
+                    # Consider pressure high when available < 10% of total
+                    # Medium when available < 20%
+                    available_pct = (available / total) * 100
+                    
+                    if available_pct < 5:
+                        pressure = 95.0  # Critical pressure
+                    elif available_pct < 10:
+                        pressure = 80.0  # High pressure  
+                    elif available_pct < 20:
+                        pressure = 60.0  # Medium pressure
+                    elif available_pct < 30:
+                        pressure = 40.0  # Low pressure
+                    else:
+                        pressure = 20.0  # Minimal pressure
+                    
+                    return usage_pct, pressure
+                    
+                except Exception:
+                    return 0.0, 0.0
+            
+            return await loop.run_in_executor(None, read_memory_info)
+            
+        except Exception:
+            return 0.0, 0.0
 
     async def get_cpu_temperature(self) -> float:
         """Get maximum CPU temperature from thermal zones."""
@@ -500,8 +613,65 @@ class NTTDashboard(App):
                     """)
                     return cur.fetchone()
 
+            # Calculate TWO dedup metrics:
+            # 1. Inode-level: unique hashes / hashed inodes
+            # 2. Path-level: unique hashes / paths with hashes (sampled)
+            def query_hash_dedup():
+                with self.db_conn.cursor() as cur:
+                    # Inode-level dedup (exact, fast with index)
+                    cur.execute("""
+                        SELECT 
+                            COUNT(*) as hashed_inodes,
+                            COUNT(DISTINCT hash) as unique_hashes
+                        FROM inode 
+                        WHERE hash IS NOT NULL
+                    """)
+                    inode_result = cur.fetchone()
+                    
+                    # Path-level dedup (sampled for performance)
+                    cur.execute("""
+                        WITH sample_paths AS (
+                            SELECT i.hash
+                            FROM path p
+                            JOIN inode i ON i.dev = p.dev AND i.ino = p.ino
+                            WHERE i.hash IS NOT NULL
+                            LIMIT 5000
+                        )
+                        SELECT 
+                            COUNT(*) as sample_size,
+                            COUNT(DISTINCT hash) as unique_hashes
+                        FROM sample_paths
+                    """)
+                    path_result = cur.fetchone()
+                    
+                    inode_dedup = 0.0
+                    path_dedup = 0.0
+                    
+                    if inode_result and inode_result['hashed_inodes'] > 0:
+                        inode_dedup = ((inode_result['hashed_inodes'] - inode_result['unique_hashes']) 
+                                      / inode_result['hashed_inodes']) * 100
+                    
+                    if path_result and path_result['sample_size'] > 0:
+                        path_dedup = ((path_result['sample_size'] - path_result['unique_hashes']) 
+                                     / path_result['sample_size']) * 100
+                    
+                    # Return path-level dedup as primary metric (more meaningful)
+                    # Store both for potential future display
+                    self.inode_dedup_ratio = inode_dedup
+                    return path_dedup
+            
             queue_depth = await loop.run_in_executor(None, query_queue_depth)
             stats = await loop.run_in_executor(None, query_processing_stats)
+            
+            # Calculate hash-based dedup (should be fast with index)
+            # Only runs if we have a connection
+            if self.db_conn:
+                try:
+                    dedup_ratio = await loop.run_in_executor(None, query_hash_dedup)
+                except Exception:
+                    dedup_ratio = 0.0
+            else:
+                dedup_ratio = 0.0
 
             # Calculate processing rate (files per second over last hour)
             processing_rate = stats['hour_processed'] / 3600.0 if stats['hour_processed'] else 0.0
@@ -512,7 +682,7 @@ class NTTDashboard(App):
                 files_processed_today=stats['today_processed'],
                 total_files_processed=stats['total_processed'],
                 processing_rate=processing_rate,
-                dedup_ratio=0.0,  # TODO: Calculate dedup ratio
+                dedup_ratio=dedup_ratio,  # Now calculated from actual data!
                 last_updated=datetime.now()
             )
 
@@ -553,19 +723,23 @@ class NTTDashboard(App):
                 f"Queue Depth: {latest.queue_depth:,}"
             )
             self.query_one("#rate-label", Label).update(
-                f"Processing Rate: {latest.processing_rate:.1f} files/sec"
+                f"Processing Rate: {latest.processing_rate:.1f} inodes/sec"
             )
             self.query_one("#today-label", Label).update(
-                f"Files Today: {latest.files_processed_today:,}"
+                f"Inodes Today: {latest.files_processed_today:,}"
             )
-            self.query_one("#dedup-label", Label).update(
-                f"Dedup Ratio: {latest.dedup_ratio:.1f}%"
-            )
+            # Show both dedup ratios
+            dedup_text = f"Path Dedup: {latest.dedup_ratio:.1f}%"
+            if hasattr(self, 'inode_dedup_ratio') and self.inode_dedup_ratio > 0:
+                dedup_text += f" (Inode: {self.inode_dedup_ratio:.1f}%)"
+            self.query_one("#dedup-label", Label).update(dedup_text)
 
         # Update system stats labels
         cpu_label = self.query_one("#cpu-label", Label)
         iowait_label = self.query_one("#iowait-label", Label)
         temp_label = self.query_one("#temp-label", Label)
+        mem_label = self.query_one("#mem-label", Label)
+        pressure_label = self.query_one("#pressure-label", Label)
         
         cpu_label.update(f"CPU Load: {self.current_cpu_load:.1f}%")
         iowait_label.update(f"IOwait: {self.current_iowait:.1f}%")
@@ -599,6 +773,28 @@ class NTTDashboard(App):
             iowait_label.styles.color = "yellow"
         else:
             iowait_label.styles.color = "green"
+        
+        # Update memory usage display
+        mem_label.update(f"Memory: {self.current_mem_usage:.1f}%")
+        
+        # Color code memory usage
+        if self.current_mem_usage > 90:
+            mem_label.styles.color = "red"
+        elif self.current_mem_usage > 80:
+            mem_label.styles.color = "yellow"
+        else:
+            mem_label.styles.color = "green"
+        
+        # Update memory pressure display
+        pressure_label.update(f"Mem Pressure: {self.current_mem_pressure:.0f}%")
+        
+        # Color code memory pressure
+        if self.current_mem_pressure >= 80:
+            pressure_label.styles.color = "red"
+        elif self.current_mem_pressure >= 60:
+            pressure_label.styles.color = "yellow"
+        else:
+            pressure_label.styles.color = "green"
 
     def on_unmount(self) -> None:
         """Cleanup on exit."""
