@@ -1,4 +1,4 @@
-#!/usr/bin/env -S uv run --script
+#!/usr/bin/env -S /home/pball/.local/bin/uv run --script
 # /// script
 # requires-python = ">=3.13"
 # dependencies = [
@@ -97,9 +97,12 @@ LIMIT = 0  # Unified limit for both dry-run and live modes
 # Parse command line arguments
 has_dry_run = False
 has_limit = False
+RE_HARDLINK_MODE = False
 
 for arg in sys.argv:
-    if arg.startswith('--dry-run'):
+    if arg == '--re-hardlink':
+        RE_HARDLINK_MODE = True
+    elif arg.startswith('--dry-run'):
         has_dry_run = True
         if '=' in arg:
             # --dry-run=100 format
@@ -469,8 +472,152 @@ class CopyWorker:
         return 0 if self.stats['errors'] == 0 else 1
 
 
+def run_re_hardlink_mode():
+    """Re-create missing hardlinks for all blobs."""
+    logger.remove()
+    logger.add(sys.stderr, format="{time:HH:mm:ss} | {level:<8} | {message}")
+    
+    # Check if we should output blob list
+    output_blobs = '--output-blobs' in sys.argv
+    processed_blobs = []
+    
+    logger.info("=" * 60)
+    logger.info("RE-HARDLINK MODE")
+    if DRY_RUN:
+        logger.info("DRY-RUN - no changes will be made")
+    logger.info("Re-creating missing hardlinks for existing by-hash files")
+    logger.info("=" * 60)
+    
+    # Connect to database
+    try:
+        conn = psycopg.connect(DB_URL, row_factory=dict_row)
+    except Exception as e:
+        logger.error(f"Failed to connect to database: {e}")
+        return 1
+    
+    stats = {
+        'blobs_processed': 0,
+        'by_hash_missing': 0,
+        'hardlinks_created': 0,
+        'hardlinks_existed': 0,
+        'errors': 0
+    }
+    
+    try:
+        with conn.cursor() as cur:
+            # Get all blobs
+            query = "SELECT blobid, encode(blobid, 'escape') as hex_hash FROM blobs"
+            if LIMIT > 0:
+                query += f" LIMIT {LIMIT}"
+            
+            cur.execute(query)
+            blobs = cur.fetchall()
+            total = len(blobs)
+            
+            logger.info(f"Processing {total} blobs...")
+            
+            for i, blob in enumerate(blobs):
+                if i > 0 and i % 100 == 0:
+                    logger.info(f"Progress: {i}/{total} ({i*100/total:.1f}%)")
+                
+                hex_hash = blob['hex_hash']
+                by_hash_path = BY_HASH_ROOT / hex_hash[:2] / hex_hash[2:4] / hex_hash
+                
+                # Check if by-hash exists
+                if not by_hash_path.exists():
+                    logger.warning(f"By-hash missing: {hex_hash[:12]}...")
+                    stats['by_hash_missing'] += 1
+                    continue
+                
+                # Get all paths for this blob
+                cur.execute("""
+                    SELECT DISTINCT p.path
+                    FROM path p
+                    JOIN inode i ON p.dev = i.dev AND p.ino = i.ino
+                    WHERE i.hash = %s
+                    ORDER BY p.path
+                """, (blob['blobid'],))
+                
+                paths = cur.fetchall()
+                hardlinks_created_for_blob = 0
+                
+                for path_row in paths:
+                    path = path_row['path']
+                    archive_path = ARCHIVE_ROOT / path.lstrip('/')
+                    
+                    if not archive_path.exists():
+                        if not DRY_RUN:
+                            try:
+                                archive_path.parent.mkdir(parents=True, exist_ok=True)
+                                os.link(by_hash_path, archive_path)
+                                stats['hardlinks_created'] += 1
+                                hardlinks_created_for_blob += 1
+                                logger.debug(f"Created hardlink: {path}")
+                            except Exception as e:
+                                logger.error(f"Failed to create hardlink for {path}: {e}")
+                                stats['errors'] += 1
+                        else:
+                            logger.debug(f"[DRY-RUN] Would create hardlink: {path}")
+                            stats['hardlinks_created'] += 1
+                            hardlinks_created_for_blob += 1
+                    else:
+                        stats['hardlinks_existed'] += 1
+                
+                # Update n_hardlinks count
+                if hardlinks_created_for_blob > 0 and not DRY_RUN:
+                    cur.execute("""
+                        UPDATE blobs
+                        SET n_hardlinks = COALESCE(n_hardlinks, 0) + %s
+                        WHERE blobid = %s
+                    """, (hardlinks_created_for_blob, blob['blobid']))
+                
+                stats['blobs_processed'] += 1
+                
+                # Track processed blobs if requested
+                if output_blobs:
+                    processed_blobs.append(hex_hash)
+        
+        if not DRY_RUN:
+            conn.commit()
+            logger.info("Database updated")
+        
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
+        conn.rollback()
+        return 1
+    finally:
+        conn.close()
+    
+    # Print summary
+    logger.success("=" * 60)
+    logger.success("Re-hardlink Complete")
+    logger.success(f"Blobs processed: {stats['blobs_processed']}")
+    logger.success(f"By-hash missing: {stats['by_hash_missing']}")
+    logger.success(f"Hardlinks created: {stats['hardlinks_created']}")
+    logger.success(f"Hardlinks existed: {stats['hardlinks_existed']}")
+    if stats['errors'] > 0:
+        logger.error(f"Errors: {stats['errors']}")
+    logger.success("=" * 60)
+    
+    # Output processed blobs if requested
+    if output_blobs and processed_blobs:
+        output_file = Path('/tmp/rehardlinked_blobs.txt')
+        with open(output_file, 'w') as f:
+            for blob in processed_blobs:
+                f.write(f"{blob}\n")
+        logger.info(f"Wrote {len(processed_blobs)} blob IDs to {output_file}")
+        logger.info("To verify these blobs, run:")
+        logger.info(f"  sudo /home/pball/projects/ntt/bin/ntt-verify.py --from-file {output_file}")
+    
+    return 0 if stats['errors'] == 0 else 1
+
+
 def main():
     """Entry point."""
+    # Check for re-hardlink mode first
+    if RE_HARDLINK_MODE:
+        sys.exit(run_re_hardlink_mode())
+    
     # Ensure temp directories exist with proper permissions
     for temp_dir in [RAMDISK, NVME_TMP]:
         try:

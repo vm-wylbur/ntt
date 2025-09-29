@@ -438,6 +438,13 @@ class FileProcessor(InodeProcessor):
                       context.row['medium_hash'],
                       context.row['dev'],
                       context.row['ino']))
+                
+                # Insert into blobs table (ignore if already exists)
+                cur.execute("""
+                    INSERT INTO blobs (blobid, last_checked)
+                    VALUES (%s::text::bytea, NULL)
+                    ON CONFLICT (blobid) DO NOTHING
+                """, (context.hash_value,))
             worker.conn.commit()
         else:
             worker.logger.info("[DRY-RUN] Would update database for empty file",
@@ -487,4 +494,11 @@ class FileProcessor(InodeProcessor):
                   context.row['medium_hash'],
                   context.row['dev'],
                   context.row['ino']))
+            
+            # Insert into blobs table (ignore if already exists)
+            cur.execute("""
+                INSERT INTO blobs (blobid, last_checked)
+                VALUES (%s::text::bytea, NULL)
+                ON CONFLICT (blobid) DO NOTHING
+            """, (context.hash_value,))
         worker.conn.commit()
