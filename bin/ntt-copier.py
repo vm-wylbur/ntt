@@ -98,10 +98,13 @@ LIMIT = 0  # Unified limit for both dry-run and live modes
 has_dry_run = False
 has_limit = False
 RE_HARDLINK_MODE = False
+VERBOSE = False
 
 for arg in sys.argv:
     if arg == '--re-hardlink':
         RE_HARDLINK_MODE = True
+    elif arg == '--verbose':
+        VERBOSE = True
     elif arg.startswith('--dry-run'):
         has_dry_run = True
         if '=' in arg:
@@ -475,7 +478,11 @@ class CopyWorker:
 def run_re_hardlink_mode():
     """Re-create missing hardlinks for all blobs."""
     logger.remove()
-    logger.add(sys.stderr, format="{time:HH:mm:ss} | {level:<8} | {message}")
+    # Add date to timestamp and set appropriate log level
+    if VERBOSE:
+        logger.add(sys.stderr, format="{time:YYYY-MM-DD HH:mm:ss} | {level:<8} | {message}", level="DEBUG")
+    else:
+        logger.add(sys.stderr, format="{time:YYYY-MM-DD HH:mm:ss} | {level:<8} | {message}", level="INFO")
     
     # Check if we should output blob list
     output_blobs = '--output-blobs' in sys.argv
@@ -552,12 +559,14 @@ def run_re_hardlink_mode():
                                 os.link(by_hash_path, archive_path)
                                 stats['hardlinks_created'] += 1
                                 hardlinks_created_for_blob += 1
-                                logger.debug(f"Created hardlink: {path}")
+                                if VERBOSE:
+                                    logger.debug(f"Created hardlink: {path}")
                             except Exception as e:
                                 logger.error(f"Failed to create hardlink for {path}: {e}")
                                 stats['errors'] += 1
                         else:
-                            logger.debug(f"[DRY-RUN] Would create hardlink: {path}")
+                            if VERBOSE:
+                                logger.debug(f"[DRY-RUN] Would create hardlink: {path}")
                             stats['hardlinks_created'] += 1
                             hardlinks_created_for_blob += 1
                     else:
