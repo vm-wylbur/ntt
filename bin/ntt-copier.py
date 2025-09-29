@@ -178,6 +178,12 @@ class CopyWorker:
             retention="30 days" if not DRY_RUN else "7 days",  # Shorter retention for dry-run
             level="DEBUG"
         )
+
+        # Make log files readable by dashboard user
+        try:
+            log_file.chmod(0o644)
+        except (OSError, PermissionError):
+            pass  # Ignore permission errors, dashboard will handle gracefully
         logger.add(sys.stderr, format="{time:HH:mm:ss} [{level}] {message}", level="INFO")
 
         # Bind context without reassigning
