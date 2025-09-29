@@ -1,0 +1,619 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.13"
+# dependencies = [
+#     "textual>=0.45.0",
+#     "plotext>=5.0.0",
+#     "psycopg[binary]>=3.0.0",
+#     "rich>=13.0.0"
+# ]
+# ///
+#
+# Author: PB and Claude
+# Date: 2025-09-28
+# License: (c) HRDAG, 2025, GPL-2 or newer
+#
+# ------
+# ntt/bin/ntt-dashboard
+#
+# NTT System Dashboard - Real-time monitoring TUI for copy workers and system status
+#
+# Features:
+# - Live worker status monitoring (no sudo required)
+# - Database metrics and queue depth tracking
+# - Processing throughput charts
+# - Log viewing and filtering
+#
+# Requirements:
+#   - Python 3.13+
+#   - PostgreSQL access (same credentials as ntt-copier)
+#   - Read access to worker PID files and logs
+
+import asyncio
+import os
+import sys
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Dict, List, Optional, NamedTuple
+
+import plotext as plt
+import psycopg
+from psycopg.rows import dict_row
+from rich.text import Text
+from textual.app import App, ComposeResult
+from textual.containers import Grid, Horizontal, Vertical
+from textual.widgets import (
+    DataTable, Footer, Header, Label, Log,
+    TabbedContent, TabPane, Static
+)
+from textual.reactive import reactive
+from textual.timer import Timer
+
+
+# Configuration - same as ntt-copier.py for consistency
+DB_URL = os.environ.get('NTT_DB_URL', 'postgresql:///copyjob')
+PID_FILE = Path('/tmp/ntt-workers.pids')
+WORKER_LOG_PATTERN = '/tmp/ntt-worker-*.log'
+
+# Set PostgreSQL user to original user when running under sudo
+if 'SUDO_USER' in os.environ:
+    os.environ['PGUSER'] = os.environ['SUDO_USER']
+elif os.geteuid() == 0 and 'USER' in os.environ:
+    os.environ['PGUSER'] = 'postgres'
+
+# If running as root and DB_URL doesn't specify a user, add the original user
+if os.geteuid() == 0 and 'SUDO_USER' in os.environ:
+    if '://' in DB_URL and '@' not in DB_URL:
+        DB_URL = DB_URL.replace(':///', f"://{os.environ['SUDO_USER']}@localhost/")
+
+
+class WorkerStatus(NamedTuple):
+    """Immutable worker status data for caching and display."""
+    pid: int
+    worker_id: str
+    status: str  # 'running', 'stopped', 'error'
+    uptime: str
+    files_processed: int = 0
+    current_rate: float = 0.0
+
+
+class SystemMetrics(NamedTuple):
+    """Immutable system metrics for dashboard display."""
+    queue_depth: int
+    files_processed_today: int
+    total_files_processed: int
+    processing_rate: float  # files per second
+    dedup_ratio: float  # percentage
+    last_updated: datetime
+
+
+class NTTDashboard(App):
+    """Main TUI application for NTT system monitoring."""
+
+    CSS = """
+    .status-running {
+        color: green;
+    }
+    .status-stopped {
+        color: red;
+    }
+    .status-error {
+        color: yellow;
+    }
+
+    .metric-good {
+        color: green;
+    }
+    .metric-warning {
+        color: yellow;
+    }
+    .metric-critical {
+        color: red;
+    }
+    """
+
+    # Reactive attributes for live updates
+    worker_count = reactive(0)
+    queue_depth = reactive(0)
+    processing_rate = reactive(0.0)
+
+    def __init__(self):
+        super().__init__()
+        self.db_conn: Optional[psycopg.Connection] = None
+        self.update_timer: Optional[Timer] = None
+        self.worker_data: List[WorkerStatus] = []
+        self.metrics_history: List[SystemMetrics] = []
+        self.current_cpu_load: float = 0.0
+        self.current_iowait: float = 0.0
+        self.current_cpu_temp: float = 0.0
+
+    def compose(self) -> ComposeResult:
+        """Create the main UI layout."""
+        yield Header()
+        yield Footer()
+
+        with TabbedContent(initial="live"):
+            with TabPane("Live Status", id="live"):
+                with Grid(id="main-grid"):
+                    with Vertical(id="worker-panel"):
+                        yield Static("Worker Status", id="worker-title")
+                        yield self.create_worker_table()
+                    with Vertical(id="system-stats-panel"):
+                        yield Static("System Stats", id="system-stats-title")
+                        yield self.create_system_stats_display()
+                    with Vertical(id="metrics-panel"):
+                        yield Static("System Metrics", id="metrics-title")
+                        yield self.create_metrics_display()
+                    with Vertical(id="queue-panel"):
+                        yield Static("Queue Depth", id="queue-title")
+                        yield self.create_queue_chart()
+
+            with TabPane("History", id="history"):
+                with Vertical():
+                    yield Static("Historical Analysis", id="history-title")
+                    yield Static("Historical charts will be implemented here")
+
+            with TabPane("Logs", id="logs"):
+                with Vertical():
+                    yield Static("System Logs", id="logs-title")
+                    yield Log()
+
+    def create_worker_table(self) -> DataTable:
+        """Create worker status table."""
+        table = DataTable(id="worker-table")
+        table.add_columns("PID", "Worker ID", "Status", "Uptime", "Files", "Rate")
+        return table
+
+    def create_system_stats_display(self) -> Vertical:
+        """Create system stats display for CPU and IOwait."""
+        return Vertical(
+            Label("CPU Load: --", id="cpu-label"),
+            Label("IOwait: --", id="iowait-label"),
+            Label("CPU Temp: --", id="temp-label"),
+            id="system-stats-container"
+        )
+
+    def create_metrics_display(self) -> Vertical:
+        """Create system metrics display."""
+        return Vertical(
+            Label("Queue Depth: --", id="queue-label"),
+            Label("Processing Rate: --", id="rate-label"),
+            Label("Files Today: --", id="today-label"),
+            Label("Dedup Ratio: --", id="dedup-label"),
+            id="metrics-container"
+        )
+
+    def create_queue_chart(self) -> Static:
+        """Create placeholder for queue depth chart."""
+        return Static("Queue depth chart will update here", id="queue-chart")
+
+    async def on_mount(self) -> None:
+        """Initialize dashboard on startup."""
+        self.title = "NTT System Dashboard"
+
+        # Connect to database
+        try:
+            await self.connect_database()
+            self.notify("Connected to NTT database", severity="information")
+        except Exception as e:
+            self.notify(f"Database connection failed: {e}", severity="error")
+
+        # Start periodic updates (slower to avoid CPU overload)
+        self.update_timer = self.set_interval(5.0, self.update_data)
+
+        # Initial data load
+        await self.update_data()
+
+    async def connect_database(self) -> None:
+        """Establish database connection."""
+        loop = asyncio.get_event_loop()
+        self.db_conn = await loop.run_in_executor(
+            None, lambda: psycopg.connect(DB_URL, row_factory=dict_row)
+        )
+
+    async def update_data(self) -> None:
+        """Update all dashboard data."""
+        try:
+            # Add a small delay to prevent tight loops
+            await asyncio.sleep(0.1)
+
+            # Update worker status
+            await self.update_worker_status()
+
+            # Update CPU and IOwait stats
+            cpu_load, iowait = await self.get_cpu_stats()
+            self.current_cpu_load = cpu_load
+            self.current_iowait = iowait
+            
+            # Update CPU temperature
+            self.current_cpu_temp = await self.get_cpu_temperature()
+
+            # Update system metrics (less frequently)
+            if self.db_conn:
+                await self.update_system_metrics()
+
+            # Update displays
+            self.refresh_displays()
+
+        except Exception as e:
+            self.notify(f"Update error: {e}", severity="warning")
+
+    async def update_worker_status(self) -> None:
+        """Read worker PIDs and check their status."""
+        worker_data = []
+
+        if not PID_FILE.exists():
+            self.worker_data = []
+            return
+
+        try:
+            with open(PID_FILE) as f:
+                pids = [line.strip() for line in f if line.strip()]
+
+            for i, pid_str in enumerate(pids):
+                if not pid_str:
+                    continue
+
+                try:
+                    pid = int(pid_str)
+                    worker_id = f"worker-{i+1:02d}"
+
+                    # Check if process is running
+                    status = await self.check_process_status(pid)
+                    uptime = await self.get_process_uptime(pid)
+
+                    # Parse worker log for stats
+                    files_processed, current_rate = await self.parse_worker_log(worker_id)
+
+                    worker_data.append(WorkerStatus(
+                        pid=pid,
+                        worker_id=worker_id,
+                        status=status,
+                        uptime=uptime,
+                        files_processed=files_processed,
+                        current_rate=current_rate
+                    ))
+
+                except ValueError:
+                    continue
+
+            self.worker_data = worker_data
+            self.worker_count = len([w for w in worker_data if w.status == 'running'])
+
+        except Exception as e:
+            self.notify(f"Worker status error: {e}", severity="warning")
+
+    async def check_process_status(self, pid: int) -> str:
+        """Check if a process is running using efficient OS signal."""
+        try:
+            os.kill(pid, 0)  # Signal 0 = check existence, no subprocess!
+            return 'running'
+        except ProcessLookupError:
+            return 'stopped'
+        except PermissionError:
+            return 'unknown'  # Process exists but we can't check it
+        except (OSError, ValueError):
+            return 'error'
+
+    async def get_process_uptime(self, pid: int) -> str:
+        """Get process uptime string."""
+        try:
+            import subprocess
+            loop = asyncio.get_event_loop()
+
+            def get_uptime():
+                result = subprocess.run(
+                    ['ps', '-p', str(pid), '-o', 'etime='],
+                    capture_output=True, text=True
+                )
+                if result.returncode == 0:
+                    return result.stdout.strip()
+                return "Unknown"
+
+            return await loop.run_in_executor(None, get_uptime)
+        except Exception:
+            return "Error"
+
+    async def parse_worker_log(self, worker_id: str) -> tuple[int, float]:
+        """Parse worker log file to extract files processed and current rate."""
+        try:
+            import re
+            log_file = Path(f"/tmp/ntt-{worker_id}.log")
+
+            if not log_file.exists():
+                return 0, 0.0
+
+            loop = asyncio.get_event_loop()
+
+            def parse_log():
+                try:
+                    # Only read the last 20 lines to avoid processing entire file
+                    with open(log_file, 'r') as f:
+                        lines = f.readlines()
+
+                    # Only check last 20 lines for performance
+                    recent_lines = lines[-20:] if len(lines) > 20 else lines
+
+                    # Look for the most recent heartbeat line
+                    # Format: "17:18:24 [INFO] Heartbeat: 6783 files, 5101.4 MB, 85.0 MB/s, 0 errors"
+                    files_processed = 0
+                    current_rate = 0.0
+
+                    for line in reversed(recent_lines):
+                        if 'Heartbeat:' in line:
+                            # Extract files and rate using regex
+                            match = re.search(r'Heartbeat: (\d+) files, [\d.]+\s*MB, ([\d.]+)\s*MB/s', line)
+                            if match:
+                                files_processed = int(match.group(1))
+                                # Convert MB/s to approximate files/s (rough estimate)
+                                mb_per_sec = float(match.group(2))
+                                current_rate = mb_per_sec * 10  # Very rough files/sec estimate
+                                break
+
+                    return files_processed, current_rate
+
+                except Exception:
+                    return 0, 0.0
+
+            return await loop.run_in_executor(None, parse_log)
+
+        except Exception:
+            return 0, 0.0
+
+    async def get_cpu_temperature(self) -> float:
+        """Get maximum CPU temperature from thermal zones."""
+        try:
+            import glob
+            loop = asyncio.get_event_loop()
+            
+            def read_temps():
+                try:
+                    max_temp = 0.0
+                    
+                    # Try thermal zone approach (most common)
+                    thermal_zones = glob.glob('/sys/class/thermal/thermal_zone*/temp')
+                    for zone_path in thermal_zones:
+                        try:
+                            with open(zone_path, 'r') as f:
+                                # Temperature is in millidegrees Celsius
+                                temp = int(f.read().strip()) / 1000.0
+                                max_temp = max(max_temp, temp)
+                        except (IOError, ValueError):
+                            continue
+                    
+                    # If no thermal zones, try hwmon approach
+                    if max_temp == 0.0:
+                        hwmon_temps = glob.glob('/sys/class/hwmon/hwmon*/temp*_input')
+                        for temp_path in hwmon_temps:
+                            try:
+                                with open(temp_path, 'r') as f:
+                                    # Temperature is in millidegrees Celsius
+                                    temp = int(f.read().strip()) / 1000.0
+                                    max_temp = max(max_temp, temp)
+                            except (IOError, ValueError):
+                                continue
+                    
+                    # If still no reading, try coretemp driver
+                    if max_temp == 0.0:
+                        coretemp_paths = glob.glob('/sys/devices/platform/coretemp.*/hwmon/hwmon*/temp*_input')
+                        for temp_path in coretemp_paths:
+                            try:
+                                with open(temp_path, 'r') as f:
+                                    temp = int(f.read().strip()) / 1000.0
+                                    max_temp = max(max_temp, temp)
+                            except (IOError, ValueError):
+                                continue
+                    
+                    return max_temp if max_temp > 0 else -1.0  # -1 indicates no reading available
+                    
+                except Exception:
+                    return -1.0
+            
+            return await loop.run_in_executor(None, read_temps)
+            
+        except Exception:
+            return -1.0
+
+    async def get_cpu_stats(self) -> tuple[float, float]:
+        """Read CPU load and IOwait from /proc/stat."""
+        try:
+            loop = asyncio.get_event_loop()
+            
+            def read_proc_stat():
+                try:
+                    with open('/proc/stat', 'r') as f:
+                        cpu_line = f.readline()
+                    
+                    # Parse CPU line: cpu user nice system idle iowait irq softirq steal guest guest_nice
+                    parts = cpu_line.split()
+                    if len(parts) < 6:
+                        return 0.0, 0.0
+                    
+                    user = int(parts[1])
+                    nice = int(parts[2])
+                    system = int(parts[3])
+                    idle = int(parts[4])
+                    iowait = int(parts[5])
+                    
+                    total = user + nice + system + idle + iowait
+                    if total == 0:
+                        return 0.0, 0.0
+                    
+                    # Store current values for delta calculation
+                    if not hasattr(self, 'prev_cpu_stats'):
+                        self.prev_cpu_stats = (user + nice + system, idle, iowait, total)
+                        return 0.0, 0.0
+                    
+                    prev_active, prev_idle, prev_iowait, prev_total = self.prev_cpu_stats
+                    
+                    # Calculate deltas
+                    delta_total = total - prev_total
+                    if delta_total == 0:
+                        return self.current_cpu_load, self.current_iowait
+                    
+                    current_active = user + nice + system
+                    delta_active = current_active - prev_active
+                    delta_iowait = iowait - prev_iowait
+                    
+                    cpu_load = (delta_active / delta_total) * 100
+                    iowait_pct = (delta_iowait / delta_total) * 100
+                    
+                    # Update stored values
+                    self.prev_cpu_stats = (current_active, idle, iowait, total)
+                    self.current_cpu_load = cpu_load
+                    self.current_iowait = iowait_pct
+                    
+                    return cpu_load, iowait_pct
+                    
+                except Exception:
+                    return 0.0, 0.0
+            
+            return await loop.run_in_executor(None, read_proc_stat)
+            
+        except Exception:
+            return 0.0, 0.0
+
+    async def update_system_metrics(self) -> None:
+        """Query database for system metrics."""
+        if not self.db_conn:
+            return
+
+        try:
+            loop = asyncio.get_event_loop()
+
+            # Query queue depth
+            def query_queue_depth():
+                with self.db_conn.cursor() as cur:
+                    cur.execute("SELECT COUNT(*) as count FROM inode WHERE copied = false")
+                    return cur.fetchone()['count']
+
+            # Query processing stats
+            def query_processing_stats():
+                with self.db_conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT
+                            COUNT(*) FILTER (WHERE copied = true) as total_processed,
+                            COUNT(*) FILTER (WHERE copied = true AND processed_at >= CURRENT_DATE) as today_processed,
+                            COUNT(*) FILTER (WHERE copied = true AND processed_at >= NOW() - INTERVAL '1 hour') as hour_processed
+                        FROM inode
+                    """)
+                    return cur.fetchone()
+
+            queue_depth = await loop.run_in_executor(None, query_queue_depth)
+            stats = await loop.run_in_executor(None, query_processing_stats)
+
+            # Calculate processing rate (files per second over last hour)
+            processing_rate = stats['hour_processed'] / 3600.0 if stats['hour_processed'] else 0.0
+
+            # Create metrics object
+            metrics = SystemMetrics(
+                queue_depth=queue_depth,
+                files_processed_today=stats['today_processed'],
+                total_files_processed=stats['total_processed'],
+                processing_rate=processing_rate,
+                dedup_ratio=0.0,  # TODO: Calculate dedup ratio
+                last_updated=datetime.now()
+            )
+
+            # Update reactive attributes
+            self.queue_depth = queue_depth
+            self.processing_rate = processing_rate
+
+            # Store for history
+            self.metrics_history.append(metrics)
+            if len(self.metrics_history) > 300:  # Keep last 5 minutes at 2s intervals
+                self.metrics_history.pop(0)
+
+        except Exception as e:
+            self.notify(f"Metrics query error: {e}", severity="warning")
+
+    def refresh_displays(self) -> None:
+        """Update all display widgets with current data."""
+        # Update worker table
+        worker_table = self.query_one("#worker-table", DataTable)
+        worker_table.clear()
+
+        for worker in self.worker_data:
+            status_style = f"status-{worker.status}"
+            worker_table.add_row(
+                str(worker.pid),
+                worker.worker_id,
+                Text(worker.status.title(), style=status_style),
+                worker.uptime,
+                str(worker.files_processed),
+                f"{worker.current_rate:.1f}/s"
+            )
+
+        # Update metrics labels
+        if self.metrics_history:
+            latest = self.metrics_history[-1]
+
+            self.query_one("#queue-label", Label).update(
+                f"Queue Depth: {latest.queue_depth:,}"
+            )
+            self.query_one("#rate-label", Label).update(
+                f"Processing Rate: {latest.processing_rate:.1f} files/sec"
+            )
+            self.query_one("#today-label", Label).update(
+                f"Files Today: {latest.files_processed_today:,}"
+            )
+            self.query_one("#dedup-label", Label).update(
+                f"Dedup Ratio: {latest.dedup_ratio:.1f}%"
+            )
+
+        # Update system stats labels
+        cpu_label = self.query_one("#cpu-label", Label)
+        iowait_label = self.query_one("#iowait-label", Label)
+        temp_label = self.query_one("#temp-label", Label)
+        
+        cpu_label.update(f"CPU Load: {self.current_cpu_load:.1f}%")
+        iowait_label.update(f"IOwait: {self.current_iowait:.1f}%")
+        
+        # Update temperature display
+        if self.current_cpu_temp > 0:
+            temp_label.update(f"CPU Temp: {self.current_cpu_temp:.1f}°C")
+            # Add color coding for temperature
+            if self.current_cpu_temp > 85:
+                temp_label.styles.color = "red"
+            elif self.current_cpu_temp > 70:
+                temp_label.styles.color = "yellow"
+            else:
+                temp_label.styles.color = "green"
+        else:
+            temp_label.update("CPU Temp: N/A")
+            temp_label.styles.color = "dim"
+        
+        # Add color coding for CPU load
+        if self.current_cpu_load > 80:
+            cpu_label.styles.color = "red"
+        elif self.current_cpu_load > 60:
+            cpu_label.styles.color = "yellow"
+        else:
+            cpu_label.styles.color = "green"
+        
+        # Add color coding for IOwait
+        if self.current_iowait > 30:
+            iowait_label.styles.color = "red"
+        elif self.current_iowait > 10:
+            iowait_label.styles.color = "yellow"
+        else:
+            iowait_label.styles.color = "green"
+
+    def on_unmount(self) -> None:
+        """Cleanup on exit."""
+        if self.update_timer:
+            self.update_timer.stop()
+
+        if self.db_conn:
+            self.db_conn.close()
+
+
+def main():
+    """Entry point for dashboard application."""
+    app = NTTDashboard()
+    app.run()
+
+
+if __name__ == "__main__":
+    main()
