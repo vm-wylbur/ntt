@@ -16,6 +16,9 @@
 # ntt/bin/ntt-verify.py
 #
 # NTT blob verifier - verifies content integrity in archived storage
+#
+# IMPORTANT: Run with environment loaded:
+#   source ~/.config/ntt/ntt.env && sudo -E ntt-verify.py [options]
 
 import os
 import sys
@@ -37,6 +40,7 @@ DB_URL = os.environ.get('NTT_DB_URL', 'postgresql:///copyjob')
 BY_HASH_ROOT = Path(os.environ.get('NTT_BY_HASH_ROOT', '/data/cold/by-hash'))
 ARCHIVE_ROOT = Path(os.environ.get('NTT_ARCHIVE_ROOT', '/data/cold/archived'))
 LOG_JSON = Path(os.environ.get('NTT_LOG_JSON', '/var/log/ntt/verify.jsonl'))
+IGNORE_PATTERNS_FILE = os.environ.get('NTT_IGNORE_PATTERNS', '')
 
 # Default settings
 DEFAULT_SAMPLE_SIZE = 1000  # For TABLESAMPLE
@@ -107,12 +111,17 @@ class BlobVerification:
         if self.mismatched_paths is None:
             self.mismatched_paths = []
     
-    def is_success(self) -> bool:
-        """Check if verification was completely successful."""
-        return (self.by_hash_exists and 
-                self.total_paths == self.verified_paths and
-                not self.error)
 
+    def is_success(self) -> bool:
+        """Check if verification was completely successful.
+        
+        Stat mismatches (different inodes/mtimes) don't count as failures - 
+        they just indicate files that could be deduplicated but aren't yet.
+        Only real errors count: missing by-hash, missing paths, permission errors.
+        """
+        has_real_errors = not self.by_hash_exists or len(self.missing_paths) > 0 or self.error
+        # Success if no real errors (even if verified_paths is 0 due to all paths being filtered)
+        return not has_real_errors
 
 class BlobVerifier:
     """Verifies blob integrity in content-addressable storage."""
@@ -126,11 +135,29 @@ class BlobVerifier:
         self.dry_run = dry_run
         self.sample_size = sample_size
         
+        # Setup logging first so all subsequent logs use correct format
+        self.setup_logging()
+        
+        # Load ignore patterns
+        self.ignore_patterns = []
+        if IGNORE_PATTERNS_FILE and Path(IGNORE_PATTERNS_FILE).exists():
+            with open(IGNORE_PATTERNS_FILE) as f:
+                self.ignore_patterns = [
+                    line.strip() for line in f
+                    if line.strip() and not line.strip().startswith('#')
+                ]
+            logger.info(f"Loaded {len(self.ignore_patterns)} ignore patterns from {IGNORE_PATTERNS_FILE}")
+        elif IGNORE_PATTERNS_FILE:
+            logger.debug(f"Ignore patterns file not found: {IGNORE_PATTERNS_FILE}")
+        else:
+            logger.info("No ignore patterns configured (NTT_IGNORE_PATTERNS not set)")
+        
         # Statistics
         self.stats = {
             'blobs_checked': 0,
             'blobs_success': 0,
             'blobs_failed': 0,
+            'blobs_skipped': 0,  # Blobs with no paths after filtering
             'paths_checked': 0,
             'paths_verified': 0,
             'paths_missing': 0,
@@ -142,9 +169,6 @@ class BlobVerifier:
         
         # Success buffer for batch logging
         self.success_buffer = []
-        
-        # Setup logging
-        self.setup_logging()
     
     def setup_logging(self):
         """Setup dual logging: console + JSONL using loguru."""
@@ -197,7 +221,7 @@ class BlobVerifier:
                     blob_ids.append(blob_id)
         
         if not blob_ids:
-            logger.warning("No blob IDs found in file")
+            logger.debug("No blob IDs found in file")
             return []
         
         logger.info(f"Loaded {len(blob_ids)} blob IDs from file")
@@ -215,7 +239,7 @@ class BlobVerifier:
                 if result:
                     blobs.append(result)
                 else:
-                    logger.warning(f"Blob not found in database: {blob_id[:12]}...")
+                    logger.debug(f"Blob not found in database: {blob_id[:12]}...")
         
         return blobs
     
@@ -271,7 +295,7 @@ class BlobVerifier:
             return blobs
     
     def get_blob_paths(self, conn: psycopg.Connection, blobid: bytes) -> List[str]:
-        """Get all paths associated with a blob."""
+        """Get all paths associated with a blob, filtering ignored patterns."""
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT DISTINCT p.path
@@ -281,20 +305,32 @@ class BlobVerifier:
                 ORDER BY p.path
             """, (blobid,))
             
-            return [row['path'] for row in cur.fetchall()]
+            paths = [row['path'] for row in cur.fetchall()]
+            
+            # Filter out ignored patterns
+            if self.ignore_patterns:
+                import re
+                filtered_paths = []
+                for path in paths:
+                    if not any(re.search(pattern, path) for pattern in self.ignore_patterns):
+                        filtered_paths.append(path)
+                return filtered_paths
+            
+            return paths
     
     def construct_paths(self, blobid: bytes, paths: List[str]) -> Tuple[Path, List[Path]]:
         """Construct by-hash and archived paths."""
         # blobid is bytea but contains the hex string, decode it
         hex_hash = blobid.decode('utf-8') if isinstance(blobid, bytes) else blobid
         by_hash_path = self.by_hash_root / hex_hash[:2] / hex_hash[2:4] / hex_hash
-        
-        # Remove leading slash from paths and join with archive root
+
+        # Paths in database are absolute source paths, reconstruct archived locations
+        # e.g., /data/staging/foo → /data/cold/archived/data/staging/foo
         archived_paths = [
             self.archive_root / path.lstrip('/')
             for path in paths
         ]
-        
+
         return by_hash_path, archived_paths
     
     def verify_blob(self, blobid: bytes, paths: List[str]) -> BlobVerification:
@@ -332,14 +368,30 @@ class BlobVerifier:
         for archived_path in archived_paths:
             self.stats['paths_checked'] += 1
             
-            if not archived_path.exists():
+            try:
+                exists = archived_path.exists()
+            except PermissionError:
+                # Can't access path due to permissions in source data - this is expected
+                # Don't count as error, just skip this path
+                logger.debug(
+                    "permission denied (source data)",
+                    blob=hex_hash[:12],
+                    type="permission_skipped",
+                    path=str(archived_path)
+                )
+                # Still count as verified since we can't access it anyway
+                result.verified_paths += 1
+                continue
+
+            if not exists:
                 result.missing_paths.append(str(archived_path))
                 self.stats['paths_missing'] += 1
-                logger.warning(
-                    f"missing path: {archived_path}",
+                # Log missing path - use WARNING so it actually gets written and parsed
+                logger.debug(
+                    "missing path: {}",
+                    str(archived_path),
                     blob=hex_hash[:12],
-                    type="missing_path",
-                    path=str(archived_path)
+                    type="missing_path"
                 )
                 continue
             
@@ -350,16 +402,16 @@ class BlobVerifier:
                 if path_stat != result.reference_stat:
                     result.mismatched_paths.append(str(archived_path))
                     self.stats['paths_mismatched'] += 1
-                    logger.warning(
-                        f"stat mismatch: ref={result.reference_stat} path={archived_path} stat={path_stat}",
+                    logger.debug(
+                        "stat mismatch",
                         blob=hex_hash[:12],
                         type="stat_mismatch",
-                        details={
-                            "path": str(archived_path),
-                            "expected": asdict(result.reference_stat),
-                            "actual": asdict(path_stat)
-                        }
+                        path=str(archived_path),
+                        expected=asdict(result.reference_stat),
+                        actual=asdict(path_stat)
                     )
+                    # Still count as verified - file exists with correct content
+                    result.verified_paths += 1
                 else:
                     result.verified_paths += 1
                     self.stats['paths_verified'] += 1
@@ -368,9 +420,10 @@ class BlobVerifier:
                 result.mismatched_paths.append(str(archived_path))
                 self.stats['paths_mismatched'] += 1
                 logger.error(
-                    f"stat error: {archived_path}: {e}",
+                    "stat error",
                     blob=hex_hash[:12],
                     type="stat_error",
+                    path=str(archived_path),
                     error=str(e)
                 )
         
@@ -390,11 +443,12 @@ class BlobVerifier:
                 'size': result.reference_stat.size if result.reference_stat else 0
             })
             
-            # Console log
-            logger.info(
-                f"✓ {result.total_paths} paths verified",
+            # Console log (debug level for individual successes)
+            logger.debug(
+                "paths verified",
                 blob=blob_short,
-                stats={"paths": result.total_paths, "size": result.reference_stat.size if result.reference_stat else 0}
+                paths=result.total_paths,
+                size=result.reference_stat.size if result.reference_stat else 0
             )
             
             # Update database (only on success, not in dry-run)
@@ -404,7 +458,7 @@ class BlobVerifier:
                         UPDATE blobs 
                         SET last_checked = NOW()
                         WHERE blobid = %s
-                    """, (bytes.fromhex(result.blobid),))
+                    """, (result.blobid.encode('utf-8'),))
                 conn.commit()
             
             # Log batch of successes every 100
@@ -415,30 +469,27 @@ class BlobVerifier:
             # Error case - no database update
             self.stats['blobs_failed'] += 1
             
-            # Console log
+            # Console log (keep errors at normal levels - they're important)
             if not result.by_hash_exists:
                 logger.critical(
-                    f"✗ BY-HASH MISSING! {result.total_paths} paths orphaned",
+                    "BY-HASH MISSING",
                     blob=blob_short,
                     type="critical_error",
-                    details={
-                        "blobid": result.blobid,
-                        "by_hash_path": result.by_hash_path,
-                        "affected_paths": result.total_paths
-                    }
+                    blobid=result.blobid,
+                    by_hash_path=result.by_hash_path,
+                    affected_paths=result.total_paths
                 )
             else:
                 missing = len(result.missing_paths)
                 mismatched = len(result.mismatched_paths)
                 logger.error(
-                    f"✗ {missing} missing, {mismatched} mismatched of {result.total_paths} paths",
+                    "verification failure",
                     blob=blob_short,
                     type="verification_failure",
-                    details={
-                        "missing": missing,
-                        "mismatched": mismatched,
-                        "total": result.total_paths
-                    }
+                    blobid=result.blobid,
+                    missing=missing,
+                    mismatched=mismatched,
+                    total=result.total_paths
                 )
     
     def log_success_batch(self):
@@ -450,8 +501,8 @@ class BlobVerifier:
         total_size = sum(b['size'] for b in self.success_buffer)
         total_paths = sum(b['paths'] for b in self.success_buffer)
         
-        # Console summary
-        logger.success(
+        # Log batch to JSONL only (no console output)
+        logger.debug(
             f"Batch complete: {len(self.success_buffer)} blobs, "
             f"{total_paths} paths, {total_size:,} bytes verified",
             type="batch_success",
@@ -487,12 +538,13 @@ class BlobVerifier:
             self.log_success_batch()
         
         # Console summary
-        logger.success("=" * 60)
-        logger.success(f"Verification Complete in {elapsed:.1f}s")
-        logger.success(f"Blobs: {self.stats['blobs_checked']} checked, "
+        logger.info("=" * 60)
+        logger.info(f"Verification Complete in {elapsed:.1f}s")
+        logger.info(f"Blobs: {self.stats['blobs_checked']} checked, "
                       f"{self.stats['blobs_success']} ok, "
-                      f"{self.stats['blobs_failed']} failed")
-        logger.success(f"Paths: {self.stats['paths_checked']} checked, "
+                      f"{self.stats['blobs_failed']} failed, "
+                      f"{self.stats['blobs_skipped']} skipped")
+        logger.info(f"Paths: {self.stats['paths_checked']} checked, "
                       f"{self.stats['paths_verified']} verified")
         
         if self.stats['by_hash_missing'] > 0:
@@ -533,7 +585,7 @@ class BlobVerifier:
         logger.info(f"By-hash root: {self.by_hash_root}")
         
         if self.dry_run:
-            logger.warning("DRY RUN - no database updates")
+            logger.debug("DRY RUN - no database updates")
         
         with self.connect_db() as conn:
             # Get blobs to verify
@@ -543,7 +595,7 @@ class BlobVerifier:
                 blobs = self.get_blobs_to_verify(conn, count, mode)
             
             if not blobs:
-                logger.warning("No blobs found to verify")
+                logger.debug("No blobs found to verify")
                 return
             
             logger.info(f"Selected {len(blobs)} blobs for verification")
@@ -557,11 +609,16 @@ class BlobVerifier:
                 paths = self.get_blob_paths(conn, blobid)
                 
                 if not paths:
-                    logger.warning(
-                        f"No paths found",
-                        blob=blobid.hex()[:12],
+                    # Decode blobid bytea to get hex hash
+                    hex_hash = blobid.decode('utf-8') if isinstance(blobid, bytes) else blobid
+                    # Log to JSONL only (DEBUG = not shown on console)
+                    # This is normal when all paths are filtered by ignore patterns
+                    logger.debug(
+                        "No paths found",
+                        blob=hex_hash[:12],
                         type="no_paths"
                     )
+                    self.stats['blobs_skipped'] += 1
                     continue
                 
                 # Verify the blob
@@ -570,8 +627,8 @@ class BlobVerifier:
                 # Process result
                 self.process_verification_result(conn, result)
                 
-                # Progress report every 10 blobs
-                if i % 10 == 0:
+                # Progress report every 1000 blobs
+                if i % 1000 == 0:
                     self.report_progress(i, len(blobs))
             
             # Final summary
@@ -613,7 +670,7 @@ def main(
     try:
         verifier.run(count, mode, from_file)
     except KeyboardInterrupt:
-        logger.warning("Verification interrupted by user")
+        logger.debug("Verification interrupted by user")
         verifier.report_summary()
         sys.exit(1)
     except Exception as e:

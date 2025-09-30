@@ -31,6 +31,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import blake3
 import psycopg
@@ -80,6 +81,7 @@ BY_HASH_ROOT = Path(os.environ.get('NTT_BY_HASH_ROOT', '/data/cold/by-hash'))
 ARCHIVE_ROOT = Path(os.environ.get('NTT_ARCHIVE_ROOT', '/data/cold/archived'))
 LOG_JSON = Path(os.environ.get('NTT_LOG_JSON', '/var/log/ntt/copier.jsonl'))
 MOUNT_MAP_FILE = Path(os.environ.get('NTT_MOUNT_MAP', '/etc/hrdag/ntt/mounts.yaml'))
+IGNORE_PATTERNS_FILE = os.environ.get('NTT_IGNORE_PATTERNS', '')
 
 # Size thresholds
 RAM_THRESHOLD = 1 * 1024 * 1024 * 1024  # 1GB
@@ -97,12 +99,13 @@ LIMIT = 0  # Unified limit for both dry-run and live modes
 # Parse command line arguments
 has_dry_run = False
 has_limit = False
-RE_HARDLINK_MODE = False
 VERBOSE = False
 
 for arg in sys.argv:
     if arg == '--re-hardlink':
-        RE_HARDLINK_MODE = True
+        print("Note: --re-hardlink mode has been moved to a separate tool.")
+        print("Please use: sudo /home/pball/projects/ntt/bin/ntt-re-hardlink.py")
+        sys.exit(1)
     elif arg == '--verbose':
         VERBOSE = True
     elif arg.startswith('--dry-run'):
@@ -198,6 +201,17 @@ class CopyWorker:
             self.logger = self.logger.bind(dry_run=True)  # Mark all logs as dry-run
 
         self.mount_map = self.load_mount_map()
+        
+        # Load ignore patterns
+        self.ignore_patterns = []
+        if IGNORE_PATTERNS_FILE and Path(IGNORE_PATTERNS_FILE).exists():
+            with open(IGNORE_PATTERNS_FILE) as f:
+                self.ignore_patterns = [
+                    line.strip() for line in f
+                    if line.strip() and not line.strip().startswith('#')
+                ]
+            if self.ignore_patterns:
+                self.logger.info(f"Loaded {len(self.ignore_patterns)} ignore patterns")
 
         # Build the processor pipeline
         self.pipeline = FileTypeDetector(
@@ -223,6 +237,10 @@ class CopyWorker:
                 shutil.rmtree(temp_dir, ignore_errors=True)
             # Create fresh directory
             temp_dir.mkdir(parents=True, exist_ok=True)
+            # Fix permissions if running as root
+            if os.geteuid() == 0:
+                os.chown(temp_dir, 1000, 1000)
+                os.chmod(temp_dir, 0o755)
 
     def load_mount_map(self) -> dict[str, Path]:
         """Load mount mapping from YAML file."""
@@ -253,7 +271,18 @@ class CopyWorker:
         with self.conn.cursor() as cur:
             # Primary strategy: CTE with TABLESAMPLE for random selection
             # Filter first in CTE, then JOIN only the filtered subset
-            cur.execute("""
+            
+            # Build path filter condition if ignore patterns exist
+            path_filter = ""
+            if self.ignore_patterns:
+                # Use PostgreSQL's ~ operator for regex matching (case-sensitive)
+                # NOT matching any of the patterns
+                pattern_conditions = " AND ".join(
+                    f"p.path !~ '{pattern}'" for pattern in self.ignore_patterns
+                )
+                path_filter = f"AND {pattern_conditions}"
+            
+            query = f"""
                 SELECT i.*, p.path
                 FROM (
                     SELECT * FROM inode
@@ -265,10 +294,12 @@ class CopyWorker:
                 JOIN path p ON (i.medium_hash = p.medium_hash
                             AND i.dev = p.dev
                             AND i.ino = p.ino)
+                WHERE 1=1 {path_filter}
                 ORDER BY RANDOM()
                 LIMIT 1
                 FOR UPDATE OF i SKIP LOCKED
-            """, {'sample_size': SAMPLE_SIZE})
+            """
+            cur.execute(query, {'sample_size': SAMPLE_SIZE})
 
             row = cur.fetchone()
             if row:
@@ -307,6 +338,10 @@ class CopyWorker:
             temp_dir = self.nvme_dir
 
         temp_dir.mkdir(parents=True, exist_ok=True)
+        # Fix permissions if running as root
+        if os.geteuid() == 0:
+            os.chown(temp_dir, 1000, 1000)
+            os.chmod(temp_dir, 0o755)
         temp_name = f"{row['medium_hash']}_{row['dev']}_{row['ino']}.tmp"
         return temp_dir / temp_name
 
@@ -475,206 +510,8 @@ class CopyWorker:
         return 0 if self.stats['errors'] == 0 else 1
 
 
-def run_re_hardlink_mode():
-    """Re-create missing hardlinks for all blobs."""
-    logger.remove()
-    # Add date to timestamp and set appropriate log level
-    if VERBOSE:
-        logger.add(sys.stderr, format="{time:YYYY-MM-DD HH:mm:ss} | {level:<8} | {message}", level="DEBUG")
-    else:
-        logger.add(sys.stderr, format="{time:YYYY-MM-DD HH:mm:ss} | {level:<8} | {message}", level="INFO")
-    
-    # Check if we should output blob list
-    output_blobs = '--output-blobs' in sys.argv
-    processed_blobs = []
-    
-    logger.info("=" * 60)
-    logger.info("RE-HARDLINK MODE")
-    if DRY_RUN:
-        logger.info("DRY-RUN - no changes will be made")
-    logger.info("Re-creating missing hardlinks for existing by-hash files")
-    logger.info("=" * 60)
-    
-    # Connect to database
-    try:
-        conn = psycopg.connect(DB_URL, row_factory=dict_row)
-    except Exception as e:
-        logger.error(f"Failed to connect to database: {e}")
-        return 1
-    
-    stats = {
-        'blobs_processed': 0,
-        'by_hash_missing': 0,
-        'hardlinks_created': 0,
-        'hardlinks_existed': 0,
-        'errors': 0
-    }
-    
-    try:
-        with conn.cursor() as cur:
-            # Get only incomplete blobs (where n_hardlinks < expected paths)
-            query = """
-                WITH blob_status AS (
-                    SELECT 
-                        b.blobid,
-                        encode(b.blobid, 'escape') as hex_hash,
-                        COALESCE(b.n_hardlinks, 0) as actual,
-                        COUNT(DISTINCT p.path) as expected
-                    FROM blobs b
-                    JOIN inode i ON i.hash = b.blobid::bytea
-                    JOIN path p ON p.dev = i.dev AND p.ino = i.ino
-                    GROUP BY b.blobid, b.n_hardlinks
-                )
-                SELECT blobid, hex_hash, actual, expected
-                FROM blob_status 
-                WHERE actual < expected
-                ORDER BY expected - actual DESC
-            """
-            if LIMIT > 0:
-                query += f" LIMIT {LIMIT}"
-            
-            cur.execute(query)
-            blobs = cur.fetchall()
-            total = len(blobs)
-            
-            if total == 0:
-                logger.success("No incomplete blobs found - all hardlinks are complete!")
-                return 0
-            
-            logger.info(f"Found {total} incomplete blobs to process...")
-            if LIMIT > 0 and total == LIMIT:
-                # There might be more incomplete blobs
-                cur.execute("""
-                    SELECT COUNT(*) as total_incomplete FROM (
-                        WITH blob_status AS (
-                            SELECT 
-                                b.blobid,
-                                COALESCE(b.n_hardlinks, 0) as actual,
-                                COUNT(DISTINCT p.path) as expected
-                            FROM blobs b
-                            JOIN inode i ON i.hash = b.blobid::bytea
-                            JOIN path p ON p.dev = i.dev AND p.ino = i.ino
-                            GROUP BY b.blobid, b.n_hardlinks
-                        )
-                        SELECT 1 FROM blob_status WHERE actual < expected
-                    ) t
-                """)
-                result = cur.fetchone()
-                if result:
-                    logger.info(f"Total incomplete blobs in database: {result['total_incomplete']}")
-            
-            for i, blob in enumerate(blobs):
-                if i > 0 and i % 100 == 0:
-                    logger.info(f"Progress: {i}/{total} ({i*100/total:.1f}%) - {stats['hardlinks_created']} links created")
-                
-                hex_hash = blob['hex_hash']
-                if VERBOSE and 'actual' in blob:
-                    logger.debug(f"Processing blob {hex_hash[:12]}... ({blob['actual']}/{blob['expected']} existing)")
-                by_hash_path = BY_HASH_ROOT / hex_hash[:2] / hex_hash[2:4] / hex_hash
-                
-                # Check if by-hash exists
-                if not by_hash_path.exists():
-                    logger.warning(f"By-hash missing: {hex_hash[:12]}...")
-                    stats['by_hash_missing'] += 1
-                    continue
-                
-                # Get all paths for this blob
-                cur.execute("""
-                    SELECT DISTINCT p.path
-                    FROM path p
-                    JOIN inode i ON p.dev = i.dev AND p.ino = i.ino
-                    WHERE i.hash = %s
-                    ORDER BY p.path
-                """, (blob['blobid'],))
-                
-                paths = cur.fetchall()
-                hardlinks_created_for_blob = 0
-                
-                for path_row in paths:
-                    path = path_row['path']
-                    archive_path = ARCHIVE_ROOT / path.lstrip('/')
-                    
-                    if not archive_path.exists():
-                        if not DRY_RUN:
-                            try:
-                                archive_path.parent.mkdir(parents=True, exist_ok=True)
-                                os.link(by_hash_path, archive_path)
-                                stats['hardlinks_created'] += 1
-                                hardlinks_created_for_blob += 1
-                                if VERBOSE:
-                                    logger.debug(f"Created hardlink: {path}")
-                            except Exception as e:
-                                logger.error(f"Failed to create hardlink for {path}: {e}")
-                                stats['errors'] += 1
-                        else:
-                            if VERBOSE:
-                                logger.debug(f"[DRY-RUN] Would create hardlink: {path}")
-                            stats['hardlinks_created'] += 1
-                            hardlinks_created_for_blob += 1
-                    else:
-                        stats['hardlinks_existed'] += 1
-                
-                # Update n_hardlinks count
-                if hardlinks_created_for_blob > 0 and not DRY_RUN:
-                    cur.execute("""
-                        UPDATE blobs
-                        SET n_hardlinks = COALESCE(n_hardlinks, 0) + %s
-                        WHERE blobid = %s
-                    """, (hardlinks_created_for_blob, blob['blobid']))
-                
-                stats['blobs_processed'] += 1
-                
-                # Track processed blobs if requested
-                if output_blobs:
-                    processed_blobs.append(hex_hash)
-        
-        if not DRY_RUN:
-            conn.commit()
-            logger.info("Database updated")
-        
-    except Exception as e:
-        logger.error(f"Fatal error: {e}")
-        conn.rollback()
-        return 1
-    finally:
-        conn.close()
-    
-    # Print summary
-    logger.success("=" * 60)
-    logger.success("Re-hardlink Complete")
-    logger.success(f"Blobs processed: {stats['blobs_processed']}")
-    logger.success(f"By-hash missing: {stats['by_hash_missing']}")
-    logger.success(f"Hardlinks created: {stats['hardlinks_created']}")
-    logger.success(f"Hardlinks existed: {stats['hardlinks_existed']}")
-    if stats['errors'] > 0:
-        logger.error(f"Errors: {stats['errors']}")
-    
-    # Check if there might be more work
-    if LIMIT > 0 and stats['blobs_processed'] == LIMIT:
-        logger.info("Limit reached - there may be more incomplete blobs")
-        logger.info("Run again to continue processing remaining incomplete blobs")
-    
-    logger.success("=" * 60)
-    
-    # Output processed blobs if requested
-    if output_blobs and processed_blobs:
-        output_file = Path('/tmp/rehardlinked_blobs.txt')
-        with open(output_file, 'w') as f:
-            for blob in processed_blobs:
-                f.write(f"{blob}\n")
-        logger.info(f"Wrote {len(processed_blobs)} blob IDs to {output_file}")
-        logger.info("To verify these blobs, run:")
-        logger.info(f"  sudo /home/pball/projects/ntt/bin/ntt-verify.py --from-file {output_file}")
-    
-    return 0 if stats['errors'] == 0 else 1
-
-
 def main():
     """Entry point."""
-    # Check for re-hardlink mode first
-    if RE_HARDLINK_MODE:
-        sys.exit(run_re_hardlink_mode())
-    
     # Ensure temp directories exist with proper permissions
     for temp_dir in [RAMDISK, NVME_TMP]:
         try:

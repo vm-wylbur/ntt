@@ -414,14 +414,38 @@ class FileProcessor(InodeProcessor):
             # Create empty file at hash location if needed
             hash_path = worker.BY_HASH_ROOT / context.hash_value[:2] / context.hash_value[2:4] / context.hash_value
             if not hash_path.exists():
+                # Create parent directories and ALWAYS set ownership/permissions
                 hash_path.parent.mkdir(parents=True, exist_ok=True)
+                # Set ownership and permissions on the newly created directory chain
+                if os.geteuid() == 0:  # Only if running as root
+                    dir_to_chown = hash_path.parent
+                    while dir_to_chown != worker.BY_HASH_ROOT and dir_to_chown.exists():
+                        os.chown(dir_to_chown, 1000, 1000)
+                        os.chmod(dir_to_chown, 0o755)  # drwxr-xr-x
+                        dir_to_chown = dir_to_chown.parent
+                        if dir_to_chown.exists() and dir_to_chown.stat().st_uid == 1000:
+                            break  # Stop if we hit a dir already owned by pball
                 hash_path.touch()
+                # Set ownership to pball:pball (UID 1000, GID 1000)
+                os.chown(hash_path, 1000, 1000)
 
             # Create archive hardlink
             archive_path = worker.ARCHIVE_ROOT / context.source_path.relative_to('/')
             if not archive_path.exists():
+                # Create parent directories and ALWAYS set ownership/permissions
                 archive_path.parent.mkdir(parents=True, exist_ok=True)
+                # Set ownership and permissions on the newly created directory chain
+                if os.geteuid() == 0:  # Only if running as root
+                    dir_to_chown = archive_path.parent
+                    while dir_to_chown != worker.ARCHIVE_ROOT and dir_to_chown.exists():
+                        os.chown(dir_to_chown, 1000, 1000)
+                        os.chmod(dir_to_chown, 0o755)  # drwxr-xr-x
+                        dir_to_chown = dir_to_chown.parent
+                        if dir_to_chown.exists() and dir_to_chown.stat().st_uid == 1000:
+                            break  # Stop if we hit a dir already owned by pball
                 os.link(hash_path, archive_path)
+                # Hardlinks share ownership, but set it anyway for clarity
+                os.chown(archive_path, 1000, 1000)
 
             # Update database
             with worker.conn.cursor() as cur:
@@ -466,8 +490,20 @@ class FileProcessor(InodeProcessor):
 
         # Move temp to hash location if not exists
         if not hash_path.exists():
-            hash_path.parent.mkdir(parents=True, exist_ok=True)
+            # Create parent directories and set ownership
+            if not hash_path.parent.exists():
+                hash_path.parent.mkdir(parents=True, exist_ok=True)
+                # Set ownership and permissions on the newly created directory chain
+                dir_to_chown = hash_path.parent
+                while dir_to_chown != worker.BY_HASH_ROOT and dir_to_chown.exists():
+                    os.chown(dir_to_chown, 1000, 1000)
+                    os.chmod(dir_to_chown, 0o755)  # drwxr-xr-x
+                    dir_to_chown = dir_to_chown.parent
+                    if dir_to_chown.exists() and dir_to_chown.stat().st_uid == 1000:
+                        break  # Stop if we hit a dir already owned by pball
             shutil.move(str(context.temp_path), str(hash_path))
+            # Set ownership to pball:pball (UID 1000, GID 1000)
+            os.chown(hash_path, 1000, 1000)
         else:
             # Hash already exists - this is deduplication
             context.temp_path.unlink()
@@ -475,8 +511,20 @@ class FileProcessor(InodeProcessor):
 
         # Create archive hardlink
         if not archive_path.exists():
-            archive_path.parent.mkdir(parents=True, exist_ok=True)
+            # Create parent directories and set ownership
+            if not archive_path.parent.exists():
+                archive_path.parent.mkdir(parents=True, exist_ok=True)
+                # Set ownership and permissions on the newly created directory chain
+                dir_to_chown = archive_path.parent
+                while dir_to_chown != worker.ARCHIVE_ROOT and dir_to_chown.exists():
+                    os.chown(dir_to_chown, 1000, 1000)
+                    os.chmod(dir_to_chown, 0o755)  # drwxr-xr-x
+                    dir_to_chown = dir_to_chown.parent
+                    if dir_to_chown.exists() and dir_to_chown.stat().st_uid == 1000:
+                        break  # Stop if we hit a dir already owned by pball
             os.link(hash_path, archive_path)
+            # Hardlinks share ownership, but set it anyway for clarity
+            os.chown(archive_path, 1000, 1000)
 
         # Update database
         with worker.conn.cursor() as cur:

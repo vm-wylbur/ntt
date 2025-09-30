@@ -1,0 +1,14 @@
+#!/bin/bash
+# Wrapper for ntt-verify.py that properly preserves environment under sudo
+
+# Load NTT environment
+source ~/.config/ntt/ntt.env
+
+# Run ntt-verify with environment variables passed explicitly
+sudo \
+  NTT_IGNORE_PATTERNS="$NTT_IGNORE_PATTERNS" \
+  NTT_DB_URL="$NTT_DB_URL" \
+  NTT_BY_HASH_ROOT="$NTT_BY_HASH_ROOT" \
+  NTT_ARCHIVE_ROOT="$NTT_ARCHIVE_ROOT" \
+  NTT_LOG_JSON="$NTT_LOG_JSON" \
+  "$(dirname "$0")/ntt-verify.py" "$@"

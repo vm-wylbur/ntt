@@ -19,6 +19,7 @@ MNT="$1"; MEDIUM_HASH="$2"; OUT="$3"
 
 # ---------- env / config ----------
 LOG_JSON="${NTT_ENUM_LOG:-/var/log/ntt/enum.jsonl}"
+IGNORE_PATTERNS="${NTT_IGNORE_PATTERNS:-}"
 mkdir -p "$(dirname "$LOG_JSON")"
 mkdir -p "$(dirname "$OUT")"
 
@@ -44,8 +45,21 @@ fi
 # ---------- enumerate ----------
 log start "{\"mnt\": \"$MNT\", \"medium_hash\": \"$MEDIUM_HASH\", \"out\": \"$OUT\"}"
 
+# Build grep filter for ignore patterns if configured
+FILTER_CMD="cat"
+if [[ -n "$IGNORE_PATTERNS" && -f "$IGNORE_PATTERNS" ]]; then
+  # Build extended regex from patterns file (skip comments and empty lines)
+  PATTERNS=$(grep -v '^#' "$IGNORE_PATTERNS" | grep -v '^[[:space:]]*$' | paste -sd '|')
+  if [[ -n "$PATTERNS" ]]; then
+    log filter_enabled "{\"patterns_file\": \"$IGNORE_PATTERNS\", \"patterns\": \"$PATTERNS\"}"
+    # Filter out paths matching any pattern (grep -v inverts, -z for null-terminated)
+    FILTER_CMD="grep -zv -E '$PATTERNS'"
+  fi
+fi
+
 # %m fs-type, %D dev, %i ino, %n nlink, %s size, %Ts mtime-epoch-seconds, %p path
 find "$MNT" -xdev -printf '%m\034%D\034%i\034%n\034%s\034%Ts\034%p\0' \
+| eval "$FILTER_CMD" \
 | tee >(tr -cd '\0' | wc -c > /tmp/ntt-count-$$) \
 | pv -0 -l -f \
 > "$OUT"
