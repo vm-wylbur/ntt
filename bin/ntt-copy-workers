@@ -5,9 +5,21 @@
 
 set -euo pipefail
 
-# Load NTT environment
+# Load NTT environment (only if vars not already set)
 if [[ -f ~/.config/ntt/ntt.env ]]; then
+    # Save existing vars
+    SAVED_DB_URL="${NTT_DB_URL:-}"
+    SAVED_PGUSER="${PGUSER:-}"
+    SAVED_ARCHIVE="${NTT_ARCHIVE_ROOT:-}"
+    SAVED_BYHASH="${NTT_BY_HASH_ROOT:-}"
+
     source ~/.config/ntt/ntt.env
+
+    # Restore if they were set before
+    [[ -n "$SAVED_DB_URL" ]] && NTT_DB_URL="$SAVED_DB_URL"
+    [[ -n "$SAVED_PGUSER" ]] && PGUSER="$SAVED_PGUSER"
+    [[ -n "$SAVED_ARCHIVE" ]] && NTT_ARCHIVE_ROOT="$SAVED_ARCHIVE"
+    [[ -n "$SAVED_BYHASH" ]] && NTT_BY_HASH_ROOT="$SAVED_BYHASH"
 fi
 
 # Default values
@@ -16,6 +28,7 @@ LIMIT=""
 DRY_RUN=""
 VERBOSE=false
 PIDS=()
+WORKER_IDS=()
 
 # Parse arguments
 usage() {
@@ -96,11 +109,17 @@ if [[ -n "$LIMIT" && -n "$DRY_RUN" ]]; then
 fi
 
 # Build worker command (pass env vars explicitly since sudo -E is ignored)
-WORKER_CMD="sudo PGUSER=${PGUSER:-$USER} NTT_DB_URL=${NTT_DB_URL:-postgresql:///copyjob} SUDO_USER=${SUDO_USER:-$USER} /home/pball/.local/bin/uv run /home/pball/projects/ntt/bin/ntt-copier.py"
+# Note: Don't pass PGOPTIONS here - ntt-copier.py sets search_path from it internally
+WORKER_CMD="sudo PGUSER=${PGUSER:-$USER} NTT_DB_URL=${NTT_DB_URL:-postgresql:///copyjob} SUDO_USER=${SUDO_USER:-$USER}"
+[[ -n "${PGPASSWORD:-}" ]] && WORKER_CMD="$WORKER_CMD PGPASSWORD='$PGPASSWORD'"
+[[ -n "${NTT_ARCHIVE_ROOT:-}" ]] && WORKER_CMD="$WORKER_CMD NTT_ARCHIVE_ROOT='$NTT_ARCHIVE_ROOT'"
+[[ -n "${NTT_BY_HASH_ROOT:-}" ]] && WORKER_CMD="$WORKER_CMD NTT_BY_HASH_ROOT='$NTT_BY_HASH_ROOT'"
+[[ -n "${NTT_SEARCH_PATH:-}" ]] && WORKER_CMD="$WORKER_CMD NTT_SEARCH_PATH='$NTT_SEARCH_PATH'"
+WORKER_CMD="$WORKER_CMD /home/pball/.local/bin/uv run /home/pball/projects/ntt/bin/ntt-copier.py"
 if [[ -n "$LIMIT" ]]; then
     WORKER_CMD="$WORKER_CMD --limit=$LIMIT"
 elif [[ -n "$DRY_RUN" ]]; then
-    WORKER_CMD="$WORKER_CMD --dry-run=$DRY_RUN"
+    WORKER_CMD="$WORKER_CMD --dry-run --limit=$DRY_RUN"
 fi
 
 # Signal handler for clean shutdown
@@ -126,7 +145,17 @@ cleanup() {
         fi
     done
 
-    echo "[$(date '+%H:%M:%S')] All workers stopped"
+    # Unmount and cleanup per-worker tmpfs
+    for wid in "${WORKER_IDS[@]}"; do
+        WORKER_TMPFS="/tmp/ram/${wid}"
+        if mountpoint -q "$WORKER_TMPFS" 2>/dev/null; then
+            echo "[$(date '+%H:%M:%S')] Unmounting tmpfs at $WORKER_TMPFS"
+            sudo umount "$WORKER_TMPFS" 2>/dev/null || true
+            sudo rmdir "$WORKER_TMPFS" 2>/dev/null || true
+        fi
+    done
+
+    echo "[$(date '+%H:%M:%S')] All workers stopped and tmpfs unmounted"
     exit 0
 }
 
@@ -143,26 +172,47 @@ fi
 
 for ((i=1; i<=WORKERS; i++)); do
     WORKER_ID="worker-$(printf '%02d' $i)"
+    LOG_FILE="/tmp/ntt-${WORKER_ID}.log"
 
     if $VERBOSE; then
         echo "[$(date '+%H:%M:%S')] Launching $WORKER_ID"
     fi
 
-    # Launch worker in background, redirect output to logs
-    $WORKER_CMD --worker-id="$WORKER_ID" \
-        > "/tmp/ntt-${WORKER_ID}.log" 2>&1 &
+    # Pre-create log file with correct permissions (as root since worker runs as root)
+    sudo touch "$LOG_FILE"
+    sudo chmod 666 "$LOG_FILE"
 
-    PIDS+=($!)
+    # Create and mount per-worker tmpfs BEFORE launching (128MB for files <100MB)
+    WORKER_TMPFS="/tmp/ram/${WORKER_ID}"
+    sudo mkdir -p "$WORKER_TMPFS"
+    sudo mount -t tmpfs -o size=128M,mode=1777 tmpfs "$WORKER_TMPFS"
+
+    if $VERBOSE; then
+        echo "[$(date '+%H:%M:%S')] Mounted 128MB tmpfs at $WORKER_TMPFS"
+    fi
+
+    # Launch worker in background with worker_id, redirect output to logs
+    $WORKER_CMD --worker-id="$WORKER_ID" > "$LOG_FILE" 2>&1 &
+
+    WORKER_PID=$!
+    PIDS+=($WORKER_PID)
+    WORKER_IDS+=($WORKER_ID)
 done
 
 echo "[$(date '+%H:%M:%S')] Launched ${#PIDS[@]} workers with PIDs: ${PIDS[*]}"
 
 # Save PIDs to file for monitoring/stopping
 PID_FILE="/tmp/ntt-workers.pids"
+sudo touch "$PID_FILE"
+sudo chmod 666 "$PID_FILE"
 printf "%s\n" "${PIDS[@]}" > "$PID_FILE"
-chmod 644 "$PID_FILE"
 
 echo "[$(date '+%H:%M:%S')] Workers launched successfully"
 echo "[$(date '+%H:%M:%S')] PIDs saved to: $PID_FILE"
 echo "[$(date '+%H:%M:%S')] Monitor progress: ntt-dashboard"
 echo "[$(date '+%H:%M:%S')] Stop workers: ntt-stop-workers"
+echo ""
+echo "Note: Workers are running in background. Tmpfs cleanup happens via:"
+echo "  - Signal handler on ^C or kill"
+echo "  - Auto-cleanup on tmpfs unmount (files deleted automatically)"
+echo "  - Manual cleanup: ntt-stop-workers"

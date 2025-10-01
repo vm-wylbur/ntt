@@ -6,12 +6,13 @@
 #     "loguru",
 #     "pyyaml",
 #     "blake3",
-#     "python-magic"
+#     "python-magic",
+#     "typer",
 # ]
 # ///
 #
 # Author: PB and Claude
-# Date: 2025-09-28
+# Date: 2025-10-01
 # License: (c) HRDAG, 2025, GPL-2 or newer
 #
 # ------
@@ -19,10 +20,15 @@
 #
 # NTT copy worker - deduplicates and archives filesystem content
 #
+# Architecture: Claim-Analyze-Execute pattern
+# - Phase 0: Claim work using TABLESAMPLE + UPDATE (0.5ms, atomic)
+# - Phase 1: Analyze (read-only, copy to temp, hash)
+# - Phase 2: Execute (filesystem first, then DB transaction)
+#
 # Requirements:
 #   - Python 3.13+
-#   - Must run as root/sudo
-#   - Environment: sudo -E PATH="$PATH" or: sudo env PATH="$PATH" $(cat /etc/hrdag/ntt.env | xargs) ntt-copier.py
+#   - Must run as root/sudo for filesystem access
+#   - Run with: sudo -E ntt-copier.py [options]
 
 import os
 import shutil
@@ -31,532 +37,644 @@ import sys
 import time
 from pathlib import Path
 from typing import Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-import blake3
 import psycopg
-
-# Import processor chain components
-# Load the processors module (handles dash in filename)
-processors_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ntt-copier-processors-updated.py")
-processors_globals = {}
-with open(processors_path) as f:
-    exec(f.read(), processors_globals)
-
-# Extract the classes we need
-InodeContext = processors_globals['InodeContext']
-FilesystemTypeDetector = processors_globals['FilesystemTypeDetector']
-DirectoryProcessor = processors_globals['DirectoryProcessor']
-SymlinkProcessor = processors_globals['SymlinkProcessor']
-SpecialFileProcessor = processors_globals['SpecialFileProcessor']
-MimeTypeDetector = processors_globals['MimeTypeDetector']
-FileProcessor = processors_globals['FileProcessor']
 from psycopg.rows import dict_row
 import yaml
 from loguru import logger
+import typer
+import magic
 
-# Set PostgreSQL user to original user when running under sudo
-# This allows root to connect to PostgreSQL as the invoking user
-if 'SUDO_USER' in os.environ:
-    os.environ['PGUSER'] = os.environ['SUDO_USER']
-elif os.geteuid() == 0 and 'USER' in os.environ:
-    # Running as root but no SUDO_USER (e.g., direct root login)
-    # Default to 'postgres' user for safety
-    os.environ['PGUSER'] = 'postgres'
+# Import strategy functions
+import ntt_copier_strategies as strategies
 
-# Configuration from environment with defaults
-# Note: Run with sudo -E to preserve environment, or:
-#       sudo env $(cat /etc/hrdag/ntt.env | xargs) ntt-copier.py
-DB_URL = os.environ.get('NTT_DB_URL', 'postgresql:///copyjob')
+app = typer.Typer()
 
-# If running as root and DB_URL doesn't specify a user, add the original user
-if os.geteuid() == 0 and 'SUDO_USER' in os.environ:
-    if '://' in DB_URL and '@' not in DB_URL:
-        # Insert the original user into the connection string
-        # postgresql:///copyjob -> postgresql://pball@/copyjob
-        DB_URL = DB_URL.replace(':///', f"://{os.environ['SUDO_USER']}@localhost/")
-RAMDISK = Path(os.environ.get('NTT_RAMDISK', '/tmp/ram'))
-NVME_TMP = Path(os.environ.get('NTT_NVME_TMP', '/data/fast/tmp'))
-BY_HASH_ROOT = Path(os.environ.get('NTT_BY_HASH_ROOT', '/data/cold/by-hash'))
-ARCHIVE_ROOT = Path(os.environ.get('NTT_ARCHIVE_ROOT', '/data/cold/archived'))
-LOG_JSON = Path(os.environ.get('NTT_LOG_JSON', '/var/log/ntt/copier.jsonl'))
-MOUNT_MAP_FILE = Path(os.environ.get('NTT_MOUNT_MAP', '/etc/hrdag/ntt/mounts.yaml'))
-IGNORE_PATTERNS_FILE = os.environ.get('NTT_IGNORE_PATTERNS', '')
 
-# Size thresholds
-RAM_THRESHOLD = 1 * 1024 * 1024 * 1024  # 1GB
-CHUNK_SIZE = 64 * 1024  # 64KB for streaming
+class AnalysisError(Exception):
+    """Raised when analysis phase fails."""
+    pass
 
-# Worker configuration
-WORKER_ID = os.environ.get('NTT_WORKER_ID', f'w{os.getpid()}')
-HEARTBEAT_INTERVAL = 30  # seconds
-SAMPLE_SIZE = int(os.environ.get('NTT_SAMPLE_SIZE', '1000'))  # TABLESAMPLE rows
 
-# Processing mode and limit
-DRY_RUN = False
-LIMIT = 0  # Unified limit for both dry-run and live modes
-
-# Parse command line arguments
-has_dry_run = False
-has_limit = False
-VERBOSE = False
-
-for arg in sys.argv:
-    if arg == '--re-hardlink':
-        print("Note: --re-hardlink mode has been moved to a separate tool.")
-        print("Please use: sudo /home/pball/projects/ntt/bin/ntt-re-hardlink.py")
-        sys.exit(1)
-    elif arg == '--verbose':
-        VERBOSE = True
-    elif arg.startswith('--dry-run'):
-        has_dry_run = True
-        if '=' in arg:
-            # --dry-run=100 format
-            try:
-                LIMIT = int(arg.split('=')[1])
-                DRY_RUN = True
-            except ValueError:
-                print(f"Error: Invalid dry-run limit: {arg}", file=sys.stderr)
-                sys.exit(1)
-        else:
-            # Just --dry-run (unlimited)
-            DRY_RUN = True
-            LIMIT = 0
-    elif arg.startswith('--limit'):
-        has_limit = True
-        if '=' in arg:
-            # --limit=100 format
-            try:
-                LIMIT = int(arg.split('=')[1])
-            except ValueError:
-                print(f"Error: Invalid limit: {arg}", file=sys.stderr)
-                sys.exit(1)
-        else:
-            print("Error: --limit requires a value (e.g., --limit=100)", file=sys.stderr)
-            sys.exit(1)
-
-# Check mutual exclusivity
-if has_dry_run and has_limit:
-    print("Error: --dry-run and --limit are mutually exclusive", file=sys.stderr)
-    sys.exit(1)
-
-# Also check environment variable
-if not DRY_RUN and not has_limit and os.environ.get('NTT_DRY_RUN', '').lower() == 'true':
-    DRY_RUN = True
-    LIMIT = int(os.environ.get('NTT_DRY_RUN_LIMIT', '10'))  # Default to 10 for env var
-
-# Constants
-EMPTY_FILE_HASH = 'af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262'  # BLAKE3 of empty
+class ExecutionError(Exception):
+    """Raised when execution phase fails."""
+    pass
 
 
 class CopyWorker:
-    """Single worker that processes inodes from the queue."""
-
-    def __init__(self, worker_id: str):
+    """NTT copy worker using Claim-Analyze-Execute pattern."""
+    
+    def __init__(self, worker_id: str, db_url: str, limit: int = 0, 
+                 dry_run: bool = False, sample_size: int = 1000):
         self.worker_id = worker_id
-        self.conn: Optional[psycopg.Connection] = None
+        self.db_url = db_url
+        self.limit = limit
+        self.dry_run = dry_run
+        self.sample_size = sample_size
         self.shutdown = False
+        self.processed_count = 0
+        
+        # Environment configuration
+        self.RAMDISK = Path(os.environ.get('NTT_RAMDISK', '/tmp/ram'))
+        self.NVME_TMP = Path(os.environ.get('NTT_NVME_TMP', '/data/fast/tmp'))
+        self.BY_HASH_ROOT = Path(os.environ.get('NTT_BY_HASH_ROOT', '/data/cold/by-hash'))
+        self.ARCHIVE_ROOT = Path(os.environ.get('NTT_ARCHIVE_ROOT', '/data/cold/archived'))
+        
+        logger.info(f"Worker {self.worker_id} paths: by-hash={self.BY_HASH_ROOT}, archive={self.ARCHIVE_ROOT}")
+        
+        # Stats
         self.stats = {
             'copied': 0,
-            'bytes': 0,
-            'errors': 0,
-            'skipped': 0,
             'deduped': 0,
-            'start_time': time.time()
+            'errors': 0,
+            'bytes': 0,
         }
-        self.processed_count = 0  # Track files processed (for both dry-run and limit modes)
-
-        # Export config for processors
-        self.dry_run = DRY_RUN
-        self.EMPTY_FILE_HASH = EMPTY_FILE_HASH
-        self.CHUNK_SIZE = CHUNK_SIZE
-        self.BY_HASH_ROOT = BY_HASH_ROOT
-        self.ARCHIVE_ROOT = ARCHIVE_ROOT
-
-        # Configure loguru for both console and JSON file
-        logger.remove()  # Remove default handler
-
-        # Use different log file for dry-run mode
-        log_file = LOG_JSON if not DRY_RUN else Path('/var/log/ntt/copier-dryrun.jsonl')
-
-        logger.add(
-            log_file,
-            format="{time:UNIX} {message}",
-            serialize=True,
-            rotation="1 GB",
-            retention="30 days" if not DRY_RUN else "7 days",  # Shorter retention for dry-run
-            level="DEBUG"
-        )
-
-        # Make log files readable by dashboard user
-        try:
-            log_file.chmod(0o644)
-        except (OSError, PermissionError):
-            pass  # Ignore permission errors, dashboard will handle gracefully
-        logger.add(sys.stderr, format="{time:HH:mm:ss} [{level}] {message}", level="INFO")
-
-        # Bind context without reassigning
-        self.logger = logger.bind(worker_id=worker_id)
-        if DRY_RUN:
-            self.logger = self.logger.bind(dry_run=True)  # Mark all logs as dry-run
-
-        self.mount_map = self.load_mount_map()
         
-        # Load ignore patterns
-        self.ignore_patterns = []
-        if IGNORE_PATTERNS_FILE and Path(IGNORE_PATTERNS_FILE).exists():
-            with open(IGNORE_PATTERNS_FILE) as f:
-                self.ignore_patterns = [
-                    line.strip() for line in f
-                    if line.strip() and not line.strip().startswith('#')
-                ]
-            if self.ignore_patterns:
-                self.logger.info(f"Loaded {len(self.ignore_patterns)} ignore patterns")
-
-        # Build the processor pipeline
-        self.pipeline = FilesystemTypeDetector(
-            DirectoryProcessor(
-                SymlinkProcessor(
-                    SpecialFileProcessor(
-                        MimeTypeDetector(
-                            FileProcessor()
-                        )
-                    )
-                )
-            )
-        )
-
-        # Set up per-worker temp directories
-        self.ramdisk_dir = RAMDISK / self.worker_id
-        self.nvme_dir = NVME_TMP / self.worker_id
-
-        # Clean up any leftover temps on startup
-        for temp_dir in [self.ramdisk_dir, self.nvme_dir]:
-            if temp_dir.exists():
-                self.logger.info("Cleaning up old temp dir", path=str(temp_dir))
-                shutil.rmtree(temp_dir, ignore_errors=True)
-            # Create fresh directory
-            temp_dir.mkdir(parents=True, exist_ok=True)
-            # Fix permissions if running as root
-            if os.geteuid() == 0:
-                os.chown(temp_dir, 1000, 1000)
-                os.chmod(temp_dir, 0o755)
-
-    def load_mount_map(self) -> dict[str, Path]:
-        """Load mount mapping from YAML file."""
-        if not MOUNT_MAP_FILE.exists():
-            self.logger.warning(f"Mount map not found: {MOUNT_MAP_FILE}")
-            return {}
-
-        try:
-            with open(MOUNT_MAP_FILE) as f:
-                config = yaml.safe_load(f)
-                return {k: Path(v) for k, v in config.get('mounts', {}).items()}
-        except Exception as e:
-            self.logger.error(f"Failed to load mount map: {e}")
-            return {}
-
-    def connect_db(self):
-        """Establish database connection."""
-        self.conn = psycopg.connect(DB_URL, row_factory=dict_row)
-        self.conn.autocommit = False
-
-    def fetch_work(self) -> Optional[dict]:
-        """Fetch random uncoped inode with row-level lock using TABLESAMPLE.
-
-        Uses TABLESAMPLE SYSTEM_ROWS for fast random selection from large tables.
-        CTE filters uncoped rows first, then JOINs for better performance.
-        Falls back to simple query if sample returns no results (edge case).
-        """
-        with self.conn.cursor() as cur:
-            # Primary strategy: CTE with TABLESAMPLE for random selection
-            # Filter first in CTE, then JOIN only the filtered subset
-            
-            # Build path filter condition if ignore patterns exist
-            path_filter = ""
-            if self.ignore_patterns:
-                # Use PostgreSQL's ~ operator for regex matching (case-sensitive)
-                # NOT matching any of the patterns
-                pattern_conditions = " AND ".join(
-                    f"p.path !~ '{pattern}'" for pattern in self.ignore_patterns
-                )
-                path_filter = f"AND {pattern_conditions}"
-            
-            query = f"""
-                SELECT i.*, p.path
-                FROM (
-                    SELECT * FROM inode
-                    TABLESAMPLE SYSTEM_ROWS(%(sample_size)s)
-                    WHERE copied = false
-                    ORDER BY RANDOM()
-                    LIMIT 100
-                ) i
-                JOIN path p ON (i.medium_hash = p.medium_hash
-                            AND i.dev = p.dev
-                            AND i.ino = p.ino)
-                WHERE 1=1 {path_filter}
-                ORDER BY RANDOM()
-                LIMIT 1
-                FOR UPDATE OF i SKIP LOCKED
-            """
-            cur.execute(query, {'sample_size': SAMPLE_SIZE})
-
-            row = cur.fetchone()
-            if row:
-                return row
-
-            # Fallback: if TABLESAMPLE missed all uncoped files
-            # This can happen when very few uncoped files remain
-            self.logger.debug("TABLESAMPLE returned no results, using fallback")
-            cur.execute("""
-                SELECT i.*, p.path
-                FROM inode i
-                JOIN path p ON (i.medium_hash = p.medium_hash
-                            AND i.dev = p.dev
-                            AND i.ino = p.ino)
-                WHERE i.copied = false
-                LIMIT 1
-                FOR UPDATE OF i SKIP LOCKED
-            """)
-            return cur.fetchone()
-
-    def get_source_path(self, row: dict) -> Path:
-        """Get actual source path with mount mapping."""
-        if row['medium_hash'] in self.mount_map:
-            mount_point = self.mount_map[row['medium_hash']]
-            return mount_point / row['path'].lstrip('/')
-        else:
-            # Assume path is already absolute
-            return Path(row['path'])
-
-    def get_temp_path(self, row: dict) -> Path:
-        """Get temp path for this inode, includes medium_hash for uniqueness."""
-        size = row['size']
-        if size < RAM_THRESHOLD:
-            temp_dir = self.ramdisk_dir
-        else:
-            temp_dir = self.nvme_dir
-
-        temp_dir.mkdir(parents=True, exist_ok=True)
-        # Fix permissions if running as root
-        if os.geteuid() == 0:
-            os.chown(temp_dir, 1000, 1000)
-            os.chmod(temp_dir, 0o755)
-        temp_name = f"{row['medium_hash']}_{row['dev']}_{row['ino']}.tmp"
-        return temp_dir / temp_name
-
-    def hash_file(self, path: Path) -> str:
-        """Calculate BLAKE3 hash of existing file."""
-        hasher = blake3.blake3()
-
-        with open(path, 'rb') as f:
-            while chunk := f.read(CHUNK_SIZE):
-                hasher.update(chunk)
-
-        return hasher.hexdigest()
-
-    def hash_and_copy(self, source: Path, dest: Path) -> str:
-        """Stream copy to dest while calculating BLAKE3 hash."""
-        hasher = blake3.blake3()
-
-        with open(source, 'rb') as src, open(dest, 'wb') as dst:
-            while chunk := src.read(CHUNK_SIZE):
-                hasher.update(chunk)
-                dst.write(chunk)
-
-            # Ensure data is on disk
-            dst.flush()
-            os.fsync(dst.fileno())
-
-        return hasher.hexdigest()
-
-    def handle_existing_temp(self, temp_path: Path, source_path: Path, size: int) -> Optional[str]:
-        """Handle existing temp file from previous run."""
-        if not temp_path.exists():
-            return None
-
-        if size < RAM_THRESHOLD:
-            # Small file in ramdisk - just redo it
-            self.logger.info("Restarting small file from ramdisk", path=str(temp_path))
-            temp_path.unlink()
-            return None
-        else:
-            # Large file on NVMe - verify before discarding
-            temp_size = temp_path.stat().st_size
-            if temp_size == size:
-                # Might be complete, hash to verify
-                self.logger.info("Verifying large file", path=str(temp_path))
-                temp_hash = self.hash_file(temp_path)
-                # For now, trust it if size matches
-                # Could verify against source if paranoid
-                return temp_hash
-            else:
-                # Definitely incomplete
-                self.logger.info("Restarting incomplete file",
-                               path=str(temp_path), temp_size=temp_size, expected_size=size)
-                temp_path.unlink()
-                return None
-
-    def process_inode(self, row: dict):
-        """Process single inode through the processor chain."""
-        # Create context and run through pipeline
-        context = InodeContext(
-            row=row,
-            source_path=self.get_source_path(row),
-            fs_type=row.get('fs_type'),
-            mime_type=row.get('mime_type')
-        )
-
-        try:
-            result = self.pipeline.process(context, self)
-
-            if not result.should_process:
-                self.logger.debug(f"Skipped: {result.skip_reason}",
-                                path=str(result.source_path),
-                                ino=row['ino'])
-
-        except Exception as e:
-            self.logger.error(f"Processing failed: {e}",
-                            ino=row['ino'],
-                            path=str(context.source_path))
-            self.stats['errors'] += 1
-
-            # Record error in database
+        # Database connection
+        self.conn = psycopg.connect(self.db_url, row_factory=dict_row, autocommit=False)
+        
+        # Set search_path if NTT_SEARCH_PATH is provided, adding 'public' for extensions
+        if 'NTT_SEARCH_PATH' in os.environ:
+            search_path = os.environ['NTT_SEARCH_PATH']
             with self.conn.cursor() as cur:
-                cur.execute("""
-                    UPDATE inode
-                    SET errors = array_append(errors, %s)
-                    WHERE medium_hash = %s AND dev = %s AND ino = %s
-                """, (str(e), row['medium_hash'], row['dev'], row['ino']))
+                # Include 'public' so extensions like tsm_system_rows are accessible
+                cur.execute(f"SET search_path = {search_path}, public")
             self.conn.commit()
-
-        return
-
-
-    def emit_heartbeat(self):
-        """Emit JSON heartbeat with worker stats."""
-        elapsed = time.time() - self.stats['start_time']
-        rate = self.stats['bytes'] / elapsed if elapsed > 0 else 0
-
-        heartbeat = {
-            'worker_id': self.worker_id,
-            'copied': self.stats['copied'],
-            'deduped': self.stats['deduped'],
-            'skipped': self.stats['skipped'],
-            'mb': self.stats['bytes'] / (1024 * 1024),
-            'rate_mb_s': rate / (1024 * 1024),
-            'errors': self.stats['errors'],
-            'ts': time.time()
-        }
-        # Log to both console and JSON file
-        self.logger.info("Heartbeat: {copied} files, {mb:.1f} MB, {rate_mb_s:.1f} MB/s, {errors} errors",
-                        copied=heartbeat['copied'],
-                        mb=heartbeat['mb'],
-                        rate_mb_s=heartbeat['rate_mb_s'],
-                        errors=heartbeat['errors'])
-
-    def handle_shutdown(self, signum, frame):
-        """Graceful shutdown on SIGTERM."""
-        self.logger.info("Shutdown signal received", signal=signum)
+        
+        # MIME type detector (reused across files)
+        self.mime_detector = magic.Magic(mime=True)
+        
+        # Setup signal handlers
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+        
+        logger.info(f"Worker {self.worker_id} initialized", 
+                   limit=self.limit, dry_run=self.dry_run, sample_size=self.sample_size)
+    
+    def _signal_handler(self, signum, frame):
+        """Handle shutdown signals gracefully."""
+        logger.info(f"Received signal {signum}, shutting down...")
         self.shutdown = True
-
-    def cleanup(self):
-        """Clean up worker resources."""
-        # Clean up temp directories
-        if hasattr(self, 'ramdisk_dir') and hasattr(self, 'nvme_dir'):
-            for temp_dir in [self.ramdisk_dir, self.nvme_dir]:
-                if temp_dir.exists():
-                    self.logger.info("Cleaning up temp dir", path=str(temp_dir))
-                    try:
-                        shutil.rmtree(temp_dir)
-                    except Exception as e:
-                        self.logger.warning(f"Failed to clean up {temp_dir}: {e}")
-
-        # Close database connection
-        if self.conn:
-            self.conn.close()
-
+    
     def run(self):
         """Main worker loop."""
-        signal.signal(signal.SIGTERM, self.handle_shutdown)
-        signal.signal(signal.SIGINT, self.handle_shutdown)
-
-        self.connect_db()
-        last_heartbeat = time.time()
-
-        self.logger.info("Worker starting", worker_id=self.worker_id)
-
+        logger.info(f"Worker {self.worker_id} starting")
+        
         while not self.shutdown:
-            # Check processing limit
-            if LIMIT > 0 and self.processed_count >= LIMIT:
-                mode = "Dry-run" if DRY_RUN else "Processing"
-                self.logger.info(f"{mode} limit reached", limit=LIMIT, processed=self.processed_count)
+            work_unit = self.fetch_and_claim_work_unit()
+            if not work_unit:
+                logger.debug("No work available, waiting...")
+                time.sleep(0.01)  # 10ms - fast retry on claim race
+                continue
+            
+            logger.info(f"Processing work unit ino={work_unit['inode_row']['ino']}")
+            self.process_work_unit(work_unit)
+            self.processed_count += 1
+            logger.info(f"Completed work unit, processed_count={self.processed_count}")
+            
+            if self.limit > 0 and self.processed_count >= self.limit:
+                logger.info(f"Limit reached: {self.limit}")
                 break
-
-            if time.time() - last_heartbeat > HEARTBEAT_INTERVAL:
-                self.emit_heartbeat()
-                last_heartbeat = time.time()
-
-            row = self.fetch_work()
-            if row:
-                self.process_inode(row)
-            else:
-                time.sleep(1)
-
-        self.emit_heartbeat()
-        self.cleanup()
-
-        self.logger.info("Worker complete", stats=self.stats)
-        return 0 if self.stats['errors'] == 0 else 1
-
-
-def main():
-    """Entry point."""
-    # Ensure temp directories exist with proper permissions
-    for temp_dir in [RAMDISK, NVME_TMP]:
+        
+        logger.info(f"Worker {self.worker_id} finished", stats=self.stats)
+        self.conn.close()
+    
+    def fetch_and_claim_work_unit(self) -> Optional[dict]:
+        """
+        Atomically claim one inode with all its paths using TABLESAMPLE.
+        
+        Returns:
+            {'inode_row': {...}, 'paths': ['/path1', ...]} or None
+        """
+        claim_query = """
+            WITH candidate AS (
+                SELECT medium_hash, dev, ino
+                FROM inode
+                TABLESAMPLE SYSTEM_ROWS(%(sample_size)s)
+                WHERE copied = false 
+                  AND (claimed_by IS NULL OR claimed_at < NOW() - INTERVAL '1 hour')
+                ORDER BY RANDOM()
+                LIMIT 1
+            ),
+            claimed AS (
+                UPDATE inode i
+                SET claimed_by = %(worker_id)s, claimed_at = NOW()
+                FROM candidate c
+                WHERE (i.medium_hash, i.dev, i.ino) = (c.medium_hash, c.dev, c.ino)
+                  AND i.claimed_by IS NULL
+                RETURNING i.*
+            )
+            SELECT c.*,
+                   (SELECT array_agg(p.path)
+                    FROM path p
+                    WHERE (p.medium_hash, p.dev, p.ino) = (c.medium_hash, c.dev, c.ino)) as paths
+            FROM claimed c;
+        """
+        
+        with self.conn.cursor() as cur:
+            cur.execute(claim_query, {
+                'worker_id': self.worker_id,
+                'sample_size': self.sample_size
+            })
+            row = cur.fetchone()
+        
+        self.conn.commit()  # Auto-commit the claim
+        
+        if not row:
+            logger.debug("No work claimed (either no candidates or claim race lost)")
+            return None
+        
+        logger.debug(f"Claimed inode ino={row['ino']}, paths={len(row.get('paths', []))}")
+        
+        inode_row = dict(row)
+        paths = inode_row.pop('paths', [])
+        
+        return {'inode_row': inode_row, 'paths': paths}
+    
+    def release_claim(self, inode_row: dict):
+        """Release claim on an inode after error."""
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                UPDATE inode 
+                SET claimed_by = NULL, claimed_at = NULL
+                WHERE medium_hash = %s AND dev = %s AND ino = %s
+                  AND claimed_by = %s
+            """, (inode_row['medium_hash'], inode_row['dev'], inode_row['ino'],
+                  self.worker_id))
+        self.conn.commit()
+    
+    def process_work_unit(self, work_unit: dict):
+        """Process one work unit through Claim-Analyze-Execute."""
+        plan = None
+        temp_file_path = None
+        inode_row = work_unit['inode_row']
+        
         try:
-            temp_dir.mkdir(parents=True, exist_ok=True)
-            # Set permissions to match /tmp (sticky bit + world writable)
-            os.chmod(temp_dir, 0o1777)
-        except PermissionError:
-            # Try with sudo if we're running as root
-            if os.geteuid() == 0:
-                os.makedirs(temp_dir, exist_ok=True)
-                os.chmod(temp_dir, 0o1777)
+            # PHASE 1: ANALYSIS (read-only, no locks)
+            plan = self.analyze_inode(work_unit)
+            temp_file_path = plan.get('temp_file_path')
+            
+            logger.info(f"Analysis complete: action={plan['action']}, ino={inode_row['ino']}")
+            
+            if plan['action'] == 'skip':
+                logger.warning(f"Skipping inode ino={inode_row['ino']}, reason={plan['reason']}")
+                self.release_claim(inode_row)
+                return
+            
+            if self.dry_run:
+                logger.info("[DRY-RUN] Would execute", 
+                           action=plan['action'],
+                           ino=inode_row['ino'],
+                           paths=len(work_unit['paths']))
+                self.release_claim(inode_row)
+                return
+            
+            # PHASE 2: EXECUTION (filesystem first, then DB)
+            logger.info(f"Starting execution: action={plan['action']}, ino={inode_row['ino']}")
+            self.execute_plan(plan)
+            
+            logger.info(f"Work unit completed: action={plan['action']}, ino={inode_row['ino']}")
+            logger.debug("Work unit completed", 
+                        ino=inode_row['ino'],
+                        action=plan['action'])
+        
+        except AnalysisError as e:
+            logger.error(f"Analysis failed ino={inode_row['ino']}, error={e}", exc_info=True)
+            self.release_claim(inode_row)
+            self.stats['errors'] += 1
+        
+        except ExecutionError as e:
+            logger.error(f"Execution failed ino={inode_row['ino']}, error={e}", exc_info=True)
+            # Don't release claim - timeout will trigger retry
+            self.stats['errors'] += 1
+        
+        except Exception as e:
+            logger.error(f"Unexpected error ino={inode_row['ino']}, error={e}", exc_info=True)
+            self.release_claim(inode_row)
+            self.stats['errors'] += 1
+        
+        finally:
+            # Cleanup temp file
+            if temp_file_path and temp_file_path.exists():
+                temp_file_path.unlink(missing_ok=True)
+    
+    # ========================================
+    # PHASE 1: ANALYSIS FUNCTIONS
+    # ========================================
+    
+    def analyze_inode(self, work_unit: dict) -> dict:
+        """Analyze an inode and create execution plan."""
+        inode_row = work_unit['inode_row']
+        paths = work_unit['paths']
+        source_path = Path(paths[0])  # Use first path for analysis
+        
+        fs_type = inode_row.get('fs_type')
+        if not fs_type:
+            fs_type = strategies.detect_fs_type(source_path)
+            if not fs_type:
+                return {'action': 'skip', 'reason': 'Cannot detect fs_type'}
+        
+        # Strategy dispatch
+        if fs_type == 'f':
+            return self.analyze_file(work_unit, source_path)
+        elif fs_type == 'd':
+            return self.analyze_directory(work_unit)
+        elif fs_type == 'l':
+            return self.analyze_symlink(work_unit, source_path)
+        elif fs_type in ['b', 'c', 'p', 's']:
+            return self.analyze_special(work_unit, fs_type)
+        else:
+            return {'action': 'skip', 'reason': f'Unknown fs_type: {fs_type}'}
+    
+    def analyze_file(self, work_unit: dict, source_path: Path) -> dict:
+        """Analyze regular file - copy to temp and hash."""
+        inode_row = work_unit['inode_row']
+        size = inode_row['size']
+        
+        # Empty file special case
+        if size == 0:
+            return {
+                'action': 'handle_empty_file',
+                'hash': strategies.EMPTY_FILE_HASH,
+                'paths_to_link': work_unit['paths'],
+                'inode_row': inode_row,
+                'mime_type': 'application/x-empty'
+            }
+        
+        # Copy to temp and hash
+        temp_path = self.get_temp_path(inode_row)
+        try:
+            strategies.copy_file_to_temp(source_path, temp_path, size)
+            hash_value = strategies.hash_file(temp_path)
+        except Exception as e:
+            if temp_path.exists():
+                temp_path.unlink()
+            raise AnalysisError(f"Failed to copy/hash: {e}")
+        
+        # Detect MIME type
+        mime_type = strategies.detect_mime_type(self.mime_detector, source_path)
+        
+        # Check if blob already exists (deduplication)
+        blob_exists = self.check_blob_exists(hash_value)
+        
+        if blob_exists:
+            temp_path.unlink()  # No longer needed
+            return {
+                'action': 'link_existing_file',
+                'hash': hash_value,
+                'paths_to_link': work_unit['paths'],
+                'inode_row': inode_row,
+                'mime_type': mime_type
+            }
+        else:
+            return {
+                'action': 'copy_new_file',
+                'hash': hash_value,
+                'paths_to_link': work_unit['paths'],
+                'temp_file_path': temp_path,
+                'inode_row': inode_row,
+                'mime_type': mime_type
+            }
+    
+    def analyze_directory(self, work_unit: dict) -> dict:
+        """Analyze directory."""
+        return {
+            'action': 'create_directory',
+            'paths': work_unit['paths'],
+            'inode_row': work_unit['inode_row']
+        }
+    
+    def analyze_symlink(self, work_unit: dict, source_path: Path) -> dict:
+        """Analyze symlink."""
+        try:
+            target = strategies.read_symlink_target(source_path)
+        except Exception as e:
+            raise AnalysisError(f"Failed to read symlink: {e}")
+        
+        return {
+            'action': 'create_symlink',
+            'target': target,
+            'paths': work_unit['paths'],
+            'inode_row': work_unit['inode_row']
+        }
+    
+    def analyze_special(self, work_unit: dict, fs_type: str) -> dict:
+        """Analyze special file (block/char device, pipe, socket)."""
+        return {
+            'action': 'record_special',
+            'fs_type': fs_type,
+            'inode_row': work_unit['inode_row']
+        }
+    
+    def get_temp_path(self, inode_row: dict) -> Path:
+        """Get temporary file path for an inode."""
+        size = inode_row['size']
+        ino = inode_row['ino']
+        
+        if size < 100 * 1024 * 1024:  # < 100MB: use per-worker tmpfs
+            base = self.RAMDISK / self.worker_id
+        else:  # >= 100MB: use NVME
+            base = self.NVME_TMP
+        
+        base.mkdir(parents=True, exist_ok=True)
+        return base / f"{ino}.tmp"
+    
+    def check_blob_exists(self, hash_value: str) -> bool:
+        """Check if a blob already exists."""
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM blobs WHERE blobid = %s", (hash_value,))
+            return cur.fetchone() is not None
+    
+    # ========================================
+    # PHASE 2: EXECUTION FUNCTIONS
+    # ========================================
+    
+    def execute_plan(self, plan: dict):
+        """Execute plan - filesystem first, then database transaction."""
+        
+        by_hash_created_by_this_worker = False
+        
+        # ========================================
+        # STEP 1: FILESYSTEM (outside transaction)
+        # ========================================
+        try:
+            if plan['action'] == 'copy_new_file':
+                logger.info(f"Calling execute_copy_new_file_fs for ino={plan['inode_row']['ino']}")
+                by_hash_created_by_this_worker = self.execute_copy_new_file_fs(plan)
+                logger.info(f"execute_copy_new_file_fs returned: {by_hash_created_by_this_worker}")
+            
+            elif plan['action'] == 'link_existing_file':
+                self.execute_link_existing_file_fs(plan)
+            
+            elif plan['action'] == 'handle_empty_file':
+                self.execute_empty_file_fs(plan)
+            
+            elif plan['action'] == 'create_directory':
+                self.execute_directory_fs(plan)
+            
+            elif plan['action'] == 'create_symlink':
+                self.execute_symlink_fs(plan)
+            
+            elif plan['action'] == 'record_special':
+                pass  # No filesystem work
+        
+        except (OSError, PermissionError) as e:
+            # Filesystem failure - release claim for retry
+            self.release_claim(plan['inode_row'])
+            raise ExecutionError(f"Filesystem failed: {e}")
+        
+        # ========================================
+        # STEP 2: DATABASE (atomic transaction)
+        # ========================================
+        try:
+            logger.info(f"Starting DB transaction for action={plan['action']}, ino={plan['inode_row']['ino']}")
+            with self.conn.transaction():
+                if plan['action'] in ['copy_new_file', 'link_existing_file', 'handle_empty_file']:
+                    self.update_db_for_file(
+                        plan['inode_row'],
+                        plan['hash'],
+                        by_hash_created_by_this_worker,
+                        len(plan['paths_to_link']),
+                        plan.get('mime_type')
+                    )
+                
+                elif plan['action'] == 'create_directory':
+                    self.update_db_for_directory(plan['inode_row'])
+                
+                elif plan['action'] == 'create_symlink':
+                    self.update_db_for_symlink(plan['inode_row'])
+                
+                elif plan['action'] == 'record_special':
+                    self.update_db_for_special(plan['inode_row'], plan['fs_type'])
+            
+            # Explicit commit (transaction context should auto-commit, but being explicit)
+            self.conn.commit()
+            logger.info(f"DB transaction committed for ino={plan['inode_row']['ino']}")
+        
+        except Exception as e:
+            # DB failure - filesystem is correct, claim stays set
+            # Next run will fix DB state
+            logger.error(f"DB transaction failed: {e}", exc_info=True)
+            raise ExecutionError(f"Database failed: {e}")
+        
+        # Update stats
+        self.update_stats(plan, by_hash_created_by_this_worker)
+    
+    def execute_copy_new_file_fs(self, plan: dict) -> bool:
+        """Filesystem operations for new file. Returns True if we created by-hash."""
+        hash_val = plan['hash']
+        hash_path = self.BY_HASH_ROOT / hash_val[:2] / hash_val[2:4] / hash_val
+        temp_file = plan['temp_file_path']
+        
+        logger.info(f"execute_copy_new_file_fs: temp={temp_file}, exists={temp_file.exists()}, hash_path={hash_path}")
+        
+        try:
+            hash_path.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+            logger.info(f"Created parent dir: {hash_path.parent}")
+        except Exception as e:
+            logger.error(f"Failed to create parent dir {hash_path.parent}: {e}")
+            raise
+        
+        try:
+            # Atomic move
+            shutil.move(str(temp_file), str(hash_path))
+            by_hash_created = True
+            logger.info(f"Created by-hash file: {hash_path}")
+        except FileExistsError:
+            # RACE: Another worker created it between analysis and now
+            temp_file.unlink()
+            by_hash_created = False
+            logger.info(f"By-hash already exists: {hash_path}")
+        except Exception as e:
+            logger.error(f"Failed to move {temp_file} to {hash_path}: {e}")
+            raise
+        
+        # Create hardlinks (idempotent)
+        strategies.create_hardlinks_idempotent(
+            hash_path, 
+            plan['paths_to_link'],
+            self.ARCHIVE_ROOT
+        )
+        
+        return by_hash_created
+    
+    def execute_link_existing_file_fs(self, plan: dict):
+        """Filesystem operations for deduplicated file."""
+        hash_val = plan['hash']
+        hash_path = self.BY_HASH_ROOT / hash_val[:2] / hash_val[2:4] / hash_val
+        
+        strategies.create_hardlinks_idempotent(
+            hash_path,
+            plan['paths_to_link'],
+            self.ARCHIVE_ROOT
+        )
+    
+    def execute_empty_file_fs(self, plan: dict):
+        """Filesystem operations for empty file."""
+        hash_path = self.BY_HASH_ROOT / plan['hash'][:2] / plan['hash'][2:4] / plan['hash']
+        hash_path.parent.mkdir(parents=True, exist_ok=True)
+        hash_path.touch(exist_ok=True)
+        
+        strategies.create_hardlinks_idempotent(
+            hash_path,
+            plan['paths_to_link'],
+            self.ARCHIVE_ROOT
+        )
+    
+    def execute_directory_fs(self, plan: dict):
+        """Filesystem operations for directory."""
+        for path_str in plan['paths']:
+            archive_path = self.ARCHIVE_ROOT / path_str.lstrip('/')
+            if not archive_path.exists():
+                archive_path.mkdir(parents=True, exist_ok=True, mode=0o755)
+                strategies.ensure_directory_ownership(archive_path, self.ARCHIVE_ROOT)
+    
+    def execute_symlink_fs(self, plan: dict):
+        """Filesystem operations for symlink."""
+        target = plan['target']
+        for path_str in plan['paths']:
+            archive_path = self.ARCHIVE_ROOT / path_str.lstrip('/')
+            if not archive_path.exists() and not archive_path.is_symlink():
+                archive_path.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    archive_path.symlink_to(target)
+                except FileExistsError:
+                    pass  # Race with another worker
+    
+    # ========================================
+    # DATABASE UPDATE FUNCTIONS
+    # ========================================
+    
+    def update_db_for_file(self, inode_row, hash_val, by_hash_created, num_links, mime_type):
+        """Single atomic DB transaction for file."""
+        with self.conn.cursor() as cur:
+            # Update inode
+            cur.execute("""
+                UPDATE inode
+                SET hash = %s,
+                    copied = true,
+                    by_hash_created = %s,
+                    mime_type = COALESCE(%s, mime_type),
+                    processed_at = NOW(),
+                    claimed_by = NULL,
+                    claimed_at = NULL
+                WHERE medium_hash = %s AND dev = %s AND ino = %s
+            """, (hash_val, by_hash_created, mime_type,
+                  inode_row['medium_hash'], inode_row['dev'], inode_row['ino']))
+            
+            # Upsert blob (atomic increment)
+            cur.execute("""
+                INSERT INTO blobs (blobid, n_hardlinks)
+                VALUES (%s, %s)
+                ON CONFLICT (blobid) DO UPDATE
+                SET n_hardlinks = blobs.n_hardlinks + EXCLUDED.n_hardlinks
+            """, (hash_val, num_links))
+    
+    def update_db_for_directory(self, inode_row):
+        """Update DB for directory."""
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                UPDATE inode
+                SET copied = true,
+                    by_hash_created = true,
+                    mime_type = 'inode/directory',
+                    processed_at = NOW(),
+                    claimed_by = NULL,
+                    claimed_at = NULL
+                WHERE medium_hash = %s AND dev = %s AND ino = %s
+            """, (inode_row['medium_hash'], inode_row['dev'], inode_row['ino']))
+    
+    def update_db_for_symlink(self, inode_row):
+        """Update DB for symlink."""
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                UPDATE inode
+                SET copied = true,
+                    by_hash_created = true,
+                    mime_type = 'inode/symlink',
+                    processed_at = NOW(),
+                    claimed_by = NULL,
+                    claimed_at = NULL
+                WHERE medium_hash = %s AND dev = %s AND ino = %s
+            """, (inode_row['medium_hash'], inode_row['dev'], inode_row['ino']))
+    
+    def update_db_for_special(self, inode_row, fs_type):
+        """Update DB for special file."""
+        mime_type = {
+            'b': 'inode/blockdevice',
+            'c': 'inode/chardevice',
+            'p': 'inode/fifo',
+            's': 'inode/socket'
+        }.get(fs_type, 'inode/special')
+        
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                UPDATE inode
+                SET copied = true,
+                    by_hash_created = true,
+                    mime_type = %s,
+                    processed_at = NOW(),
+                    claimed_by = NULL,
+                    claimed_at = NULL
+                WHERE medium_hash = %s AND dev = %s AND ino = %s
+            """, (mime_type,
+                  inode_row['medium_hash'], inode_row['dev'], inode_row['ino']))
+    
+    def update_stats(self, plan: dict, by_hash_created: bool):
+        """Update worker statistics."""
+        if plan['action'] in ['copy_new_file', 'link_existing_file', 'handle_empty_file']:
+            if by_hash_created:
+                self.stats['copied'] += 1
             else:
-                print(f"Warning: Cannot create temp directory {temp_dir}", file=sys.stderr)
-
-    # Show mode and limit status prominently
-    print("=" * 60, file=sys.stderr)
-    if DRY_RUN:
-        print("RUNNING IN DRY-RUN MODE", file=sys.stderr)
-        if LIMIT > 0:
-            print(f"Will process up to {LIMIT} files", file=sys.stderr)
-        else:
-            print("No limit set (use --dry-run=N to limit)", file=sys.stderr)
-        print("No files will be modified or copied", file=sys.stderr)
-        print("No database updates will be committed", file=sys.stderr)
-        print(f"Dry-run logs: /var/log/ntt/copier-dryrun.jsonl", file=sys.stderr)
-    else:
-        if LIMIT > 0:
-            print(f"RUNNING IN LIMITED MODE", file=sys.stderr)
-            print(f"Will process up to {LIMIT} files", file=sys.stderr)
-            print("Files WILL be copied and database WILL be updated", file=sys.stderr)
-        else:
-            print("RUNNING IN FULL PRODUCTION MODE", file=sys.stderr)
-            print("Processing all files until complete", file=sys.stderr)
-    print("=" * 60, file=sys.stderr)
-
-    # Check if running as root (needed for accessing all files)
-    if os.geteuid() != 0:
-        print("Error: ntt-copier must be run as root/sudo", file=sys.stderr)
-        sys.exit(1)
-
-    worker = CopyWorker(WORKER_ID)
-    sys.exit(worker.run())
+                self.stats['deduped'] += 1
+            self.stats['bytes'] += plan['inode_row'].get('size', 0)
 
 
-if __name__ == '__main__':
-    main()
+@app.command()
+def main(
+    limit: int = typer.Option(0, "--limit", "-l", help="Process at most N inodes (0 = unlimited)"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Log actions without making changes"),
+    sample_size: int = typer.Option(1000, "--sample-size", help="TABLESAMPLE size for work selection"),
+    worker_id: str = typer.Option(None, "--worker-id", help="Worker ID (defaults to w{pid})"),
+):
+    """
+    NTT Copy Worker - Deduplicates and archives filesystem content.
+    
+    Must run as root/sudo: sudo -E ntt-copier.py [options]
+    """
+    
+    # Setup logging
+    logger.remove()  # Remove default handler
+    logger.add(sys.stderr, level="INFO")
+    
+    # Set PostgreSQL user to original user when running under sudo
+    if 'SUDO_USER' in os.environ:
+        os.environ['PGUSER'] = os.environ['SUDO_USER']
+    
+    # Get database URL
+    db_url = os.environ.get('NTT_DB_URL', 'postgresql:///copyjob')
+    if os.geteuid() == 0 and 'SUDO_USER' in os.environ:
+        if '://' in db_url and '@' not in db_url:
+            db_url = db_url.replace(':///', f"://{os.environ['SUDO_USER']}@localhost/")
+    
+    logger.info("NTT Copier starting", 
+                limit=limit, 
+                dry_run=dry_run,
+                sample_size=sample_size)
+    
+    # Single worker mode (this process is one worker)
+    # Use provided worker_id or default to w{pid}
+    if worker_id is None:
+        worker_id = f'w{os.getpid()}'
+    
+    worker = CopyWorker(
+        worker_id=worker_id,
+        db_url=db_url,
+        limit=limit,
+        dry_run=dry_run,
+        sample_size=sample_size
+    )
+    worker.run()
 
-# done.  <-- always leave this string at the end of the file.
+
+if __name__ == "__main__":
+    app()

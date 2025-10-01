@@ -4,6 +4,7 @@
 # dependencies = [
 #     "textual>=0.45.0",
 #     "plotext>=5.0.0",
+#     "textual-plotext>=0.2.0",
 #     "psycopg[binary]>=3.0.0",
 #     "rich>=13.0.0"
 # ]
@@ -39,6 +40,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, NamedTuple
 
 import plotext as plt
+from textual_plotext import PlotextPlot
 import psycopg
 from psycopg.rows import dict_row
 from rich.text import Text
@@ -46,7 +48,7 @@ from textual.app import App, ComposeResult
 from textual.containers import Grid, Horizontal, Vertical
 from textual.widgets import (
     DataTable, Footer, Header, Label, Log,
-    TabbedContent, TabPane, Static
+    TabbedContent, TabPane, Static, Sparkline
 )
 from textual.reactive import reactive
 from textual.timer import Timer
@@ -76,8 +78,7 @@ class WorkerStatus(NamedTuple):
     worker_id: str
     status: str  # 'running', 'stopped', 'error'
     uptime: str
-    files_processed: int = 0
-    current_rate: float = 0.0
+    cpu_percent: float = 0.0
 
 
 class SystemMetrics(NamedTuple):
@@ -97,12 +98,13 @@ class SystemStatsPanel(Static):
         """Create the system stats display."""
         with Horizontal(id="system-stats-row"):
             yield Label("CPU: --", id="cpu-compact")
+            yield Label("Load: --", id="load-compact")
             yield Label("Temp: --", id="temp-compact")
             yield Label("IO: --", id="io-compact")
             yield Label("Mem: --", id="mem-compact")
             yield Label("Pressure: --", id="pressure-compact")
 
-    def update_stats(self, cpu: float, temp: float, iowait: float, mem: float, pressure: float):
+    def update_stats(self, cpu: float, load: float, temp: float, iowait: float, mem: float, pressure: float):
         """Update all system stats displays."""
         # Update CPU
         cpu_label = self.query_one("#cpu-compact", Label)
@@ -113,6 +115,19 @@ class SystemStatsPanel(Static):
             cpu_label.styles.color = "yellow"
         else:
             cpu_label.styles.color = "green"
+
+        # Update Load Average
+        load_label = self.query_one("#load-compact", Label)
+        load_label.update(f"Load: {load:.1f}")
+        # Color based on CPU count (assume reasonable load = CPU count)
+        import os
+        cpu_count = os.cpu_count() or 8
+        if load > cpu_count * 1.5:
+            load_label.styles.color = "red"
+        elif load > cpu_count:
+            load_label.styles.color = "yellow"
+        else:
+            load_label.styles.color = "green"
 
         # Update Temperature
         temp_label = self.query_one("#temp-compact", Label)
@@ -157,6 +172,88 @@ class SystemStatsPanel(Static):
             pressure_label.styles.color = "yellow"
         else:
             pressure_label.styles.color = "green"
+
+
+class ThroughputGraph(PlotextPlot):
+    """Live updating throughput graph using textual-plotext"""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.rate_history = []
+
+    def update_data(self, history: list[tuple[float, float]]):
+        """Update with new rate history data"""
+        self.rate_history = history
+        self.update_plot()
+
+    def on_mount(self) -> None:
+        """Called when widget is mounted"""
+        self.update_plot()
+
+    def update_plot(self) -> None:
+        """Update the plot with current data"""
+        if not self.rate_history:
+            self.plt.text("Waiting for data...", x=0, y=0)
+            self.refresh()
+            return
+
+        # Configuration
+        WINDOW_SIZE = 20  # Always show 20 positions
+        recent = self.rate_history[-WINDOW_SIZE:]
+
+        # Prepare data
+        rates = [r for _, r in recent]
+        num_points = len(rates)
+
+        # X positions: right-align so newest data is always at position 19
+        x_offset = WINDOW_SIZE - num_points
+        x_positions = list(range(x_offset, WINDOW_SIZE))
+
+        # Clear and configure
+        self.plt.clear_figure()
+
+        # Create bars
+        self.plt.bar(x_positions, rates)
+
+        # Fixed X-axis range (always 0-19)
+        self.plt.xlim(0, WINDOW_SIZE - 1)
+
+        # X-axis labels: relative time (leftmost = -100s, rightmost = now)
+        x_labels = [f"-{(WINDOW_SIZE - i - 1) * 5}s" if i % 5 == 0 else "" for i in range(WINDOW_SIZE)]
+        x_labels[-1] = "now"  # Rightmost is "now"
+        self.plt.xticks(list(range(WINDOW_SIZE)), x_labels)
+
+        # Fixed Y-axis: 0 to 3500 with 3 labels only
+        self.plt.ylim(0, 3500)
+        self.plt.yticks([0, 1750, 3500], ["0", "1750", "3500"])
+        self.plt.yfrequency(0)  # Disable auto ticks
+
+        # Styling (no title for more vertical space)
+        self.plt.xlabel("Time (5s intervals)")
+        self.plt.ylabel("inodes/sec")
+
+        # Trigger refresh to display
+        self.refresh()
+
+
+class ExponentialMovingAverage:
+    """Exponential moving average for smoothing rate calculations."""
+    def __init__(self, alpha=0.3):
+        """
+        alpha: smoothing factor (0-1)
+        - Higher alpha = more weight on recent values
+        - Lower alpha = smoother, more historical weight
+        - Common: 0.1-0.3 for smoothing
+        """
+        self.alpha = alpha
+        self.ema = None
+
+    def add(self, value):
+        if self.ema is None:
+            self.ema = value
+        else:
+            self.ema = self.alpha * value + (1 - self.alpha) * self.ema
+        return self.ema
 
 
 class NTTDashboard(App):
@@ -217,6 +314,11 @@ class NTTDashboard(App):
     DataTable {
         height: 100%;
     }
+
+    #copier-rate-graph {
+        height: 18;
+        border: solid $primary;
+    }
     """
 
     # Reactive attributes for live updates
@@ -244,6 +346,14 @@ class NTTDashboard(App):
         self.verify_stats = None
         self.system_stats_panels: List[SystemStatsPanel] = []
 
+        # Track processing rate with delta calculation
+        self.prev_processed_count: int = 0
+        self.prev_processed_time: float = 0.0
+        self.processing_rate_ema = ExponentialMovingAverage(alpha=0.2)
+
+        # Track rate history for max calculations (timestamp, rate)
+        self.rate_history: List[tuple[float, float]] = []
+
     def compose(self) -> ComposeResult:
         """Create the main UI layout with tool-specific tabs."""
         yield Header()
@@ -258,22 +368,20 @@ class NTTDashboard(App):
                     yield stats_panel
 
                     with Grid(id="copier-grid"):
-                        # Worker Status Panel
-                        with Vertical(id="copier-workers"):
-                            yield Static("Worker Status", classes="panel-title")
-                            worker_table = DataTable(id="copier-worker-table")
-                            worker_table.add_columns("PID", "Worker", "Status", "Uptime", "Files", "Rate")
-                            yield worker_table
-
-                        # Queue and Metrics Panel
+                        # Metrics Panel (includes worker status)
                         with Vertical(id="copier-metrics"):
-                            yield Static("Queue & Metrics", classes="panel-title")
+                            yield Static("Metrics", classes="panel-title")
                             with Vertical(classes="metrics-container"):
+                                yield Label("Workers: --", id="copier-worker-summary")
                                 yield Label("Queue Depth: --", id="copier-queue")
                                 yield Label("Processing: --", id="copier-rate")
                                 yield Label("Today: --", id="copier-today")
                                 yield Label("Total: --", id="copier-total")
                                 yield Label("Dedup: --", id="copier-dedup")
+
+                        # Graph Panel
+                        with Vertical(id="copier-graph-panel"):
+                            yield ThroughputGraph(id="copier-rate-graph")
 
             # Re-Hardlink Tab
             with TabPane("Re-Hardlink", id="hardlink"):
@@ -359,6 +467,8 @@ class NTTDashboard(App):
             self.current_cpu_load = cpu_load
             self.current_iowait = iowait
 
+            load_avg = await self.get_load_average()
+
             self.current_cpu_temp = await self.get_cpu_temperature()
 
             mem_usage, mem_pressure = await self.get_memory_stats()
@@ -369,6 +479,7 @@ class NTTDashboard(App):
             for panel in self.system_stats_panels:
                 panel.update_stats(
                     self.current_cpu_load,
+                    load_avg,
                     self.current_cpu_temp,
                     self.current_iowait,
                     self.current_mem_usage,
@@ -413,8 +524,16 @@ class NTTDashboard(App):
                     # Check if process is running
                     status = await self.check_process_status(pid)
 
-                    # Parse worker log for stats
-                    files_processed, current_rate, is_completed = await self.parse_worker_log(worker_id)
+                    # Find actual Python worker PID (sudo wrapper → python)
+                    python_pid = await self.find_python_worker_pid(pid)
+
+                    # Get CPU% from Python process if found
+                    cpu_percent = 0.0
+                    if python_pid and status == 'running':
+                        cpu_percent = await self.get_process_cpu(python_pid)
+
+                    # Check completion status from log
+                    _, _, is_completed = await self.parse_worker_log(worker_id)
 
                     # Mark as 'done' if process is stopped AND work completed
                     if status == 'stopped' and is_completed:
@@ -427,8 +546,7 @@ class NTTDashboard(App):
                         worker_id=worker_id,
                         status=status,
                         uptime=uptime,
-                        files_processed=files_processed,
-                        current_rate=current_rate
+                        cpu_percent=cpu_percent
                     ))
 
                 except ValueError:
@@ -471,6 +589,83 @@ class NTTDashboard(App):
         except Exception:
             return "Error"
 
+    async def find_python_worker_pid(self, sudo_pid: int) -> Optional[int]:
+        """Find the actual Python worker PID by traversing children of sudo process."""
+        try:
+            import subprocess
+            loop = asyncio.get_event_loop()
+
+            def find_python():
+                # Get all processes with parent = sudo_pid, recursively
+                result = subprocess.run(
+                    ['pgrep', '-P', str(sudo_pid)],
+                    capture_output=True, text=True
+                )
+
+                if result.returncode != 0:
+                    return None
+
+                # Check each child
+                for child_pid in result.stdout.strip().split('\n'):
+                    if not child_pid:
+                        continue
+
+                    # Check if this is the Python process
+                    cmd_result = subprocess.run(
+                        ['ps', '-p', child_pid, '-o', 'comm='],
+                        capture_output=True, text=True
+                    )
+
+                    if cmd_result.returncode == 0 and 'python' in cmd_result.stdout.lower():
+                        return int(child_pid)
+
+                    # Recursively check this child's children
+                    grandchild = subprocess.run(
+                        ['pgrep', '-P', child_pid],
+                        capture_output=True, text=True
+                    )
+
+                    if grandchild.returncode == 0:
+                        for gc_pid in grandchild.stdout.strip().split('\n'):
+                            if not gc_pid:
+                                continue
+
+                            gc_cmd = subprocess.run(
+                                ['ps', '-p', gc_pid, '-o', 'comm='],
+                                capture_output=True, text=True
+                            )
+
+                            if gc_cmd.returncode == 0 and 'python' in gc_cmd.stdout.lower():
+                                return int(gc_pid)
+
+                return None
+
+            return await loop.run_in_executor(None, find_python)
+        except Exception:
+            return None
+
+    async def get_process_cpu(self, pid: int) -> float:
+        """Get CPU percentage for a process."""
+        try:
+            import subprocess
+            loop = asyncio.get_event_loop()
+
+            def get_cpu():
+                result = subprocess.run(
+                    ['ps', '-p', str(pid), '-o', '%cpu='],
+                    capture_output=True, text=True
+                )
+                if result.returncode == 0:
+                    try:
+                        return float(result.stdout.strip())
+                    except ValueError:
+                        return 0.0
+                return 0.0
+
+            return await loop.run_in_executor(None, get_cpu)
+        except Exception:
+            return 0.0
+
     async def parse_worker_log(self, worker_id: str) -> tuple[int, float, bool]:
         """Parse worker log file to extract files processed, current rate, and completion status."""
         try:
@@ -502,7 +697,8 @@ class NTTDashboard(App):
                             'all files processed',
                             'worker exiting',
                             'shutting down gracefully',
-                            'work complete'
+                            'work complete',
+                            'worker.*finished'
                         ]):
                             is_completed = True
 
@@ -712,6 +908,15 @@ class NTTDashboard(App):
         except Exception:
             return -1.0
 
+    async def get_load_average(self) -> float:
+        """Get 1-minute load average."""
+        try:
+            import os
+            load_avg = os.getloadavg()[0]  # 1-minute load average
+            return load_avg
+        except Exception:
+            return 0.0
+
     async def get_cpu_stats(self) -> tuple[float, float]:
         """Read CPU load and IOwait from /proc/stat."""
         try:
@@ -810,8 +1015,7 @@ class NTTDashboard(App):
                     cur.execute("""
                         SELECT
                             COUNT(*) FILTER (WHERE copied = true) as total_processed,
-                            COUNT(*) FILTER (WHERE copied = true AND processed_at >= CURRENT_DATE) as today_processed,
-                            COUNT(*) FILTER (WHERE copied = true AND processed_at >= NOW() - INTERVAL '1 hour') as hour_processed
+                            COUNT(*) FILTER (WHERE copied = true AND processed_at >= CURRENT_DATE) as today_processed
                         FROM inode
                     """)
                     return cur.fetchone()
@@ -863,8 +1067,33 @@ class NTTDashboard(App):
                 self.notify(f"Hardlink stats query error: {e}", severity="error")
                 raise
 
-            # Calculate processing rate
-            processing_rate = stats['hour_processed'] / 3600.0 if stats['hour_processed'] else 0.0
+            # Calculate processing rate using delta between updates
+            current_time = time.time()
+            current_processed = stats['total_processed']
+
+            if self.prev_processed_time > 0:
+                time_delta = current_time - self.prev_processed_time
+                count_delta = current_processed - self.prev_processed_count
+
+                if time_delta > 0 and count_delta >= 0:
+                    # Calculate instantaneous rate
+                    instant_rate = count_delta / time_delta
+                    # Smooth it with exponential moving average
+                    processing_rate = self.processing_rate_ema.add(instant_rate)
+
+                    # Store in history for max calculations
+                    self.rate_history.append((current_time, instant_rate))
+
+                    # Keep only last 10 minutes of history
+                    cutoff_time = current_time - 600  # 10 minutes
+                    self.rate_history = [(t, r) for t, r in self.rate_history if t > cutoff_time]
+                else:
+                    processing_rate = self.processing_rate_ema.ema or 0.0
+            else:
+                processing_rate = 0.0
+
+            self.prev_processed_count = current_processed
+            self.prev_processed_time = current_time
 
             # Create metrics object
             metrics = SystemMetrics(
@@ -912,21 +1141,26 @@ class NTTDashboard(App):
 
     def refresh_copier_display(self):
         """Update copier tab displays."""
-        # Update worker table
+        # Update worker summary
         try:
-            worker_table = self.query_one("#copier-worker-table", DataTable)
-            worker_table.clear()
+            running = len([w for w in self.worker_data if w.status == 'running'])
+            completed = len([w for w in self.worker_data if w.status == 'done'])
+            failed = len([w for w in self.worker_data if w.status in ('stopped', 'error')])
 
-            for worker in self.worker_data:
-                status_style = f"status-{worker.status}"
-                worker_table.add_row(
-                    str(worker.pid),
-                    worker.worker_id,
-                    Text(worker.status.title(), style=status_style),
-                    worker.uptime,
-                    str(worker.files_processed),
-                    f"{worker.current_rate:.1f}/s"
-                )
+            # Calculate average CPU for running workers
+            running_workers = [w for w in self.worker_data if w.status == 'running']
+            avg_cpu = sum(w.cpu_percent for w in running_workers) / len(running_workers) if running_workers else 0
+
+            # Get current timestamp
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%H:%M:%S")
+
+            if avg_cpu > 0:
+                summary = f"{running} running, {completed} completed, {failed} failed (avg CPU: {avg_cpu:.0f}%) @ {timestamp}"
+            else:
+                summary = f"{running} running, {completed} completed, {failed} failed @ {timestamp}"
+
+            self.query_one("#copier-worker-summary", Label).update(summary)
         except Exception:
             pass
 
@@ -936,16 +1170,33 @@ class NTTDashboard(App):
 
             try:
                 self.query_one("#copier-queue", Label).update(
-                    f"Queue Depth: {latest.queue_depth:,}"
+                    f"Queue Depth: {latest.queue_depth:,} inodes to process"
                 )
-                self.query_one("#copier-rate", Label).update(
-                    f"Processing: {latest.processing_rate:.1f} inodes/sec"
-                )
+                # Calculate 5-minute stats (min, avg, max)
+                current_time = time.time()
+                recent_5min = [r for t, r in self.rate_history if t > current_time - 300]
+
+                if len(recent_5min) > 0:
+                    min_5min = min(recent_5min)
+                    max_5min = max(recent_5min)
+                    avg_5min = self.processing_rate_ema.ema or 0.0
+
+                    # Format: "Processing: 1875 inodes/sec (5min: 1600 min, 1975 avg, 2100 max)"
+                    rate_text = f"Processing: {int(latest.processing_rate)} inodes/sec (5min: {int(min_5min)} min, {int(avg_5min)} avg, {int(max_5min)} max)"
+                else:
+                    rate_text = f"Processing: {int(latest.processing_rate)} inodes/sec"
+
+                self.query_one("#copier-rate", Label).update(rate_text)
+
+                # Update plotext graph
+                if len(self.rate_history) > 0:
+                    graph = self.query_one("#copier-rate-graph", ThroughputGraph)
+                    graph.update_data(self.rate_history)
                 self.query_one("#copier-today", Label).update(
-                    f"Today: {latest.files_processed_today:,}"
+                    f"Today: {latest.files_processed_today:,} inodes"
                 )
                 self.query_one("#copier-total", Label).update(
-                    f"Total: {latest.total_files_processed:,}"
+                    f"Total: {latest.total_files_processed:,} inodes"
                 )
                 self.query_one("#copier-dedup", Label).update(
                     f"Dedup: {latest.dedup_ratio:.1f}%"
