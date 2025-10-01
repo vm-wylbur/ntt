@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
 """
+================================================================================
+DEPRECATED - DO NOT USE
+================================================================================
+
+This file has been SUPERSEDED by ntt-copier.py with Claim-Analyze-Execute
+architecture and ntt_copier_strategies.py.
+
+This Chain of Responsibility pattern is no longer used and should be removed
+in the next release.
+
+DO NOT MODIFY THIS FILE
+================================================================================
+
 NTT Copier Processor Chain - Chain of Responsibility pattern for inode processing
 
 This module implements a clean pipeline for processing inodes with different types
@@ -462,7 +475,7 @@ class FileProcessor(InodeProcessor):
                       context.row['medium_hash'],
                       context.row['dev'],
                       context.row['ino']))
-                
+
                 # Insert into blobs table (ignore if already exists)
                 cur.execute("""
                     INSERT INTO blobs (blobid, last_checked)
@@ -542,7 +555,7 @@ class FileProcessor(InodeProcessor):
                   context.row['medium_hash'],
                   context.row['dev'],
                   context.row['ino']))
-            
+
             # Insert into blobs table (ignore if already exists)
             cur.execute("""
                 INSERT INTO blobs (blobid, last_checked)

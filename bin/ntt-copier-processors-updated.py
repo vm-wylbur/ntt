@@ -10,6 +10,32 @@
 # ]
 # ///
 """
+================================================================================
+DEPRECATED - DO NOT USE
+================================================================================
+
+This file implements a Chain of Responsibility pattern that has critical bugs
+and architectural flaws. It is being replaced by a new Claim-Analyze-Execute
+architecture.
+
+CRITICAL BUGS IN THIS CODE:
+1. _get_all_paths_for_hash() queries by hash instead of by inode, causing:
+   - Processing 100 inodes creates hardlinks for 12k+ paths (violates --limit)
+   - Only current inode gets by_hash_created=true flag
+   - expected_hardlinks never populated
+   - Inconsistent database state
+
+2. Scattered database commits throughout processor chain release locks early,
+   creating race conditions
+
+3. No transactional integrity - partial updates possible
+
+This file is kept for reference only while migrating logic to the new
+architecture. See design docs for the Claim-Analyze-Execute pattern.
+
+DO NOT MODIFY THIS FILE - Extract needed logic and move to new strategy module.
+================================================================================
+
 Modified processor chain for ntt-copier with enhanced tracking.
 
 Key changes:

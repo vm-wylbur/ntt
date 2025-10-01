@@ -377,6 +377,7 @@ class NTTDashboard(App):
                                 yield Label("Processing: --", id="copier-rate")
                                 yield Label("Today: --", id="copier-today")
                                 yield Label("Total: --", id="copier-total")
+                                yield Label("ETA: --", id="copier-eta")
                                 yield Label("Dedup: --", id="copier-dedup")
 
                         # Graph Panel
@@ -1172,19 +1173,22 @@ class NTTDashboard(App):
                 self.query_one("#copier-queue", Label).update(
                     f"Queue Depth: {latest.queue_depth:,} inodes to process"
                 )
-                # Calculate 5-minute stats (min, avg, max)
+                # Calculate 5-minute stats (min, avg, max) and 5-second rate
                 current_time = time.time()
                 recent_5min = [r for t, r in self.rate_history if t > current_time - 300]
+
+                # Get 5-second instantaneous rate (most recent entry)
+                rate_5s = self.rate_history[-1][1] if len(self.rate_history) > 0 else 0
 
                 if len(recent_5min) > 0:
                     min_5min = min(recent_5min)
                     max_5min = max(recent_5min)
                     avg_5min = self.processing_rate_ema.ema or 0.0
 
-                    # Format: "Processing: 1875 inodes/sec (5min: 1600 min, 1975 avg, 2100 max)"
-                    rate_text = f"Processing: {int(latest.processing_rate)} inodes/sec (5min: {int(min_5min)} min, {int(avg_5min)} avg, {int(max_5min)} max)"
+                    # Format: "Processing: 3150 inodes/sec (5min: 2800 min, 3050 avg, 3200 max)"
+                    rate_text = f"Processing: {int(rate_5s)} inodes/sec (5min: {int(min_5min)} min, {int(avg_5min)} avg, {int(max_5min)} max)"
                 else:
-                    rate_text = f"Processing: {int(latest.processing_rate)} inodes/sec"
+                    rate_text = f"Processing: {int(rate_5s)} inodes/sec"
 
                 self.query_one("#copier-rate", Label).update(rate_text)
 
@@ -1198,6 +1202,39 @@ class NTTDashboard(App):
                 self.query_one("#copier-total", Label).update(
                     f"Total: {latest.total_files_processed:,} inodes"
                 )
+
+                # Calculate ETA using 5-min statistics
+                if latest.queue_depth > 0 and len(recent_5min) > 0:
+                    min_5min = min(recent_5min)
+                    max_5min = max(recent_5min)
+                    avg_5min = self.processing_rate_ema.ema or 0.0
+
+                    if avg_5min > 0:
+                        # Average ETA
+                        eta_avg_seconds = latest.queue_depth / avg_5min
+                        # Range: best case (max rate) to worst case (min rate)
+                        eta_best_seconds = latest.queue_depth / max_5min if max_5min > 0 else 0
+                        eta_worst_seconds = latest.queue_depth / min_5min if min_5min > 0 else 0
+
+                        def format_time(seconds):
+                            if seconds < 60:
+                                return f"{int(seconds)}s"
+                            elif seconds < 3600:
+                                mins = int(seconds / 60)
+                                secs = int(seconds % 60)
+                                return f"{mins}m {secs}s"
+                            else:
+                                hrs = int(seconds / 3600)
+                                mins = int((seconds % 3600) / 60)
+                                return f"{hrs}h {mins}m"
+
+                        eta_text = f"ETA: {format_time(eta_avg_seconds)} (range: {format_time(eta_best_seconds)} - {format_time(eta_worst_seconds)})"
+                        self.query_one("#copier-eta", Label).update(eta_text)
+                    else:
+                        self.query_one("#copier-eta", Label).update("ETA: --")
+                else:
+                    self.query_one("#copier-eta", Label).update("ETA: --")
+
                 self.query_one("#copier-dedup", Label).update(
                     f"Dedup: {latest.dedup_ratio:.1f}%"
                 )
