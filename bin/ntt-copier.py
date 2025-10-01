@@ -38,17 +38,17 @@ import psycopg
 
 # Import processor chain components
 # Load the processors module (handles dash in filename)
-processors_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ntt-copier-processors.py")
+processors_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ntt-copier-processors-updated.py")
 processors_globals = {}
 with open(processors_path) as f:
     exec(f.read(), processors_globals)
 
 # Extract the classes we need
 InodeContext = processors_globals['InodeContext']
-FileTypeDetector = processors_globals['FileTypeDetector']
-DirectoryHandler = processors_globals['DirectoryHandler']
-SymlinkHandler = processors_globals['SymlinkHandler']
-NonFileHandler = processors_globals['NonFileHandler']
+FilesystemTypeDetector = processors_globals['FilesystemTypeDetector']
+DirectoryProcessor = processors_globals['DirectoryProcessor']
+SymlinkProcessor = processors_globals['SymlinkProcessor']
+SpecialFileProcessor = processors_globals['SpecialFileProcessor']
 MimeTypeDetector = processors_globals['MimeTypeDetector']
 FileProcessor = processors_globals['FileProcessor']
 from psycopg.rows import dict_row
@@ -214,10 +214,10 @@ class CopyWorker:
                 self.logger.info(f"Loaded {len(self.ignore_patterns)} ignore patterns")
 
         # Build the processor pipeline
-        self.pipeline = FileTypeDetector(
-            DirectoryHandler(
-                SymlinkHandler(
-                    NonFileHandler(
+        self.pipeline = FilesystemTypeDetector(
+            DirectoryProcessor(
+                SymlinkProcessor(
+                    SpecialFileProcessor(
                         MimeTypeDetector(
                             FileProcessor()
                         )

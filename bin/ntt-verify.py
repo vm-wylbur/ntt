@@ -64,6 +64,7 @@ app = typer.Typer()
 class VerifyMode(str, Enum):
     """Blob selection modes."""
     oldest = "oldest"
+    newest = "newest"
     never = "never"
     random = "random"
 
@@ -233,7 +234,7 @@ class BlobVerifier:
                 cur.execute("""
                     SELECT blobid 
                     FROM blobs
-                    WHERE blobid = %s::text::bytea
+                    WHERE blobid = %s
                 """, (blob_id,))
                 result = cur.fetchone()
                 if result:
@@ -245,13 +246,17 @@ class BlobVerifier:
     
     def get_blobs_to_verify(self, conn: psycopg.Connection, count: int, 
                            mode: VerifyMode) -> List[Dict]:
-        """Select blobs for verification using efficient TABLESAMPLE."""
+        """Select blobs for verification using efficient TABLESAMPLE.
+        
+        Simplified: Fast blob selection without pre-filtering.
+        Path filtering happens in batched queries (much faster).
+        """
         with conn.cursor() as cur:
             if mode == VerifyMode.random:
                 # Use TABLESAMPLE hybrid approach for true randomness
                 cur.execute("""
                     SELECT blobid FROM (
-                        SELECT * FROM blobs
+                        SELECT blobid FROM blobs
                         TABLESAMPLE SYSTEM_ROWS(%(sample)s)
                         ORDER BY RANDOM()
                         LIMIT %(limit)s
@@ -278,6 +283,19 @@ class BlobVerifier:
                     FROM blobs
                     WHERE last_checked IS NULL
                     ORDER BY blobid
+                    LIMIT %s
+                """, (count,))
+                blobs = cur.fetchall()
+                
+            elif mode == VerifyMode.newest:
+                # Most recently copied blobs (by inode.processed_at)
+                cur.execute("""
+                    SELECT b.blobid 
+                    FROM blobs b
+                    JOIN inode i ON i.hash = b.blobid
+                    WHERE i.processed_at IS NOT NULL
+                    GROUP BY b.blobid
+                    ORDER BY MAX(i.processed_at) DESC
                     LIMIT %s
                 """, (count,))
                 blobs = cur.fetchall()
@@ -318,10 +336,49 @@ class BlobVerifier:
             
             return paths
     
+    def get_blob_paths_batch(self, conn: psycopg.Connection, blobids: List[bytes]) -> Dict[bytes, List[str]]:
+        """Get all paths for multiple blobs in a single query.
+        
+        Returns a dict mapping blobid -> [paths], filtering ignored patterns.
+        This eliminates the N+1 query problem by batching path lookups.
+        
+        Filtering is done in Python (fast) rather than SQL (slow with 58M paths).
+        """
+        if not blobids:
+            return {}
+        
+        with conn.cursor() as cur:
+            # Single query to get all paths for all blobs - NO filtering in SQL
+            cur.execute("""
+                SELECT i.hash, p.path
+                FROM inode i
+                JOIN path p ON i.dev = p.dev AND i.ino = p.ino
+                WHERE i.hash = ANY(%s)
+                  AND i.hash IS NOT NULL
+                ORDER BY i.hash, p.path
+            """, (blobids,))
+            
+            # Group paths by blobid and filter in Python
+            import re
+            result = {blobid: set() for blobid in blobids}
+            
+            for row in cur.fetchall():
+                path = row['path']
+                
+                # Apply ignore patterns in Python (much faster than SQL regex)
+                if self.ignore_patterns:
+                    if any(re.search(pattern, path) for pattern in self.ignore_patterns):
+                        continue  # Skip ignored paths
+                
+                result[row['hash']].add(path)
+            
+            # Convert sets to lists
+            return {blobid: list(paths) for blobid, paths in result.items()}
+    
     def construct_paths(self, blobid: bytes, paths: List[str]) -> Tuple[Path, List[Path]]:
         """Construct by-hash and archived paths."""
         # blobid is bytea but contains the hex string, decode it
-        hex_hash = blobid.decode('utf-8') if isinstance(blobid, bytes) else blobid
+        hex_hash = blobid
         by_hash_path = self.by_hash_root / hex_hash[:2] / hex_hash[2:4] / hex_hash
 
         # Paths in database are absolute source paths, reconstruct archived locations
@@ -336,7 +393,7 @@ class BlobVerifier:
     def verify_blob(self, blobid: bytes, paths: List[str]) -> BlobVerification:
         """Verify a single blob and all its paths."""
         # blobid is bytea but contains the hex string, decode it
-        hex_hash = blobid.decode('utf-8') if isinstance(blobid, bytes) else blobid
+        hex_hash = blobid
         result = BlobVerification(
             blobid=hex_hash,
             by_hash_path="",
@@ -458,7 +515,7 @@ class BlobVerifier:
                         UPDATE blobs 
                         SET last_checked = NOW()
                         WHERE blobid = %s
-                    """, (result.blobid.encode('utf-8'),))
+                    """, (result.blobid,))
                 conn.commit()
             
             # Log batch of successes every 100
@@ -600,36 +657,43 @@ class BlobVerifier:
             
             logger.info(f"Selected {len(blobs)} blobs for verification")
             
-            # Process each blob
-            for i, blob_row in enumerate(blobs, 1):
-                blobid = blob_row['blobid']
-                self.stats['blobs_checked'] += 1
+            # Process blobs in batches to reduce DB queries
+            BATCH_SIZE = 100
+            total_blobs = len(blobs)
+            
+            for batch_start in range(0, total_blobs, BATCH_SIZE):
+                batch_end = min(batch_start + BATCH_SIZE, total_blobs)
+                batch = blobs[batch_start:batch_end]
                 
-                # Get paths for this blob
-                paths = self.get_blob_paths(conn, blobid)
+                # Get all blobids in this batch
+                blobids = [blob_row['blobid'] for blob_row in batch]
                 
-                if not paths:
-                    # Decode blobid bytea to get hex hash
-                    hex_hash = blobid.decode('utf-8') if isinstance(blobid, bytes) else blobid
-                    # Log to JSONL only (DEBUG = not shown on console)
-                    # This is normal when all paths are filtered by ignore patterns
-                    logger.debug(
-                        "No paths found",
-                        blob=hex_hash[:12],
-                        type="no_paths"
-                    )
-                    self.stats['blobs_skipped'] += 1
-                    continue
+                # Single query to get paths for all blobs in batch
+                blob_paths_map = self.get_blob_paths_batch(conn, blobids)
                 
-                # Verify the blob
-                result = self.verify_blob(blobid, paths)
+                # Process each blob in the batch
+                for blob_row in batch:
+                    blobid = blob_row['blobid']
+                    self.stats['blobs_checked'] += 1
+                    
+                    # Get paths from batch result
+                    paths = blob_paths_map.get(blobid, [])
+                    
+                    if not paths:
+                        # All paths for this blob were filtered by ignore patterns
+                        # Skip silently - this is expected and normal
+                        self.stats['blobs_skipped'] += 1
+                        continue
+                    
+                    # Verify the blob
+                    result = self.verify_blob(blobid, paths)
+                    
+                    # Process result
+                    self.process_verification_result(conn, result)
                 
-                # Process result
-                self.process_verification_result(conn, result)
-                
-                # Progress report every 1000 blobs
-                if i % 1000 == 0:
-                    self.report_progress(i, len(blobs))
+                # Progress report every batch
+                if (batch_end % 1000) < BATCH_SIZE:
+                    self.report_progress(batch_end, total_blobs)
             
             # Final summary
             self.report_summary()

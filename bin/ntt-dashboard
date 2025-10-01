@@ -539,65 +539,65 @@ class NTTDashboard(App):
                 try:
                     import json
                     import subprocess
-                    
+
                     # Use grep to find the last final_summary (much faster than reading whole file)
                     result = subprocess.run(
                         ['grep', '"type": "final_summary"', str(VERIFY_LOG)],
                         capture_output=True, text=True
                     )
-                    
+
                     verified_count = 0
                     error_count = 0
                     skipped_count = 0
                     last_check = None
                     status = "Idle"
                     display_lines = []
-                    
+
                     with open('/tmp/dash-grep-debug.log', 'w') as df:
                         df.write(f"returncode: {result.returncode}\n")
                         df.write(f"stdout: {len(result.stdout) if result.stdout else 0}\n")
-                    
+
                     if result.returncode == 0 and result.stdout:
                         # Get the last matching line
                         last_summary_line = result.stdout.strip().split('\n')[-1]
                         entry = json.loads(last_summary_line)
                         record = entry.get('record', {})
                         extra = record.get('extra', {})
-                        
+
                         if extra.get('type') == 'final_summary':
                             stats = extra.get('stats', {})
                             verified_count = stats.get('blobs_success', 0)
                             error_count = stats.get('blobs_failed', 0)
                             skipped_count = stats.get('blobs_skipped', 0)
                             status = "Complete"
-                            
+
                             # Get timestamp
                             time_info = record.get('time', {})
                             if time_info:
                                 timestamp = time_info.get('repr', '')
                                 if timestamp:
                                     last_check = timestamp.split()[1][:8]
-                    
+
                     # Get recent progress lines for display
                     with open(VERIFY_LOG, 'r') as f:
                         recent = f.readlines()[-50:]
-                    
+
                     for line in reversed(recent):
                         try:
                             entry = json.loads(line)
                             text = entry.get('text', '')
                             record = entry.get('record', {})
                             level = record.get('level', {}).get('name', '')
-                            
+
                             if level == 'ERROR':
                                 status = "Error"
-                            
+
                             if level not in ['DEBUG'] and len(display_lines) < 10:
                                 if '/data/cold/' not in text:
                                     display_lines.append(text.strip())
                         except:
                             continue
-                    
+
                     return {
                         'status': status,
                         'verified': verified_count,
@@ -606,7 +606,7 @@ class NTTDashboard(App):
                         'last_check': last_check or "Never",
                         'recent_lines': list(reversed(display_lines))
                     }
-                    
+
                 except Exception as e:
                     import traceback
                     with open("/tmp/ntt-dashboard-verify-error.log", "w") as f:

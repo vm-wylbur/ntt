@@ -61,7 +61,7 @@ class HardlinkCounter:
     def process_blob(self, conn: psycopg.Connection, blob: dict) -> int:
         """Count hardlinks for a single blob."""
         blobid = blob['blobid']
-        hex_hash = blobid.decode('utf-8') if isinstance(blobid, bytes) else blobid
+        hex_hash = blobid
         
         # Construct by-hash path
         by_hash_path = self.by_hash_root / hex_hash[:2] / hex_hash[2:4] / hex_hash

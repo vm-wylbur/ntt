@@ -93,7 +93,7 @@ def process_batch(batch_data, created_dirs, dir_lock, output_blobs, dry_run, ver
         blob_ids = [b['blobid'] for b in batch]
         batch_cur.execute("""
             SELECT 
-                encode(i.hash, 'escape') as hex_hash,
+                i.hash as hex_hash,
                 p.path
             FROM path p
             JOIN inode i ON p.dev = i.dev AND p.ino = i.ino
@@ -148,29 +148,15 @@ def process_batch(batch_data, created_dirs, dir_lock, output_blobs, dry_run, ver
                         dirs_to_create.add(parent)
                         parent = parent.parent
                 
-                # Create directories
+                # Create directories  
                 t2 = time.time()
                 for dir_path in sorted(dirs_to_create):
                     # Thread-safe check and add to created_dirs
                     with dir_lock:
                         if dir_path not in created_dirs:
                             try:
-                                dir_path.mkdir(parents=True, exist_ok=True)
+                                dir_path.mkdir(parents=True, exist_ok=True, mode=0o755)
                                 created_dirs.add(dir_path)
-                                
-                                # Fix ownership and permissions for all created directories up to ARCHIVE_ROOT
-                                if os.geteuid() == 0:  # Only if running as root
-                                    chown_dir = dir_path
-                                    while chown_dir != ARCHIVE_ROOT and chown_dir.exists():
-                                        try:
-                                            os.chown(chown_dir, 1000, 1000)
-                                            os.chmod(chown_dir, 0o755)  # drwxr-xr-x
-                                        except Exception as e:
-                                            logger.warning(f"Failed to chown/chmod {chown_dir}: {e}")
-                                        chown_dir = chown_dir.parent
-                                        # Stop if we reach a dir already owned by pball (UID 1000)
-                                        if chown_dir.exists() and chown_dir.stat().st_uid == 1000:
-                                            break
                             except Exception as e:
                                 logger.error(f"Failed to create directory {dir_path}: {e}")
                 batch_timings['create_dirs'] += time.time() - t2
@@ -326,7 +312,7 @@ def main():
                             COALESCE(n_hardlinks, 0) as actual,
                             COALESCE(expected_hardlinks, 0) as expected
                         FROM blobs 
-                        WHERE encode(blobid, 'escape') = %s
+                        WHERE blobid = %s
                     """, (hex_hash, hex_hash))
                     
                     result = cur.fetchone()
@@ -354,7 +340,7 @@ def main():
                     query = """
                         SELECT 
                             blobid,
-                            encode(blobid, 'escape') as hex_hash,
+                            blobid as hex_hash,
                             COALESCE(n_hardlinks, 0) as actual,
                             expected_hardlinks as expected
                         FROM blobs 
@@ -368,11 +354,11 @@ def main():
                         WITH blob_status AS (
                             SELECT 
                                 b.blobid,
-                                encode(b.blobid, 'escape') as hex_hash,
+                                b.blobid as hex_hash,
                                 COALESCE(b.n_hardlinks, 0) as actual,
                                 COUNT(DISTINCT p.path) as expected
                             FROM blobs b
-                            JOIN inode i ON i.hash = b.blobid::bytea
+                            JOIN inode i ON i.hash = b.blobid
                             JOIN path p ON p.dev = i.dev AND p.ino = i.ino
                             GROUP BY b.blobid, b.n_hardlinks
                         )
@@ -413,7 +399,7 @@ def main():
                                         COALESCE(b.n_hardlinks, 0) as actual,
                                         COUNT(DISTINCT p.path) as expected
                                     FROM blobs b
-                                    JOIN inode i ON i.hash = b.blobid::bytea
+                                    JOIN inode i ON i.hash = b.blobid
                                     JOIN path p ON p.dev = i.dev AND p.ino = i.ino
                                     GROUP BY b.blobid, b.n_hardlinks
                                 )

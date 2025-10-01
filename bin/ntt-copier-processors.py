@@ -451,7 +451,7 @@ class FileProcessor(InodeProcessor):
             with worker.conn.cursor() as cur:
                 cur.execute("""
                     UPDATE inode
-                    SET hash = %s::text::bytea,
+                    SET hash = %s,
                         copied = true,
                         copied_to = %s,
                         mime_type = COALESCE(mime_type, 'application/x-empty'),
@@ -466,7 +466,7 @@ class FileProcessor(InodeProcessor):
                 # Insert into blobs table (ignore if already exists)
                 cur.execute("""
                     INSERT INTO blobs (blobid, last_checked)
-                    VALUES (%s::text::bytea, NULL)
+                    VALUES (%s, NULL)
                     ON CONFLICT (blobid) DO NOTHING
                 """, (context.hash_value,))
             worker.conn.commit()
@@ -530,7 +530,7 @@ class FileProcessor(InodeProcessor):
         with worker.conn.cursor() as cur:
             cur.execute("""
                 UPDATE inode
-                SET hash = %s::text::bytea,
+                SET hash = %s,
                     copied = true,
                     copied_to = %s,
                     mime_type = COALESCE(mime_type, %s),
@@ -546,7 +546,7 @@ class FileProcessor(InodeProcessor):
             # Insert into blobs table (ignore if already exists)
             cur.execute("""
                 INSERT INTO blobs (blobid, last_checked)
-                VALUES (%s::text::bytea, NULL)
+                VALUES (%s, NULL)
                 ON CONFLICT (blobid) DO NOTHING
             """, (context.hash_value,))
         worker.conn.commit()

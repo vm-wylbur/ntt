@@ -5,6 +5,11 @@
 
 set -euo pipefail
 
+# Load NTT environment
+if [[ -f ~/.config/ntt/ntt.env ]]; then
+    source ~/.config/ntt/ntt.env
+fi
+
 # Default values
 WORKERS=4
 LIMIT=""
@@ -90,8 +95,8 @@ if [[ -n "$LIMIT" && -n "$DRY_RUN" ]]; then
     exit 1
 fi
 
-# Build worker command
-WORKER_CMD="sudo -E /home/pball/.local/bin/uv run /home/pball/projects/ntt/bin/ntt-copier.py"
+# Build worker command (pass env vars explicitly since sudo -E is ignored)
+WORKER_CMD="sudo PGUSER=${PGUSER:-$USER} NTT_DB_URL=${NTT_DB_URL:-postgresql:///copyjob} SUDO_USER=${SUDO_USER:-$USER} /home/pball/.local/bin/uv run /home/pball/projects/ntt/bin/ntt-copier.py"
 if [[ -n "$LIMIT" ]]; then
     WORKER_CMD="$WORKER_CMD --limit=$LIMIT"
 elif [[ -n "$DRY_RUN" ]]; then
@@ -155,6 +160,7 @@ echo "[$(date '+%H:%M:%S')] Launched ${#PIDS[@]} workers with PIDs: ${PIDS[*]}"
 # Save PIDs to file for monitoring/stopping
 PID_FILE="/tmp/ntt-workers.pids"
 printf "%s\n" "${PIDS[@]}" > "$PID_FILE"
+chmod 644 "$PID_FILE"
 
 echo "[$(date '+%H:%M:%S')] Workers launched successfully"
 echo "[$(date '+%H:%M:%S')] PIDs saved to: $PID_FILE"

@@ -394,7 +394,7 @@ class FileProcessor(Processor):
                 # Update inode
                 cur.execute("""
                     UPDATE inode
-                    SET hash = %s::text::bytea,
+                    SET hash = %s,
                         copied = true,
                         by_hash_created = %s,
                         copied_to = %s,
@@ -412,7 +412,7 @@ class FileProcessor(Processor):
                 if by_hash_created:
                     cur.execute("""
                         INSERT INTO blobs (blobid, last_checked, n_hardlinks)
-                        VALUES (%s::text::bytea, NULL, %s)
+                        VALUES (%s, NULL, %s)
                         ON CONFLICT (blobid) DO UPDATE
                         SET n_hardlinks = blobs.n_hardlinks + %s
                     """, (context.hash_value, len(hardlinks_created), len(hardlinks_created)))
@@ -421,7 +421,7 @@ class FileProcessor(Processor):
                     cur.execute("""
                         UPDATE blobs
                         SET n_hardlinks = n_hardlinks + %s
-                        WHERE blobid = %s::text::bytea
+                        WHERE blobid = %s
                     """, (len(hardlinks_created), context.hash_value))
                     
             worker.conn.commit()
@@ -466,7 +466,7 @@ class FileProcessor(Processor):
             # Update inode
             cur.execute("""
                 UPDATE inode
-                SET hash = %s::text::bytea,
+                SET hash = %s,
                     copied = true,
                     by_hash_created = %s,
                     copied_to = %s,
@@ -486,7 +486,7 @@ class FileProcessor(Processor):
                 # New blob - insert with initial count
                 cur.execute("""
                     INSERT INTO blobs (blobid, last_checked, n_hardlinks)
-                    VALUES (%s::text::bytea, NULL, %s)
+                    VALUES (%s, NULL, %s)
                     ON CONFLICT (blobid) DO UPDATE
                     SET n_hardlinks = blobs.n_hardlinks + %s
                 """, (context.hash_value, len(hardlinks_created), len(hardlinks_created)))
@@ -495,7 +495,7 @@ class FileProcessor(Processor):
                 cur.execute("""
                     UPDATE blobs
                     SET n_hardlinks = n_hardlinks + %s
-                    WHERE blobid = %s::text::bytea
+                    WHERE blobid = %s
                 """, (len(hardlinks_created), context.hash_value))
                 
         worker.conn.commit()
@@ -529,7 +529,7 @@ class FileProcessor(Processor):
                 cur.execute("""
                     UPDATE blobs
                     SET n_hardlinks = n_hardlinks + %s
-                    WHERE blobid = %s::text::bytea
+                    WHERE blobid = %s
                 """, (len(hardlinks_created), context.hash_value))
             worker.conn.commit()
         
@@ -543,7 +543,7 @@ class FileProcessor(Processor):
                 SELECT DISTINCT p.path
                 FROM path p
                 JOIN inode i ON p.dev = i.dev AND p.ino = i.ino
-                WHERE i.hash = %s::text::bytea
+                WHERE i.hash = %s
                 ORDER BY p.path
             """, (context.hash_value,))
             return [row['path'] for row in cur.fetchall()]
