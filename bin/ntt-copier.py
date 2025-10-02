@@ -147,7 +147,7 @@ class CopyWorker:
         """
         claim_query = """
             WITH candidate AS (
-                SELECT medium_hash, dev, ino
+                SELECT medium_hash, ino
                 FROM inode
                 TABLESAMPLE SYSTEM_ROWS(%(sample_size)s)
                 WHERE copied = false 
@@ -159,14 +159,14 @@ class CopyWorker:
                 UPDATE inode i
                 SET claimed_by = %(worker_id)s, claimed_at = NOW()
                 FROM candidate c
-                WHERE (i.medium_hash, i.dev, i.ino) = (c.medium_hash, c.dev, c.ino)
+                WHERE (i.medium_hash, i.ino) = (c.medium_hash, c.ino)
                   AND i.claimed_by IS NULL
                 RETURNING i.*
             )
             SELECT c.*,
                    (SELECT array_agg(p.path)
                     FROM path p
-                    WHERE (p.medium_hash, p.dev, p.ino) = (c.medium_hash, c.dev, c.ino)) as paths
+                    WHERE (p.medium_hash, p.ino) = (c.medium_hash, c.ino)) as paths
             FROM claimed c;
         """
         
@@ -196,9 +196,9 @@ class CopyWorker:
             cur.execute("""
                 UPDATE inode 
                 SET claimed_by = NULL, claimed_at = NULL
-                WHERE medium_hash = %s AND dev = %s AND ino = %s
+                WHERE medium_hash = %s AND ino = %s
                   AND claimed_by = %s
-            """, (inode_row['medium_hash'], inode_row['dev'], inode_row['ino'],
+            """, (inode_row['medium_hash'], inode_row['ino'],
                   self.worker_id))
         self.conn.commit()
     
@@ -557,9 +557,9 @@ class CopyWorker:
                     processed_at = NOW(),
                     claimed_by = NULL,
                     claimed_at = NULL
-                WHERE medium_hash = %s AND dev = %s AND ino = %s
+                WHERE medium_hash = %s AND ino = %s
             """, (hash_val, by_hash_created, mime_type,
-                  inode_row['medium_hash'], inode_row['dev'], inode_row['ino']))
+                  inode_row['medium_hash'], inode_row['ino']))
             
             # Upsert blob (atomic increment)
             cur.execute("""
@@ -580,8 +580,8 @@ class CopyWorker:
                     processed_at = NOW(),
                     claimed_by = NULL,
                     claimed_at = NULL
-                WHERE medium_hash = %s AND dev = %s AND ino = %s
-            """, (inode_row['medium_hash'], inode_row['dev'], inode_row['ino']))
+                WHERE medium_hash = %s AND ino = %s
+            """, (inode_row['medium_hash'], inode_row['ino']))
     
     def update_db_for_symlink(self, inode_row):
         """Update DB for symlink."""
@@ -594,8 +594,8 @@ class CopyWorker:
                     processed_at = NOW(),
                     claimed_by = NULL,
                     claimed_at = NULL
-                WHERE medium_hash = %s AND dev = %s AND ino = %s
-            """, (inode_row['medium_hash'], inode_row['dev'], inode_row['ino']))
+                WHERE medium_hash = %s AND ino = %s
+            """, (inode_row['medium_hash'], inode_row['ino']))
     
     def update_db_for_special(self, inode_row, fs_type):
         """Update DB for special file."""
@@ -615,9 +615,9 @@ class CopyWorker:
                     processed_at = NOW(),
                     claimed_by = NULL,
                     claimed_at = NULL
-                WHERE medium_hash = %s AND dev = %s AND ino = %s
+                WHERE medium_hash = %s AND ino = %s
             """, (mime_type,
-                  inode_row['medium_hash'], inode_row['dev'], inode_row['ino']))
+                  inode_row['medium_hash'], inode_row['ino']))
     
     def update_stats(self, plan: dict, by_hash_created: bool):
         """Update worker statistics."""

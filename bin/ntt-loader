@@ -125,18 +125,19 @@ SELECT DISTINCT medium_hash, now()
 FROM   $TABLE_NAME
 ON CONFLICT DO NOTHING;
 
--- inode rows (unique by medium_hash,dev,ino)
+-- inode rows (unique by medium_hash,ino) - dev kept as metadata but not in key
 INSERT INTO inode (medium_hash,dev,ino,nlink,size,mtime)
-SELECT medium_hash,dev,ino,MAX(nlink),MAX(size),MAX(mtime)
+SELECT medium_hash,MAX(dev),ino,MAX(nlink),MAX(size),MAX(mtime)
 FROM   $TABLE_NAME
-GROUP  BY medium_hash,dev,ino
-ON CONFLICT (medium_hash,dev,ino) DO NOTHING;
+GROUP  BY medium_hash,ino
+ON CONFLICT (medium_hash,ino) DO NOTHING;
 
--- path rows (unique by full path)
+-- path rows (unique by medium_hash,ino,path) - dev kept as metadata but not in key
 INSERT INTO path (medium_hash,dev,ino,path)
-SELECT medium_hash,dev,ino,path
+SELECT medium_hash,MAX(dev),ino,path
 FROM   $TABLE_NAME
-ON CONFLICT (medium_hash,dev,ino,path) DO NOTHING;
+GROUP  BY medium_hash,ino,path
+ON CONFLICT (medium_hash,ino,path) DO NOTHING;
 " || fail "Failed to deduplicate into final tables"
 
 # ---------- 4. cleanup and summary ----------
