@@ -44,7 +44,7 @@ EOSQL
 # Step 2: n_hardlinks distribution (logarithmic histogram)
 echo ""
 echo "Step 2/5: Analyzing n_hardlinks distribution..."
-psql "$DB" -t -A -F',' <<'EOSQL' | jq -R -s -c 'split("\n") | map(select(length > 0) | split(",")) | map({lower_bound: .[0]|tonumber, upper_bound: .[1]|tonumber, num_blobs: .[2]|tonumber, total_inodes: .[3]|tonumber})' > /tmp/nhardlinks.json
+psql "$DB" -t -A -F',' -q <<'EOSQL' | jq -R -s -c 'split("\n") | map(select(length > 0) | split(",")) | map({lower_bound: .[0]|tonumber, upper_bound: .[1]|tonumber, num_blobs: .[2]|tonumber, total_inodes: .[3]|tonumber})' > /tmp/nhardlinks.json
 SELECT
   pow(2, floor(log(2, n_hardlinks)))::int AS lower_bound,
   (pow(2, floor(log(2, n_hardlinks))+1)-1)::int AS upper_bound,
@@ -92,7 +92,7 @@ echo "Exported to /tmp/sharing_matrix.csv"
 # Step 5: Per-medium blob counts (for Jaccard calculation)
 echo ""
 echo "Step 5/5: Computing per-medium blob counts..."
-psql "$DB" -t -A -F',' <<'EOSQL' | jq -R -s -c 'split("\n") | map(select(length > 0) | split(",")) | map({medium_hash: .[0], unique_blobs: .[1]|tonumber}) | INDEX(.medium_hash)' > /tmp/jaccard.json
+psql "$DB" -t -A -F',' -q <<'EOSQL' | jq -R -s -c 'split("\n") | map(select(length > 0) | split(",")) | map({medium_hash: .[0], unique_blobs: .[1]|tonumber}) | INDEX(.medium_hash)' > /tmp/jaccard.json
 SELECT medium_hash, COUNT(DISTINCT hash) as unique_blobs
 FROM blob_media_matrix
 GROUP BY medium_hash
