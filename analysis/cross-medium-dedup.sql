@@ -89,13 +89,24 @@ EOSQL
 done
 echo "Exported to /tmp/sharing_matrix.csv"
 
-# Step 5: Per-medium blob counts (for Jaccard calculation)
+# Step 5: Per-medium blob counts and labels (for Jaccard calculation)
 echo ""
-echo "Step 5/5: Computing per-medium blob counts..."
-psql "$DB" -t -A -F',' -q <<'EOSQL' | jq -R -s -c 'split("\n") | map(select(length > 0) | split(",")) | map({medium_hash: .[0], unique_blobs: .[1]|tonumber}) | INDEX(.medium_hash)' > /tmp/jaccard.json
-SELECT medium_hash, COUNT(DISTINCT hash) as unique_blobs
-FROM blob_media_matrix
-GROUP BY medium_hash
+echo "Step 5/6: Computing per-medium blob counts and labels..."
+psql "$DB" -t -A -F',' -q <<'EOSQL' | jq -R -s -c 'split("\n") | map(select(length > 0) | split(",")) | map({medium_hash: .[0], unique_blobs: .[1]|tonumber, label: .[2]}) | INDEX(.medium_hash)' > /tmp/jaccard.json
+SELECT
+  b.medium_hash,
+  COUNT(DISTINCT b.hash) as unique_blobs,
+  COALESCE(
+    (SELECT substring(p.path from '^(/[^/]+/[^/]+/[^/]+)')
+     FROM path p
+     WHERE p.medium_hash = b.medium_hash
+     GROUP BY substring(p.path from '^(/[^/]+/[^/]+/[^/]+)')
+     ORDER BY COUNT(*) DESC
+     LIMIT 1),
+    b.medium_hash
+  ) as label
+FROM blob_media_matrix b
+GROUP BY b.medium_hash
 ORDER BY unique_blobs DESC;
 EOSQL
 echo "Exported to /tmp/jaccard.json"

@@ -3,9 +3,11 @@ title: "Cross-Medium Deduplication Analysis"
 author: "NTT Dedup System"
 date: "`r Sys.Date()`"
 output:
-  pdf_document:
+  html_document:
     toc: true
+    toc_float: true
     number_sections: true
+    theme: cosmo
     fig_caption: true
 ---
 
@@ -19,11 +21,9 @@ library(dplyr)
 library(tidyr)
 library(knitr)
 library(scales)
-
-# Try to load UpSetR if available
-if (!require("UpSetR", quietly = TRUE)) {
-  cat("Note: UpSetR not installed. Install with: install.packages('UpSetR')\n")
-}
+library(UpSetR)
+library(tidygraph)
+library(ggraph)
 ```
 
 ## Executive Summary
@@ -100,8 +100,9 @@ Storage impact of deduplication between media pairs.
 
 ```{r sharing-matrix-prep}
 # Calculate Jaccard similarity
-# Convert jaccard_data to a simple lookup vector
+# Convert jaccard_data to simple lookup vectors
 jaccard_lookup <- sapply(jaccard_data, function(x) x$unique_blobs)
+label_lookup <- sapply(jaccard_data, function(x) x$label)
 
 sharing_enriched <- sharing_matrix %>%
   mutate(
@@ -110,8 +111,8 @@ sharing_enriched <- sharing_matrix %>%
     union_size = blobs_a + blobs_b - shared_blobs,
     jaccard = round(shared_blobs / union_size, 4),
     shared_gb = round(shared_bytes / 1e9, 1),
-    medium_a_short = paste0(substr(medium_a, 1, 4), "...", substr(medium_a, nchar(medium_a)-3, nchar(medium_a))),
-    medium_b_short = paste0(substr(medium_b, 1, 4), "...", substr(medium_b, nchar(medium_b)-3, nchar(medium_b)))
+    medium_a_label = label_lookup[medium_a],
+    medium_b_label = label_lookup[medium_b]
   ) %>%
   arrange(desc(shared_gb))
 ```
@@ -119,7 +120,7 @@ sharing_enriched <- sharing_matrix %>%
 ```{r sharing-table}
 # Top pairs by storage impact
 sharing_enriched %>%
-  select(medium_a_short, medium_b_short, shared_blobs, shared_gb, jaccard) %>%
+  select(medium_a_label, medium_b_label, shared_blobs, shared_gb, jaccard) %>%
   head(10) %>%
   kable(
     col.names = c("Medium A", "Medium B", "Shared Blobs", "Storage (GB)", "Jaccard"),
@@ -131,7 +132,7 @@ sharing_enriched %>%
 # Visualize top sharing pairs
 sharing_enriched %>%
   head(10) %>%
-  mutate(pair_label = paste(medium_a_short, "↔", medium_b_short)) %>%
+  mutate(pair_label = paste(medium_a_label, "↔", medium_b_label)) %>%
   ggplot(aes(x = reorder(pair_label, shared_gb), y = shared_gb)) +
   geom_col(aes(fill = jaccard)) +
   coord_flip() +
@@ -147,7 +148,7 @@ sharing_enriched %>%
 
 **Key Insights:**
 
-- Top pair saves: **`r sharing_enriched$shared_gb[1]` GB** between `r sharing_enriched$medium_a_short[1]` and `r sharing_enriched$medium_b_short[1]`
+- Top pair saves: **`r sharing_enriched$shared_gb[1]` GB** between `r sharing_enriched$medium_a_label[1]` and `r sharing_enriched$medium_b_label[1]`
 - Jaccard similarity: **`r sharing_enriched$jaccard[1]`** (0 = disjoint, 1 = identical)
 - Total storage saved: **`r comma(sum(sharing_enriched$shared_gb))` GB** across all pairs
 
@@ -161,15 +162,15 @@ Understanding each medium's role in the dedup ecosystem.
 # Convert jaccard_data list to dataframe
 medium_stats <- data.frame(
   medium_hash = names(jaccard_data),
-  unique_blobs = sapply(jaccard_data, function(x) x$unique_blobs)
+  unique_blobs = sapply(jaccard_data, function(x) x$unique_blobs),
+  label = sapply(jaccard_data, function(x) x$label)
 ) %>%
   mutate(
-    pct_of_total = round(100 * unique_blobs / sum(unique_blobs), 1),
-    medium_short = paste0(substr(medium_hash, 1, 4), "...", substr(medium_hash, nchar(medium_hash)-3, nchar(medium_hash)))
+    pct_of_total = round(100 * unique_blobs / sum(unique_blobs), 1)
   ) %>%
   arrange(desc(unique_blobs))
 
-kable(medium_stats %>% select(medium_short, unique_blobs, pct_of_total),
+kable(medium_stats %>% select(label, unique_blobs, pct_of_total),
       col.names = c("Medium", "Unique Blobs", "% of Total"),
       format.args = list(big.mark = ","))
 ```
@@ -177,7 +178,7 @@ kable(medium_stats %>% select(medium_short, unique_blobs, pct_of_total),
 ```{r medium-plot, fig.width=8, fig.height=5}
 # Visualize medium sizes
 medium_stats %>%
-  ggplot(aes(x = reorder(medium_short, -unique_blobs), y = unique_blobs)) +
+  ggplot(aes(x = reorder(label, -unique_blobs), y = unique_blobs)) +
   geom_col(fill = "coral") +
   scale_y_continuous(labels = comma) +
   labs(
@@ -192,7 +193,7 @@ medium_stats %>%
 
 **Role Assignment:**
 
-- **Hub:** `r medium_stats$medium_short[1]` (`r comma(medium_stats$unique_blobs[1])` blobs, `r medium_stats$pct_of_total[1]`%)
+- **Hub:** `r medium_stats$label[1]` (`r comma(medium_stats$unique_blobs[1])` blobs, `r medium_stats$pct_of_total[1]`%)
 - **Satellites:** Other media depend on hub for cross-medium dedup
 
 ---
@@ -208,14 +209,14 @@ hub_candidate <- sharing_enriched %>%
   slice(1) %>%
   pull(medium_a)
 
-hub_short <- paste0(substr(hub_candidate, 1, 4), "...", substr(hub_candidate, nchar(hub_candidate)-3, nchar(hub_candidate)))
+hub_label <- label_lookup[hub_candidate]
 ```
 
-**Network Structure:** Star topology with **`r hub_short`** as central hub
+**Network Structure:** Star topology with **`r hub_label`** as central hub
 
 **Properties:**
 
-- **Hub medium:** `r hub_short` connects to all others
+- **Hub medium:** `r hub_label` connects to all others
 - **Weak clustering:** Jaccard scores <10% indicate independent content collections
 - **No tight communities:** Media are largely independent
 
@@ -223,38 +224,100 @@ hub_short <- paste0(substr(hub_candidate, 1, 4), "...", substr(hub_candidate, nc
 
 ## 5. UpSet Visualization
 
-```{r upset-check}
-upset_available <- file.exists("/tmp/upset_data.csv") && requireNamespace("UpSetR", quietly = TRUE)
-```
+### Intersection Pattern Visualization
 
-`r if (upset_available) "### Intersection Pattern Visualization" else "UpSet visualization not available (requires UpSetR package and /tmp/upset_data.csv)"`
+```{r upset-plot, fig.width=12, fig.height=8}
+# Load UpSet data
+upset_data <- read.csv("/tmp/upset_data.csv", row.names = 1)
 
-```{r upset-plot, eval=upset_available, fig.width=12, fig.height=8}
-if (upset_available) {
-  upset_data <- read.csv("/tmp/upset_data.csv", row.names = 1)
+# Get media order from jaccard_data
+media_order <- names(jaccard_data)
+media_cols <- grep("^media_", names(upset_data), value = TRUE)
 
-  # Only use first 10 media columns if more exist
-  media_cols <- grep("^media_", names(upset_data), value = TRUE)[1:min(10, sum(grepl("^media_", names(upset_data))))]
+# Map column names to human-readable labels
+col_mapping <- setNames(
+  sapply(1:length(media_cols), function(i) {
+    jaccard_data[[media_order[i]]]$label
+  }),
+  media_cols
+)
 
-  UpSetR::upset(
-    upset_data[, media_cols],
-    sets = media_cols,
-    order.by = "freq",
-    text.scale = 1.3,
-    mainbar.y.label = "Blob Intersection Size",
-    sets.x.label = "Blobs per Medium"
-  )
-}
+# Rename columns to use labels
+names(upset_data) <- sapply(names(upset_data), function(n) {
+  if (n %in% names(col_mapping)) col_mapping[[n]] else n
+})
+
+# Get labeled column names
+label_cols <- names(upset_data)[names(upset_data) != "blob_hash"]
+
+UpSetR::upset(
+  upset_data,
+  sets = label_cols,
+  order.by = "freq",
+  text.scale = 1.0,
+  point.size = 3,
+  mainbar.y.label = "Blob Intersection Size",
+  sets.x.label = "Blobs per Medium"
+)
 ```
 
 ---
 
-## 6. Recommendations
+## 6. Network Visualization
+
+### Medium Relationship Graph
+
+```{r network-plot, fig.width=10, fig.height=8, dev='cairo_pdf'}
+# Prepare network data from sharing matrix
+network_edges <- sharing_enriched %>%
+  select(medium_a_label, medium_b_label, jaccard, shared_gb) %>%
+  rename(from = medium_a_label, to = medium_b_label)
+
+# Create graph object
+graph_data <- network_edges %>%
+  as_tbl_graph(directed = FALSE) %>%
+  activate(nodes) %>%
+  mutate(
+    degree = centrality_degree(),
+    # Get blob count for each node
+    blob_count = sapply(name, function(n) {
+      label_data <- Filter(function(x) x$label == n, jaccard_data)
+      if (length(label_data) > 0) label_data[[1]]$unique_blobs else 0
+    })
+  )
+
+# Create network visualization
+ggraph(graph_data, layout = 'fr') +
+  geom_edge_link(
+    aes(width = jaccard, alpha = jaccard),
+    color = "steelblue",
+    lineend = "round"
+  ) +
+  geom_node_point(aes(size = blob_count, color = degree)) +
+  geom_node_text(aes(label = name), size = 3, vjust = -1, family = "sans") +
+  scale_edge_width_continuous(range = c(0.5, 3)) +
+  scale_edge_alpha_continuous(range = c(0.3, 0.9)) +
+  scale_size_continuous(range = c(4, 15), labels = scales::comma) +
+  scale_color_viridis_c(option = "plasma", direction = -1) +
+  theme_graph(base_family = "sans") +
+  labs(
+    title = "Storage Media Network - Blob Sharing Topology",
+    subtitle = "Node size = blob count, Node color = connection degree, Edge width/alpha = Jaccard similarity",
+    size = "Blob Count",
+    color = "Connections"
+  )
+```
+
+**Interpretation:** This graph reveals the network topology of content sharing between storage media. Nodes represent media (sized by blob count), edges represent shared content (weighted by Jaccard similarity). The layout algorithm positions highly connected media centrally, making hub-and-spoke patterns visually apparent.
+
+---
+
+## 7. Recommendations
 
 ### Storage Optimization
 
 - **Priority 1:** Top pair already achieving maximum dedup (`r sharing_enriched$shared_gb[1]` GB)
-- **Priority 2:** Monitor hub medium (`r hub_short`) - critical for cross-medium dedup
+- **Priority 2:** Monitor hub medium (`r hub_label`) - critical for cross-medium dedup
 - **Priority 3:** Low Jaccard scores suggest distinct content - limited further dedup opportunity
 
 ### Data Management
