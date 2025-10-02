@@ -111,16 +111,19 @@ import csv
 # Query for data
 query = "SELECT hash, medium_hash FROM blob_media_matrix"
 result = subprocess.run(
-    ['psql', 'postgresql://pball@192.168.86.200/copyjob', '-t', '-A', '-F,', '-c', query],
+    ['psql', 'postgresql://pball@192.168.86.200/copyjob', '-t', '-A', '-F,', '-q', '-c', query],
     capture_output=True, text=True
 )
 
 # Build hash -> media set mapping
 hash_media = {}
 for line in result.stdout.strip().split('\n'):
-    if not line:
+    if not line or ',' not in line:
         continue
-    hash_val, medium = line.split(',')
+    parts = line.split(',')
+    if len(parts) != 2:
+        continue
+    hash_val, medium = parts
     if hash_val not in hash_media:
         hash_media[hash_val] = set()
     hash_media[hash_val].add(medium)
