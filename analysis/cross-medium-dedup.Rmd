@@ -101,11 +101,13 @@ Storage impact of deduplication between media pairs.
 
 ```{r sharing-matrix-prep}
 # Calculate Jaccard similarity
+# Convert jaccard_data to a simple lookup vector
+jaccard_lookup <- sapply(jaccard_data, function(x) x$unique_blobs)
+
 sharing_enriched <- sharing_matrix %>%
-  rowwise() %>%
   mutate(
-    blobs_a = jaccard_data[[medium_a]]$unique_blobs,
-    blobs_b = jaccard_data[[medium_b]]$unique_blobs,
+    blobs_a = jaccard_lookup[medium_a],
+    blobs_b = jaccard_lookup[medium_b],
     union_size = blobs_a + blobs_b - shared_blobs,
     jaccard = round(shared_blobs / union_size, 4),
     shared_gb = round(shared_bytes / 1e9, 1),
