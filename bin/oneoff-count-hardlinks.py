@@ -84,7 +84,7 @@ class HardlinkCounter:
                 SELECT DISTINCT p.path
                 FROM path p
                 JOIN inode i ON p.dev = i.dev AND p.ino = i.ino
-                WHERE i.hash = %s
+                WHERE i.blobid = %s
                 ORDER BY p.path
             """, (blobid,))
             paths = cur.fetchall()

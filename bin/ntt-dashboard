@@ -567,7 +567,9 @@ class NTTDashboard(App):
         except ProcessLookupError:
             return 'stopped'
         except PermissionError:
-            return 'unknown'
+            # Permission denied means process exists but owned by another user (root)
+            # This is expected for sudo-launched workers
+            return 'running'
         except (OSError, ValueError):
             return 'error'
 
@@ -597,49 +599,44 @@ class NTTDashboard(App):
             loop = asyncio.get_event_loop()
 
             def find_python():
-                # Get all processes with parent = sudo_pid, recursively
-                result = subprocess.run(
-                    ['pgrep', '-P', str(sudo_pid)],
-                    capture_output=True, text=True
-                )
+                def search_descendants(pid: int, depth: int = 0) -> Optional[int]:
+                    """Recursively search process tree for Python process."""
+                    if depth > 5:  # Prevent infinite loops
+                        return None
 
-                if result.returncode != 0:
+                    # Get children of this PID
+                    result = subprocess.run(
+                        ['pgrep', '-P', str(pid)],
+                        capture_output=True, text=True
+                    )
+
+                    if result.returncode != 0:
+                        return None
+
+                    # Check each child
+                    for child_pid_str in result.stdout.strip().split('\n'):
+                        if not child_pid_str:
+                            continue
+
+                        child_pid = int(child_pid_str)
+
+                        # Check if this is the Python process
+                        cmd_result = subprocess.run(
+                            ['ps', '-p', str(child_pid), '-o', 'comm='],
+                            capture_output=True, text=True
+                        )
+
+                        if cmd_result.returncode == 0 and 'python' in cmd_result.stdout.lower():
+                            return child_pid
+
+                        # Recursively search this child's descendants
+                        python_pid = search_descendants(child_pid, depth + 1)
+                        if python_pid:
+                            return python_pid
+
                     return None
 
-                # Check each child
-                for child_pid in result.stdout.strip().split('\n'):
-                    if not child_pid:
-                        continue
-
-                    # Check if this is the Python process
-                    cmd_result = subprocess.run(
-                        ['ps', '-p', child_pid, '-o', 'comm='],
-                        capture_output=True, text=True
-                    )
-
-                    if cmd_result.returncode == 0 and 'python' in cmd_result.stdout.lower():
-                        return int(child_pid)
-
-                    # Recursively check this child's children
-                    grandchild = subprocess.run(
-                        ['pgrep', '-P', child_pid],
-                        capture_output=True, text=True
-                    )
-
-                    if grandchild.returncode == 0:
-                        for gc_pid in grandchild.stdout.strip().split('\n'):
-                            if not gc_pid:
-                                continue
-
-                            gc_cmd = subprocess.run(
-                                ['ps', '-p', gc_pid, '-o', 'comm='],
-                                capture_output=True, text=True
-                            )
-
-                            if gc_cmd.returncode == 0 and 'python' in gc_cmd.stdout.lower():
-                                return int(gc_pid)
-
-                return None
+                return search_descendants(sudo_pid)
 
             return await loop.run_in_executor(None, find_python)
         except Exception:
@@ -1007,7 +1004,12 @@ class NTTDashboard(App):
             # Query queue depth
             def query_queue_depth():
                 with self.db_conn.cursor() as cur:
-                    cur.execute("SELECT COUNT(*) as count FROM inode WHERE copied = false")
+                    cur.execute("""
+                        SELECT COUNT(*) as count
+                        FROM inode i
+                        JOIN medium m ON i.medium_hash = m.medium_hash
+                        WHERE i.copied = false AND m.health = 'ok'
+                    """)
                     return cur.fetchone()['count']
 
             # Query processing stats
@@ -1026,15 +1028,15 @@ class NTTDashboard(App):
                 with self.db_conn.cursor() as cur:
                     cur.execute("""
                         WITH sample_paths AS (
-                            SELECT i.hash
+                            SELECT i.blobid
                             FROM path p
                             JOIN inode i ON i.dev = p.dev AND i.ino = p.ino
-                            WHERE i.hash IS NOT NULL
+                            WHERE i.blobid IS NOT NULL
                             LIMIT 5000
                         )
                         SELECT
                             COUNT(*) as sample_size,
-                            COUNT(DISTINCT hash) as unique_hashes
+                            COUNT(DISTINCT blobid) as unique_hashes
                         FROM sample_paths
                     """)
                     result = cur.fetchone()

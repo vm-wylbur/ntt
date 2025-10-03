@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.13"
+# dependencies = [
+#     "psycopg[binary]>=3.0.0",
+# ]
+# ///
+#
+# Author: PB and Claude
+# Date: 2025-10-03
+# License: (c) HRDAG, 2025, GPL-2 or newer
+#
+# ------
+# ntt/bin/ntt-list-media
+#
+# List medium_hashes for media containing paths with a specific prefix
+#
+# Usage:
+#   ntt-list-media --path-prefix /data/staging
+#   ntt-list-media --path-prefix /mnt --format comma
+
+import argparse
+import os
+import sys
+import psycopg
+from psycopg.rows import dict_row
+
+# Database configuration
+DB_URL = os.environ.get('NTT_DB_URL', 'postgresql:///copyjob')
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='List medium_hashes for media containing paths with a specific prefix'
+    )
+    parser.add_argument(
+        '--path-prefix',
+        required=True,
+        help='Path prefix to search for (e.g., /data/staging)'
+    )
+    parser.add_argument(
+        '--format',
+        choices=['list', 'comma', 'quoted'],
+        default='list',
+        help='Output format: list (one per line), comma (CSV), quoted (for SQL)'
+    )
+    parser.add_argument(
+        '--stats',
+        action='store_true',
+        help='Show statistics about each medium'
+    )
+
+    args = parser.parse_args()
+
+    # Ensure path prefix starts with /
+    path_prefix = args.path_prefix
+    if not path_prefix.startswith('/'):
+        path_prefix = '/' + path_prefix
+
+    # Add wildcard for LIKE query
+    like_pattern = path_prefix.rstrip('/') + '/%'
+
+    try:
+        with psycopg.connect(DB_URL, row_factory=dict_row) as conn:
+            with conn.cursor() as cur:
+                if args.stats:
+                    # Query with statistics
+                    cur.execute("""
+                        SELECT
+                            p.medium_hash,
+                            COUNT(DISTINCT (p.medium_hash, p.ino)) as total_inodes,
+                            COUNT(DISTINCT (p.medium_hash, p.ino)) FILTER (
+                                WHERE EXISTS (
+                                    SELECT 1 FROM inode i
+                                    WHERE i.medium_hash = p.medium_hash
+                                    AND i.ino = p.ino
+                                    AND i.copied = false
+                                )
+                            ) as unclaimed_inodes,
+                            COUNT(DISTINCT p.path) as total_paths,
+                            MIN(p.path) as sample_path
+                        FROM path p
+                        WHERE p.path LIKE %s
+                        GROUP BY p.medium_hash
+                        ORDER BY unclaimed_inodes DESC
+                    """, (like_pattern,))
+
+                    results = cur.fetchall()
+
+                    if not results:
+                        print(f"No media found with paths starting with {path_prefix}", file=sys.stderr)
+                        sys.exit(1)
+
+                    # Print statistics
+                    print(f"Media with paths starting with {path_prefix}:\n")
+                    print(f"{'Medium Hash':<64} {'Total':<10} {'Unclaimed':<10} {'Paths':<10} Sample Path")
+                    print("-" * 120)
+
+                    total_inodes = 0
+                    total_unclaimed = 0
+                    media_hashes = []
+
+                    for row in results:
+                        print(f"{row['medium_hash']:<64} {row['total_inodes']:<10} "
+                              f"{row['unclaimed_inodes']:<10} {row['total_paths']:<10} {row['sample_path'][:40]}")
+                        total_inodes += row['total_inodes']
+                        total_unclaimed += row['unclaimed_inodes']
+                        media_hashes.append(row['medium_hash'])
+
+                    print("-" * 120)
+                    print(f"Total: {len(results)} media, {total_inodes:,} inodes, {total_unclaimed:,} unclaimed")
+                    print()
+
+                    # Output media hashes for copy-workers
+                    if args.format == 'comma':
+                        print(','.join(media_hashes))
+                    elif args.format == 'quoted':
+                        print("'" + "','".join(media_hashes) + "'")
+                    else:
+                        for mh in media_hashes:
+                            print(mh)
+                else:
+                    # Simple query - just get the hashes
+                    cur.execute("""
+                        SELECT DISTINCT medium_hash
+                        FROM path
+                        WHERE path LIKE %s
+                        ORDER BY medium_hash
+                    """, (like_pattern,))
+
+                    results = cur.fetchall()
+
+                    if not results:
+                        print(f"No media found with paths starting with {path_prefix}", file=sys.stderr)
+                        sys.exit(1)
+
+                    media_hashes = [row['medium_hash'] for row in results]
+
+                    if args.format == 'comma':
+                        print(','.join(media_hashes))
+                    elif args.format == 'quoted':
+                        print("'" + "','".join(media_hashes) + "'")
+                    else:
+                        for mh in media_hashes:
+                            print(mh)
+
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()

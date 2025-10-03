@@ -10,7 +10,7 @@ SET expected_hardlinks = (
     SELECT COUNT(DISTINCT p.path)
     FROM inode i
     JOIN path p ON p.dev = i.dev AND p.ino = i.ino
-    WHERE i.hash = b.blobid::bytea
+    WHERE i.blobid = b.blobid
 )
 WHERE expected_hardlinks IS NULL;
 
@@ -29,12 +29,12 @@ WHERE n_hardlinks < expected_hardlinks;
 CREATE MATERIALIZED VIEW IF NOT EXISTS blob_completeness AS
 WITH blob_stats AS (
     SELECT
-        i.hash as blobid,
+        i.blobid as blobid,
         COUNT(DISTINCT p.path) as expected_paths
     FROM inode i
     JOIN path p ON p.dev = i.dev AND p.ino = i.ino
-    WHERE i.hash IS NOT NULL
-    GROUP BY i.hash
+    WHERE i.blobid IS NOT NULL
+    GROUP BY i.blobid
 )
 SELECT
     b.blobid,
@@ -42,7 +42,7 @@ SELECT
     s.expected_paths,
     s.expected_paths - COALESCE(b.n_hardlinks, 0) as missing_hardlinks
 FROM blobs b
-JOIN blob_stats s ON s.blobid = b.blobid::bytea
+JOIN blob_stats s ON s.blobid = b.blobid
 WHERE COALESCE(b.n_hardlinks, 0) < s.expected_paths;
 
 CREATE INDEX IF NOT EXISTS idx_blob_completeness_missing

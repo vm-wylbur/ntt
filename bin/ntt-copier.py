@@ -64,12 +64,14 @@ class CopyWorker:
     """NTT copy worker using Claim-Analyze-Execute pattern."""
     
     def __init__(self, worker_id: str, db_url: str, limit: int = 0, 
-                 dry_run: bool = False, sample_size: int = 1000):
+                 dry_run: bool = False, sample_size: int = 1000,
+                 medium_hashes: Optional[list[str]] = None):
         self.worker_id = worker_id
         self.db_url = db_url
         self.limit = limit
         self.dry_run = dry_run
         self.sample_size = sample_size
+        self.medium_hashes = medium_hashes
         self.shutdown = False
         self.processed_count = 0
         
@@ -119,12 +121,27 @@ class CopyWorker:
         """Main worker loop."""
         logger.info(f"Worker {self.worker_id} starting")
         
+        consecutive_no_work = 0
+        max_no_work_attempts = 10  # Check for exhaustion after 10 failed claims
+        
         while not self.shutdown:
             work_unit = self.fetch_and_claim_work_unit()
             if not work_unit:
+                consecutive_no_work += 1
+                
+                # If we have medium_hashes filter and consistently finding no work,
+                # check if work is truly exhausted for our media
+                if self.medium_hashes and consecutive_no_work >= max_no_work_attempts:
+                    if self.check_media_exhausted():
+                        logger.info(f"No remaining work for assigned media, exiting")
+                        break
+                    consecutive_no_work = 0  # Reset counter, work exists but claim race
+                
                 logger.debug("No work available, waiting...")
                 time.sleep(0.01)  # 10ms - fast retry on claim race
                 continue
+            
+            consecutive_no_work = 0  # Reset on successful claim
             
             logger.info(f"Processing work unit ino={work_unit['inode_row']['ino']}")
             self.process_work_unit(work_unit)
@@ -138,56 +155,151 @@ class CopyWorker:
         logger.info(f"Worker {self.worker_id} finished", stats=self.stats)
         self.conn.close()
     
+    def check_media_exhausted(self) -> bool:
+        """
+        Check if there are any unclaimed inodes left for our assigned media.
+        (Health checked at startup via ntt-copy-workers)
+
+        Returns:
+            True if no work remains, False if work still exists
+        """
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                SELECT EXISTS(
+                    SELECT 1 FROM inode
+                    WHERE copied = false
+                      AND claimed_by IS NULL
+                      AND medium_hash = ANY(%s)
+                    LIMIT 1
+                )
+            """, (self.medium_hashes,))
+            result = cur.fetchone()
+            work_exists = result['exists'] if result else False
+            return not work_exists
+    
+    def get_queue_depth(self) -> int:
+        """Get current queue depth for adaptive sampling (respects medium_hashes filter).
+        Health checked at startup via ntt-copy-workers."""
+        with self.conn.cursor() as cur:
+            if self.medium_hashes:
+                cur.execute("""
+                    SELECT COUNT(*) as count
+                    FROM inode
+                    WHERE copied = false
+                      AND claimed_by IS NULL
+                      AND medium_hash = ANY(%s)
+                """, (self.medium_hashes,))
+            else:
+                cur.execute("""
+                    SELECT COUNT(*) as count
+                    FROM inode
+                    WHERE copied = false
+                      AND claimed_by IS NULL
+                """)
+            return cur.fetchone()['count']
+
     def fetch_and_claim_work_unit(self) -> Optional[dict]:
         """
-        Atomically claim one inode with all its paths using TABLESAMPLE.
-        
+        Atomically claim one inode with all its paths.
+
+        Uses adaptive sampling:
+        - TABLESAMPLE for large queues (>50K) - fast random sampling
+        - Direct query for small queues (<=50K) - handles sparse long-tail
+
         Returns:
             {'inode_row': {...}, 'paths': ['/path1', ...]} or None
         """
-        claim_query = """
-            WITH candidate AS (
-                SELECT medium_hash, ino
-                FROM inode
-                TABLESAMPLE SYSTEM_ROWS(%(sample_size)s)
-                WHERE copied = false 
-                  AND (claimed_by IS NULL OR claimed_at < NOW() - INTERVAL '1 hour')
-                ORDER BY RANDOM()
-                LIMIT 1
-            ),
-            claimed AS (
-                UPDATE inode i
-                SET claimed_by = %(worker_id)s, claimed_at = NOW()
-                FROM candidate c
-                WHERE (i.medium_hash, i.ino) = (c.medium_hash, c.ino)
-                  AND i.claimed_by IS NULL
-                RETURNING i.*
-            )
-            SELECT c.*,
-                   (SELECT array_agg(p.path)
-                    FROM path p
-                    WHERE (p.medium_hash, p.ino) = (c.medium_hash, c.ino)) as paths
-            FROM claimed c;
-        """
-        
+        # Build WHERE clause for medium_hash filter
+        medium_filter = ""
+        if self.medium_hashes:
+            medium_filter = "AND medium_hash = ANY(%(medium_hashes)s)"
+
+        # Check queue depth every 100 claims to decide sampling strategy
+        if not hasattr(self, '_queue_depth_cache'):
+            self._queue_depth_cache = None
+            self._queue_depth_check_counter = 0
+
+        self._queue_depth_check_counter += 1
+        if self._queue_depth_check_counter >= 100 or self._queue_depth_cache is None:
+            self._queue_depth_cache = self.get_queue_depth()
+            self._queue_depth_check_counter = 0
+            logger.debug(f"Queue depth: {self._queue_depth_cache}")
+
+        # Adaptive sampling: use TABLESAMPLE for large queues, direct query for long-tail
+        LONG_TAIL_THRESHOLD = 50000
+
+        if self._queue_depth_cache > LONG_TAIL_THRESHOLD:
+            # Large queue: SELECT with SKIP LOCKED to avoid worker contention
+            claim_query = f"""
+                WITH locked_row AS (
+                    SELECT medium_hash, ino
+                    FROM inode
+                    WHERE copied = false
+                      AND claimed_by IS NULL
+                      {medium_filter}
+                    LIMIT 1
+                    FOR UPDATE SKIP LOCKED
+                ),
+                claimed AS (
+                    UPDATE inode i
+                    SET claimed_by = %(worker_id)s, claimed_at = NOW()
+                    FROM locked_row lr
+                    WHERE (i.medium_hash, i.ino) = (lr.medium_hash, lr.ino)
+                    RETURNING i.*
+                )
+                SELECT c.*,
+                       (SELECT array_agg(p.path)
+                        FROM path p
+                        WHERE (p.medium_hash, p.ino) = (c.medium_hash, c.ino)) as paths
+                FROM claimed c;
+            """
+        else:
+            # Long-tail: SELECT with SKIP LOCKED (same as large queue for consistency)
+            claim_query = f"""
+                WITH locked_row AS (
+                    SELECT medium_hash, ino
+                    FROM inode
+                    WHERE copied = false
+                      AND claimed_by IS NULL
+                      {medium_filter}
+                    LIMIT 1
+                    FOR UPDATE SKIP LOCKED
+                ),
+                claimed AS (
+                    UPDATE inode i
+                    SET claimed_by = %(worker_id)s, claimed_at = NOW()
+                    FROM locked_row lr
+                    WHERE (i.medium_hash, i.ino) = (lr.medium_hash, lr.ino)
+                    RETURNING i.*
+                )
+                SELECT c.*,
+                       (SELECT array_agg(p.path)
+                        FROM path p
+                        WHERE (p.medium_hash, p.ino) = (c.medium_hash, c.ino)) as paths
+                FROM claimed c;
+            """
+
+        params = {
+            'worker_id': self.worker_id
+        }
+        if self.medium_hashes:
+            params['medium_hashes'] = self.medium_hashes
+
         with self.conn.cursor() as cur:
-            cur.execute(claim_query, {
-                'worker_id': self.worker_id,
-                'sample_size': self.sample_size
-            })
+            cur.execute(claim_query, params)
             row = cur.fetchone()
-        
+
         self.conn.commit()  # Auto-commit the claim
-        
+
         if not row:
             logger.debug("No work claimed (either no candidates or claim race lost)")
             return None
-        
+
         logger.debug(f"Claimed inode ino={row['ino']}, paths={len(row.get('paths', []))}")
-        
+
         inode_row = dict(row)
         paths = inode_row.pop('paths', [])
-        
+
         return {'inode_row': inode_row, 'paths': paths}
     
     def release_claim(self, inode_row: dict):
@@ -294,7 +406,7 @@ class CopyWorker:
         if size == 0:
             return {
                 'action': 'handle_empty_file',
-                'hash': strategies.EMPTY_FILE_HASH,
+                'blobid': strategies.EMPTY_FILE_HASH,
                 'paths_to_link': work_unit['paths'],
                 'inode_row': inode_row,
                 'mime_type': 'application/x-empty'
@@ -320,7 +432,7 @@ class CopyWorker:
             temp_path.unlink()  # No longer needed
             return {
                 'action': 'link_existing_file',
-                'hash': hash_value,
+                'blobid': hash_value,
                 'paths_to_link': work_unit['paths'],
                 'inode_row': inode_row,
                 'mime_type': mime_type
@@ -328,7 +440,7 @@ class CopyWorker:
         else:
             return {
                 'action': 'copy_new_file',
-                'hash': hash_value,
+                'blobid': hash_value,
                 'paths_to_link': work_unit['paths'],
                 'temp_file_path': temp_path,
                 'inode_row': inode_row,
@@ -431,7 +543,7 @@ class CopyWorker:
                 if plan['action'] in ['copy_new_file', 'link_existing_file', 'handle_empty_file']:
                     self.update_db_for_file(
                         plan['inode_row'],
-                        plan['hash'],
+                        plan['blobid'],
                         by_hash_created_by_this_worker,
                         len(plan['paths_to_link']),
                         plan.get('mime_type')
@@ -461,7 +573,7 @@ class CopyWorker:
     
     def execute_copy_new_file_fs(self, plan: dict) -> bool:
         """Filesystem operations for new file. Returns True if we created by-hash."""
-        hash_val = plan['hash']
+        hash_val = plan['blobid']
         hash_path = self.BY_HASH_ROOT / hash_val[:2] / hash_val[2:4] / hash_val
         temp_file = plan['temp_file_path']
         
@@ -499,7 +611,7 @@ class CopyWorker:
     
     def execute_link_existing_file_fs(self, plan: dict):
         """Filesystem operations for deduplicated file."""
-        hash_val = plan['hash']
+        hash_val = plan['blobid']
         hash_path = self.BY_HASH_ROOT / hash_val[:2] / hash_val[2:4] / hash_val
         
         strategies.create_hardlinks_idempotent(
@@ -510,7 +622,7 @@ class CopyWorker:
     
     def execute_empty_file_fs(self, plan: dict):
         """Filesystem operations for empty file."""
-        hash_path = self.BY_HASH_ROOT / plan['hash'][:2] / plan['hash'][2:4] / plan['hash']
+        hash_path = self.BY_HASH_ROOT / plan['blobid'][:2] / plan['blobid'][2:4] / plan['blobid']
         hash_path.parent.mkdir(parents=True, exist_ok=True)
         hash_path.touch(exist_ok=True)
         
@@ -550,7 +662,7 @@ class CopyWorker:
             # Update inode
             cur.execute("""
                 UPDATE inode
-                SET hash = %s,
+                SET blobid = %s,
                     copied = true,
                     by_hash_created = %s,
                     mime_type = COALESCE(%s, mime_type),
@@ -560,6 +672,13 @@ class CopyWorker:
                 WHERE medium_hash = %s AND ino = %s
             """, (hash_val, by_hash_created, mime_type,
                   inode_row['medium_hash'], inode_row['ino']))
+            
+            # Update path.blobid for all paths of this inode
+            cur.execute("""
+                UPDATE path
+                SET blobid = %s
+                WHERE medium_hash = %s AND ino = %s
+            """, (hash_val, inode_row['medium_hash'], inode_row['ino']))
             
             # Upsert blob (atomic increment)
             cur.execute("""
@@ -635,6 +754,7 @@ def main(
     dry_run: bool = typer.Option(False, "--dry-run", help="Log actions without making changes"),
     sample_size: int = typer.Option(1000, "--sample-size", help="TABLESAMPLE size for work selection"),
     worker_id: str = typer.Option(None, "--worker-id", help="Worker ID (defaults to w{pid})"),
+    medium_hashes: str = typer.Option(None, "--medium-hashes", help="Comma-separated medium_hashes to restrict worker to"),
 ):
     """
     NTT Copy Worker - Deduplicates and archives filesystem content.
@@ -666,12 +786,19 @@ def main(
     if worker_id is None:
         worker_id = f'w{os.getpid()}'
     
+    # Parse medium_hashes if provided
+    medium_hash_list = None
+    if medium_hashes:
+        medium_hash_list = [h.strip() for h in medium_hashes.split(',')]
+        logger.info(f"Restricting to {len(medium_hash_list)} media")
+    
     worker = CopyWorker(
         worker_id=worker_id,
         db_url=db_url,
         limit=limit,
         dry_run=dry_run,
-        sample_size=sample_size
+        sample_size=sample_size,
+        medium_hashes=medium_hash_list
     )
     worker.run()
 

@@ -18,14 +18,14 @@ UPDATE blobs b
 SET expected_hardlinks = subq.expected_count
 FROM (
     SELECT
-        i.hash as blobid,
+        i.blobid as blobid,
         COUNT(DISTINCT p.path) as expected_count
     FROM inode i
     JOIN path p ON p.dev = i.dev AND p.ino = i.ino
-    WHERE i.hash IS NOT NULL
-    GROUP BY i.hash
+    WHERE i.blobid IS NOT NULL
+    GROUP BY i.blobid
 ) subq
-WHERE b.blobid::bytea = subq.blobid
+WHERE b.blobid = subq.blobid
   AND b.expected_hardlinks IS NULL;
 
 \timing off

@@ -34,7 +34,7 @@ SELECT
         ELSE 'none'
     END as status
 FROM blobs b
-JOIN inode i ON i.hash = b.blobid::bytea
+JOIN inode i ON i.blobid = b.blobid
 JOIN path p ON p.dev = i.dev AND p.ino = i.ino
 GROUP BY b.blobid, b.n_hardlinks;
 

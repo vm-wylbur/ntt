@@ -93,12 +93,12 @@ def process_batch(batch_data, created_dirs, dir_lock, output_blobs, dry_run, ver
         blob_ids = [b['blobid'] for b in batch]
         batch_cur.execute("""
             SELECT 
-                i.hash as hex_hash,
+                i.blobid as hex_hash,
                 p.path
             FROM path p
             JOIN inode i ON p.dev = i.dev AND p.ino = i.ino
-            WHERE i.hash = ANY(%s)
-            ORDER BY i.hash, p.path
+            WHERE i.blobid = ANY(%s)
+            ORDER BY i.blobid, p.path
         """, (blob_ids,))
         all_paths = batch_cur.fetchall()
         batch_timings['query_paths'] = time.time() - t1
@@ -358,7 +358,7 @@ def main():
                                 COALESCE(b.n_hardlinks, 0) as actual,
                                 COUNT(DISTINCT p.path) as expected
                             FROM blobs b
-                            JOIN inode i ON i.hash = b.blobid
+                            JOIN inode i ON i.blobid = b.blobid
                             JOIN path p ON p.dev = i.dev AND p.ino = i.ino
                             GROUP BY b.blobid, b.n_hardlinks
                         )
@@ -399,7 +399,7 @@ def main():
                                         COALESCE(b.n_hardlinks, 0) as actual,
                                         COUNT(DISTINCT p.path) as expected
                                     FROM blobs b
-                                    JOIN inode i ON i.hash = b.blobid
+                                    JOIN inode i ON i.blobid = b.blobid
                                     JOIN path p ON p.dev = i.dev AND p.ino = i.ino
                                     GROUP BY b.blobid, b.n_hardlinks
                                 )

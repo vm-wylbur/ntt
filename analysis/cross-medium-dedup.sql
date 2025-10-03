@@ -21,14 +21,14 @@ echo "Step 1/5: Creating blob_media_matrix..."
 psql "$DB" <<'EOSQL'
 DROP TABLE IF EXISTS blob_media_matrix;
 CREATE TABLE blob_media_matrix AS
-SELECT DISTINCT i.hash, i.medium_hash, i.size
+SELECT DISTINCT i.blobid, i.medium_hash, i.size
 FROM inode i
-JOIN blobs b ON i.hash = b.blobid
+JOIN blobs b ON i.blobid = b.blobid
 WHERE i.copied = true
   AND i.fs_type = 'f'
   AND b.n_hardlinks > 1;
 
-CREATE INDEX ON blob_media_matrix(hash);
+CREATE INDEX ON blob_media_matrix(blobid);
 CREATE INDEX ON blob_media_matrix(medium_hash);
 
 -- CRITICAL: Analyze to collect statistics
@@ -36,7 +36,7 @@ ANALYZE blob_media_matrix;
 
 -- Report
 SELECT COUNT(*) as total_rows,
-       COUNT(DISTINCT hash) as unique_hashes,
+       COUNT(DISTINCT blobid) as unique_hashes,
        COUNT(DISTINCT medium_hash) as unique_media
 FROM blob_media_matrix;
 EOSQL
@@ -80,9 +80,9 @@ for ((i=0; i<MEDIA_COUNT; i++)); do
     psql "$DB" -t -A -F',' <<EOSQL >> /tmp/sharing_matrix.csv
 SELECT '$m1', '$m2', COUNT(*), SUM(size)
 FROM (
-  SELECT hash, size FROM blob_media_matrix WHERE medium_hash = '$m1'
+  SELECT blobid, size FROM blob_media_matrix WHERE medium_hash = '$m1'
   INTERSECT
-  SELECT hash, size FROM blob_media_matrix WHERE medium_hash = '$m2'
+  SELECT blobid, size FROM blob_media_matrix WHERE medium_hash = '$m2'
 ) x;
 EOSQL
   done
@@ -95,7 +95,7 @@ echo "Step 5/6: Computing per-medium blob counts and labels..."
 psql "$DB" -t -A -F',' -q <<'EOSQL' | jq -R -s -c 'split("\n") | map(select(length > 0) | split(",")) | map({medium_hash: .[0], unique_blobs: .[1]|tonumber, label: .[2]}) | INDEX(.medium_hash)' > /tmp/jaccard.json
 SELECT
   b.medium_hash,
-  COUNT(DISTINCT b.hash) as unique_blobs,
+  COUNT(DISTINCT b.blobid) as unique_blobs,
   COALESCE(
     (SELECT substring(p.path from '^(/[^/]+/[^/]+/[^/]+)')
      FROM path p
@@ -120,7 +120,7 @@ import subprocess
 import csv
 
 # Query for data
-query = "SELECT hash, medium_hash FROM blob_media_matrix"
+query = "SELECT blobid, medium_hash FROM blob_media_matrix"
 result = subprocess.run(
     ['psql', 'postgresql://pball@192.168.86.200/copyjob', '-t', '-A', '-F,', '-q', '-c', query],
     capture_output=True, text=True

@@ -26,6 +26,7 @@ fi
 WORKERS=4
 LIMIT=""
 DRY_RUN=""
+MEDIUM_HASHES=""
 VERBOSE=false
 PIDS=()
 WORKER_IDS=()
@@ -38,16 +39,21 @@ Usage: $(basename "$0") [OPTIONS]
 Launch parallel ntt-copier workers with signal handling.
 
 Options:
-    -w, --workers K      Number of parallel workers (default: 4)
-    -l, --limit N        Process limit per worker
-    -d, --dry-run N      Dry-run mode with N items per worker
-    -v, --verbose        Show detailed output
-    -h, --help           Show this help
+    -w, --workers K         Number of parallel workers (default: 4)
+    -l, --limit N           Process limit per worker
+    -d, --dry-run N         Dry-run mode with N items per worker
+    -m, --medium-hashes H   Comma-separated medium_hashes to restrict workers to
+    -v, --verbose           Show detailed output
+    -h, --help              Show this help
 
 Examples:
-    $(basename "$0") -w 8                    # 8 workers, no limit
-    $(basename "$0") -w 4 -l 100            # 4 workers, 100 items each
-    $(basename "$0") -w 8 -d 50             # 8 workers, dry-run 50 items each
+    $(basename "$0") -w 8                              # 8 workers, no limit
+    $(basename "$0") -w 4 -l 100                       # 4 workers, 100 items each
+    $(basename "$0") -w 8 -d 50                        # 8 workers, dry-run 50 items each
+    $(basename "$0") -w 16 -m "hash1,hash2"            # 16 workers on specific media
+
+Finding media hashes:
+    ntt-list-media --path-prefix /data/staging --format comma
 
 Signal handling:
     ^C (SIGINT) cleanly terminates all workers
@@ -80,6 +86,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --dry-run=*)
             DRY_RUN="${1#*=}"
+            shift
+            ;;
+        -m|--medium-hashes)
+            MEDIUM_HASHES="$2"
+            shift 2
+            ;;
+        --medium-hashes=*)
+            MEDIUM_HASHES="${1#*=}"
             shift
             ;;
         -v|--verbose)
@@ -121,6 +135,20 @@ if [[ -n "$LIMIT" ]]; then
 elif [[ -n "$DRY_RUN" ]]; then
     WORKER_CMD="$WORKER_CMD --dry-run --limit=$DRY_RUN"
 fi
+if [[ -n "$MEDIUM_HASHES" ]]; then
+    WORKER_CMD="$WORKER_CMD --medium-hashes=$MEDIUM_HASHES"
+
+    # Ensure specified media have health='ok' so workers can find work
+    IFS=',' read -ra HASH_ARRAY <<< "$MEDIUM_HASHES"
+    for hash in "${HASH_ARRAY[@]}"; do
+        # Run as original user to access their environment and psql credentials
+        if [[ -n "${SUDO_USER:-}" ]]; then
+            sudo -u "$SUDO_USER" psql "${NTT_DB_URL:-postgresql:///copyjob}" -c "UPDATE medium SET health = 'ok' WHERE medium_hash = '$hash';" >/dev/null 2>&1 || true
+        else
+            psql "${NTT_DB_URL:-postgresql:///copyjob}" -c "UPDATE medium SET health = 'ok' WHERE medium_hash = '$hash';" >/dev/null 2>&1 || true
+        fi
+    done
+fi
 
 # Signal handler for clean shutdown
 cleanup() {
@@ -159,7 +187,7 @@ cleanup() {
     exit 0
 }
 
-# Set up signal trap
+# Set up signal trap (only on interrupt/terminate, not normal exit)
 trap cleanup SIGINT SIGTERM
 
 # Launch workers
@@ -168,6 +196,9 @@ if [[ -n "$LIMIT" ]]; then
     echo "[$(date '+%H:%M:%S')] Limit: $LIMIT items per worker"
 elif [[ -n "$DRY_RUN" ]]; then
     echo "[$(date '+%H:%M:%S')] Dry-run: $DRY_RUN items per worker"
+fi
+if [[ -n "$MEDIUM_HASHES" ]]; then
+    echo "[$(date '+%H:%M:%S')] Restricted to media: $MEDIUM_HASHES"
 fi
 
 for ((i=1; i<=WORKERS; i++)); do

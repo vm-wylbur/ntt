@@ -292,7 +292,7 @@ class BlobVerifier:
                 cur.execute("""
                     SELECT b.blobid 
                     FROM blobs b
-                    JOIN inode i ON i.hash = b.blobid
+                    JOIN inode i ON i.blobid = b.blobid
                     WHERE i.processed_at IS NOT NULL
                     GROUP BY b.blobid
                     ORDER BY MAX(i.processed_at) DESC
@@ -319,7 +319,7 @@ class BlobVerifier:
                 SELECT DISTINCT p.path
                 FROM path p
                 JOIN inode i ON i.dev = p.dev AND i.ino = p.ino
-                WHERE i.hash = %s
+                WHERE i.blobid = %s
                 ORDER BY p.path
             """, (blobid,))
             
@@ -350,12 +350,12 @@ class BlobVerifier:
         with conn.cursor() as cur:
             # Single query to get all paths for all blobs - NO filtering in SQL
             cur.execute("""
-                SELECT i.hash, p.path
+                SELECT i.blobid, p.path
                 FROM inode i
                 JOIN path p ON i.dev = p.dev AND i.ino = p.ino
-                WHERE i.hash = ANY(%s)
-                  AND i.hash IS NOT NULL
-                ORDER BY i.hash, p.path
+                WHERE i.blobid = ANY(%s)
+                  AND i.blobid IS NOT NULL
+                ORDER BY i.blobid, p.path
             """, (blobids,))
             
             # Group paths by blobid and filter in Python
@@ -370,7 +370,7 @@ class BlobVerifier:
                     if any(re.search(pattern, path) for pattern in self.ignore_patterns):
                         continue  # Skip ignored paths
                 
-                result[row['hash']].add(path)
+                result[row['blobid']].add(path)
             
             # Convert sets to lists
             return {blobid: list(paths) for blobid, paths in result.items()}

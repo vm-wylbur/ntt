@@ -39,7 +39,7 @@ WITH blob_status AS (
         COALESCE(b.n_hardlinks, 0) as actual,
         COUNT(DISTINCT p.path) as expected
     FROM blobs b
-    JOIN inode i ON i.hash = b.blobid::bytea
+    JOIN inode i ON i.blobid = b.blobid
     JOIN path p ON p.dev = i.dev AND p.ino = i.ino
     GROUP BY b.blobid, b.n_hardlinks
 )
@@ -62,12 +62,12 @@ LIMIT 100;
 EXPLAIN (ANALYZE, BUFFERS)
 CREATE TEMP TABLE blob_expected AS
 SELECT
-    i.hash as blobid,
+    i.blobid as blobid,
     COUNT(DISTINCT p.path) as expected_paths
 FROM inode i
 JOIN path p ON p.dev = i.dev AND p.ino = i.ino
-WHERE i.hash IS NOT NULL
-GROUP BY i.hash;
+WHERE i.blobid IS NOT NULL
+GROUP BY i.blobid;
 
 -- Then the query becomes simpler
 \echo '=== EXPLAIN: Query with Pre-calculated Expected ==='
@@ -78,7 +78,7 @@ SELECT
     COALESCE(b.n_hardlinks, 0) as actual,
     e.expected_paths as expected
 FROM blobs b
-JOIN blob_expected e ON e.blobid = b.blobid::bytea
+JOIN blob_expected e ON e.blobid = b.blobid
 WHERE COALESCE(b.n_hardlinks, 0) < e.expected_paths
 LIMIT 100;
 

@@ -92,6 +92,30 @@ identify_path() {
   echo "$medium_hash:$medium_human"
 }
 
+identify_image() {
+  local image_path="$1"
+
+  if [[ ! -f "$image_path" ]]; then
+    fail "Image file not found: $image_path"
+  fi
+
+  # Extract human-readable name from filename (without extension)
+  local filename=$(basename "$image_path")
+  local medium_human="${filename%.*}"
+
+  # Generate hash from image content (head + tail, like identify_device)
+  SIG_FILE="/tmp/ntt-sig-$$"
+  head -c 1M "$image_path" > "$SIG_FILE"
+  tail -c 1M "$image_path" >> "$SIG_FILE"
+  local medium_hash=$(b3sum < "$SIG_FILE" | cut -d' ' -f1 | cut -c1-32)
+  rm -f "$SIG_FILE"
+
+  log identify "{\"medium_human\": \"$medium_human\", \"medium_hash\": \"$medium_hash\", \"image\": \"$image_path\"}"
+
+  # Return values via echo
+  echo "$medium_hash:$medium_human"
+}
+
 # ---------- health check functions ----------
 check_device_health() {
   local dev="$1"
@@ -172,6 +196,53 @@ unmount_device() {
   else
     umount "$mnt" 2>/dev/null || true
   fi
+}
+
+mount_image() {
+  local image_path="$1"
+  local medium_hash="$2"
+
+  # Create loop device
+  local loop_device=$(losetup -f --show -r "$image_path")
+  if [[ -z "$loop_device" ]]; then
+    fail "Failed to create loop device for $image_path"
+  fi
+
+  log mount_image "{\"image\": \"$image_path\", \"loop\": \"$loop_device\", \"medium_hash\": \"$medium_hash\"}"
+
+  # Create mount point
+  local mnt="/mnt/ntt/${medium_hash}"
+  mkdir -p "$mnt"
+
+  # Mount read-only
+  if ! mount -o ro "$loop_device" "$mnt"; then
+    losetup -d "$loop_device"
+    rmdir "$mnt" 2>/dev/null || true
+    fail "Failed to mount $loop_device at $mnt"
+  fi
+
+  log mount_success "{\"mnt\": \"$mnt\", \"loop\": \"$loop_device\"}"
+
+  # Return mount path and loop device (separated by :)
+  echo "$mnt:$loop_device"
+}
+
+unmount_image() {
+  local mnt="$1"
+  local loop_device="$2"
+
+  log unmount_image "{\"mnt\": \"$mnt\", \"loop\": \"$loop_device\"}"
+
+  # Unmount
+  umount "$mnt" 2>/dev/null || true
+
+  # Detach loop device
+  [[ -n "$loop_device" ]] && losetup -d "$loop_device" 2>/dev/null || true
+
+  # Remove mount point
+  rmdir "$mnt" 2>/dev/null || true
+
+  log unmount_success "{}"
 }
 
 # ---------- processing functions ----------
@@ -283,6 +354,58 @@ handle_directory_mode() {
   fi
 }
 
+handle_image_mode() {
+  local image_path="$1"
+  local force="$2"
+  local enum_only="$3"
+
+  # Setup cleanup trap for errors
+  local loop_device=""
+  local mnt=""
+  cleanup_on_error() {
+    if [[ -n "$mnt" && -n "$loop_device" ]]; then
+      unmount_image "$mnt" "$loop_device"
+    fi
+  }
+  trap cleanup_on_error EXIT SIGINT SIGTERM
+
+  # Identify image (content-based hash)
+  local identify_result=$(identify_image "$image_path")
+  local medium_hash="${identify_result%%:*}"
+  local medium_human="${identify_result#*:}"
+
+  # Check if raw file already exists
+  RAW="$RAW_ROOT/${medium_hash}.raw"
+  if [[ -f "$RAW" ]] && ! "$force"; then
+    fail "Raw file already exists: $RAW (use --force to overwrite)"
+  fi
+
+  check_duplicate "$medium_hash" "$force"
+
+  # Insert into database with image_path
+  psql "$DB_URL" -c "INSERT INTO medium (medium_hash, medium_human, health, image_path)
+                     VALUES ('$medium_hash', '$medium_human', 'ok', '$image_path')
+                     ON CONFLICT DO NOTHING;" 2>/dev/null || true
+
+  # Mount image
+  local mount_result=$(mount_image "$image_path" "$medium_hash")
+  mnt="${mount_result%%:*}"
+  loop_device="${mount_result#*:}"
+
+  # Run enum on mounted image
+  RAW=$(run_enum "$mnt" "$medium_hash")
+
+  # Run full pipeline unless --enum-only
+  if ! "$enum_only"; then
+    run_loader "$medium_hash" "$RAW"
+    run_copy_workers "$medium_hash"
+  fi
+
+  # Cleanup (unmount and detach loop)
+  unmount_image "$mnt" "$loop_device"
+  trap - EXIT SIGINT SIGTERM  # Clear trap after successful cleanup
+}
+
 # ---------- load-only mode handler ----------
 handle_load_only_mode() {
   local raw_file="$1"
@@ -314,25 +437,34 @@ handle_load_only_mode() {
 usage() {
   cat <<EOF
 Usage:
-  sudo $0 [--enum-only] [--force] /dev/sdX           # Device enumeration (PARTIAL)
-  sudo $0 [--enum-only] [--force] /path/to/directory # Directory enumeration
-  sudo $0 --load-only /path/to/file.raw              # Load .raw into database
+  sudo $0 [--enum-only] [--force] /dev/sdX                # Device enumeration (PARTIAL)
+  sudo $0 [--enum-only] [--force] /path/to/directory      # Directory enumeration
+  sudo $0 [--enum-only] [--force] --image /path/to/image  # Disk image enumeration
+  sudo $0 --load-only /path/to/file.raw                   # Load .raw into database
 
 Current implementation status:
   ❌ TODO: Device imaging, mounting, health checks
   ✅ WORKING: Directory enumeration → .raw files → PostgreSQL loading
+  ✅ WORKING: Disk image processing (content-based hash, auto mount/unmount)
   ✅ WORKING: .raw file loading into database
   ❌ TODO: Copy workers (file copying/deduplication)
 
 Modes:
-  /path/to/dir   Enumerate directory, optionally load to database
-  /dev/sdX       Enumerate device (basic - no imaging/mounting yet)
-  --load-only    Load existing .raw file into PostgreSQL
+  /path/to/dir    Enumerate directory, optionally load to database
+  /dev/sdX        Enumerate device (basic - no imaging/mounting yet)
+  --image FILE    Process disk image (auto mount/unmount, content-based hash)
+  --load-only     Load existing .raw file into PostgreSQL
 
 Options:
-  --enum-only    Stop after enumeration (.raw file creation)
-  --force        Bypass duplicate checking
-  --load-only    Load mode: process existing .raw file
+  --enum-only     Stop after enumeration (.raw file creation)
+  --force         Bypass duplicate checking
+  --load-only     Load mode: process existing .raw file
+  --image FILE    Image mode: process disk image file
+
+Examples:
+  sudo $0 --image /data/fast/img/tm-20140409-partition3.img
+  sudo $0 --image /data/fast/img/partition3.img --enum-only
+  sudo $0 --force --image /path/to/image.img
 EOF
   exit 1
 }
@@ -342,11 +474,13 @@ EOF
 
 # Initialize flags
 LOAD_ONLY_MODE=false
+IMAGE_MODE=false
 IMAGE_FIRST=false
 FORCE=false
 ENUM_ONLY=false
 TARGET=""
 LOAD_ONLY_FILE=""
+IMAGE_FILE=""
 
 # Parse options first
 while [[ $# -gt 0 ]]; do
@@ -359,6 +493,18 @@ while [[ $# -gt 0 ]]; do
         LOAD_ONLY_FILE="$1"
         shift
       else
+        usage
+      fi
+      ;;
+    --image)
+      IMAGE_MODE=true
+      shift
+      # Next argument should be the image file
+      if [[ $# -ge 1 && "$1" != -* ]]; then
+        IMAGE_FILE="$1"
+        shift
+      else
+        echo "Error: --image requires an image file path" >&2
         usage
       fi
       ;;
@@ -380,7 +526,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     *)
       # First non-option argument is the target
-      if [[ -z "$TARGET" && "$LOAD_ONLY_MODE" == false ]]; then
+      if [[ -z "$TARGET" && "$LOAD_ONLY_MODE" == false && "$IMAGE_MODE" == false ]]; then
         TARGET="$1"
         shift
         break  # Stop parsing after target is set
@@ -401,6 +547,8 @@ fi
 # Validate arguments
 if [[ "$LOAD_ONLY_MODE" == true ]]; then
   [[ -n "$LOAD_ONLY_FILE" ]] || usage
+elif [[ "$IMAGE_MODE" == true ]]; then
+  [[ -n "$IMAGE_FILE" ]] || usage
 else
   [[ -n "$TARGET" ]] || usage
 fi
@@ -408,6 +556,8 @@ fi
 # ---------- main ----------
 if [[ "$LOAD_ONLY_MODE" == "true" ]]; then
   handle_load_only_mode "$LOAD_ONLY_FILE"
+elif [[ "$IMAGE_MODE" == "true" ]]; then
+  handle_image_mode "$IMAGE_FILE" "$FORCE" "$ENUM_ONLY"
 elif [[ "$TARGET" == /dev/* ]]; then
   handle_device_mode "$TARGET" "$IMAGE_FIRST" "$FORCE" "$ENUM_ONLY"
 else
