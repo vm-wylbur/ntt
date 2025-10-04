@@ -93,7 +93,12 @@ class CopyWorker:
         
         # Database connection
         self.conn = psycopg.connect(self.db_url, row_factory=dict_row, autocommit=False)
-        
+
+        # Force index usage for all queries - PostgreSQL planner chooses seqscan incorrectly
+        with self.conn.cursor() as cur:
+            cur.execute("SET enable_seqscan = off;")
+        self.conn.commit()
+
         # Set search_path if NTT_SEARCH_PATH is provided, adding 'public' for extensions
         if 'NTT_SEARCH_PATH' in os.environ:
             search_path = os.environ['NTT_SEARCH_PATH']
@@ -220,7 +225,7 @@ class CopyWorker:
             self._queue_depth_check_counter = 0
 
         self._queue_depth_check_counter += 1
-        if self._queue_depth_check_counter >= 100 or self._queue_depth_cache is None:
+        if self._queue_depth_check_counter >= 1000 or self._queue_depth_cache is None:
             self._queue_depth_cache = self.get_queue_depth()
             self._queue_depth_check_counter = 0
             logger.debug(f"Queue depth: {self._queue_depth_cache}")
@@ -285,11 +290,21 @@ class CopyWorker:
         if self.medium_hashes:
             params['medium_hashes'] = self.medium_hashes
 
+        import time
+        t0 = time.time()
+
         with self.conn.cursor() as cur:
+            t1 = time.time()
             cur.execute(claim_query, params)
+            t2 = time.time()
             row = cur.fetchone()
+            t3 = time.time()
 
         self.conn.commit()  # Auto-commit the claim
+        t4 = time.time()
+
+        if (t4 - t0) > 0.05:  # Log if > 50ms
+            logger.warning(f"Slow claim: total={((t4-t0)*1000):.1f}ms execute={((t2-t1)*1000):.1f}ms fetch={((t3-t2)*1000):.1f}ms commit={((t4-t3)*1000):.1f}ms")
 
         if not row:
             logger.debug("No work claimed (either no candidates or claim race lost)")

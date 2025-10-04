@@ -187,8 +187,8 @@ cleanup() {
     exit 0
 }
 
-# Set up signal trap (only on interrupt/terminate, not normal exit)
-trap cleanup SIGINT SIGTERM
+# Set up signal trap for interrupt/terminate AND normal exit
+trap cleanup SIGINT SIGTERM EXIT
 
 # Launch workers
 echo "[$(date '+%H:%M:%S')] Starting $WORKERS workers..."
@@ -247,3 +247,6 @@ echo "Note: Workers are running in background. Tmpfs cleanup happens via:"
 echo "  - Signal handler on ^C or kill"
 echo "  - Auto-cleanup on tmpfs unmount (files deleted automatically)"
 echo "  - Manual cleanup: ntt-stop-workers"
+
+# Remove EXIT trap now that workers are launched - cleanup is manual or via signals
+trap - EXIT
