@@ -216,10 +216,17 @@ for ((i=1; i<=WORKERS; i++)); do
     # Create and mount per-worker tmpfs BEFORE launching (128MB for files <100MB)
     WORKER_TMPFS="/tmp/ram/${WORKER_ID}"
     sudo mkdir -p "$WORKER_TMPFS"
-    sudo mount -t tmpfs -o size=128M,mode=1777 tmpfs "$WORKER_TMPFS"
 
-    if $VERBOSE; then
-        echo "[$(date '+%H:%M:%S')] Mounted 128MB tmpfs at $WORKER_TMPFS"
+    # Only mount if not already mounted (prevents stacking)
+    if ! mountpoint -q "$WORKER_TMPFS" 2>/dev/null; then
+        sudo mount -t tmpfs -o size=128M,mode=1777 tmpfs "$WORKER_TMPFS"
+        if $VERBOSE; then
+            echo "[$(date '+%H:%M:%S')] Mounted 128MB tmpfs at $WORKER_TMPFS"
+        fi
+    else
+        if $VERBOSE; then
+            echo "[$(date '+%H:%M:%S')] Tmpfs already mounted at $WORKER_TMPFS, reusing"
+        fi
     fi
 
     # Launch worker in background with worker_id, redirect output to logs

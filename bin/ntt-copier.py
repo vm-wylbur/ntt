@@ -236,66 +236,43 @@ class CopyWorker:
             self._queue_depth_check_counter = 0
             logger.debug(f"Queue depth: {self._queue_depth_cache}")
 
-        # Adaptive sampling: use TABLESAMPLE for large queues, direct query for long-tail
-        LONG_TAIL_THRESHOLD = 50000
-
-        if self._queue_depth_cache > LONG_TAIL_THRESHOLD:
-            # Large queue: TABLESAMPLE hybrid for true random selection (prevents sequential depletion)
-            claim_query = f"""
-                WITH sampled AS (
-                    SELECT medium_hash, ino
-                    FROM inode
-                    TABLESAMPLE SYSTEM_ROWS(%(sample_size)s)
-                    WHERE copied = false
-                      AND claimed_by IS NULL
-                      {medium_filter}
-                    ORDER BY RANDOM()
-                    LIMIT 1
-                ),
-                locked_row AS (
-                    SELECT s.medium_hash, s.ino
-                    FROM sampled s
-                    JOIN inode i ON (i.medium_hash, i.ino) = (s.medium_hash, s.ino)
-                    FOR UPDATE OF i SKIP LOCKED
-                ),
-                claimed AS (
-                    UPDATE inode i
-                    SET claimed_by = %(worker_id)s, claimed_at = NOW()
-                    FROM locked_row lr
-                    WHERE (i.medium_hash, i.ino) = (lr.medium_hash, lr.ino)
-                    RETURNING i.*
-                )
-                SELECT c.*,
-                       (SELECT array_agg(p.path)
-                        FROM path p
-                        WHERE (p.medium_hash, p.ino) = (c.medium_hash, c.ino)) as paths
-                FROM claimed c;
-            """
-        else:
-            # Long-tail: SELECT with SKIP LOCKED (same as large queue for consistency)
-            claim_query = f"""
-                WITH locked_row AS (
-                    SELECT medium_hash, ino
-                    FROM inode
-                    WHERE copied = false
-                      AND claimed_by IS NULL
-                      {medium_filter}
-                    LIMIT 1
-                    FOR UPDATE SKIP LOCKED
-                ),
-                claimed AS (
-                    UPDATE inode i
-                    SET claimed_by = %(worker_id)s, claimed_at = NOW()
-                    FROM locked_row lr
-                    WHERE (i.medium_hash, i.ino) = (lr.medium_hash, lr.ino)
-                    RETURNING i.*
-                )
-                SELECT c.*,
-                       (SELECT array_agg(p.path)
-                        FROM path p
-                        WHERE (p.medium_hash, p.ino) = (c.medium_hash, c.ino)) as paths
-                FROM claimed c;
-            """
+        # TABLESAMPLE hybrid: sample from entire table FIRST, then filter
+        # This is fast because TABLESAMPLE operates at block level before any filtering
+        claim_query = f"""
+            WITH sampled AS (
+                SELECT medium_hash, ino
+                FROM inode
+                TABLESAMPLE SYSTEM_ROWS(%(sample_size)s)
+                WHERE copied = false
+                  AND claimed_by IS NULL
+                ORDER BY RANDOM()
+                LIMIT 100
+            ),
+            filtered AS (
+                SELECT medium_hash, ino
+                FROM sampled
+                {medium_filter.replace('AND', 'WHERE') if medium_filter else ''}
+                LIMIT 1
+            ),
+            locked_row AS (
+                SELECT f.medium_hash, f.ino
+                FROM filtered f
+                JOIN inode i ON (i.medium_hash, i.ino) = (f.medium_hash, f.ino)
+                FOR UPDATE OF i SKIP LOCKED
+            ),
+            claimed AS (
+                UPDATE inode i
+                SET claimed_by = %(worker_id)s, claimed_at = NOW()
+                FROM locked_row lr
+                WHERE (i.medium_hash, i.ino) = (lr.medium_hash, lr.ino)
+                RETURNING i.*
+            )
+            SELECT c.*,
+                   (SELECT array_agg(p.path)
+                    FROM path p
+                    WHERE (p.medium_hash, p.ino) = (c.medium_hash, c.ino)) as paths
+            FROM claimed c;
+        """
 
         params = {
             'worker_id': self.worker_id,
@@ -319,37 +296,6 @@ class CopyWorker:
 
         if (t4 - t0) > 0.05:  # Log if > 50ms
             logger.warning(f"Slow claim: total={((t4-t0)*1000):.1f}ms execute={((t2-t1)*1000):.1f}ms fetch={((t3-t2)*1000):.1f}ms commit={((t4-t3)*1000):.1f}ms")
-
-        # Fallback: if TABLESAMPLE returned empty, try direct query (edge case for sparse data)
-        if not row and self._queue_depth_cache > LONG_TAIL_THRESHOLD:
-            logger.debug("TABLESAMPLE returned empty, trying fallback query")
-            fallback_query = f"""
-                WITH locked_row AS (
-                    SELECT medium_hash, ino
-                    FROM inode
-                    WHERE copied = false
-                      AND claimed_by IS NULL
-                      {medium_filter}
-                    LIMIT 1
-                    FOR UPDATE SKIP LOCKED
-                ),
-                claimed AS (
-                    UPDATE inode i
-                    SET claimed_by = %(worker_id)s, claimed_at = NOW()
-                    FROM locked_row lr
-                    WHERE (i.medium_hash, i.ino) = (lr.medium_hash, lr.ino)
-                    RETURNING i.*
-                )
-                SELECT c.*,
-                       (SELECT array_agg(p.path)
-                        FROM path p
-                        WHERE (p.medium_hash, p.ino) = (c.medium_hash, c.ino)) as paths
-                FROM claimed c;
-            """
-            with self.conn.cursor() as cur:
-                cur.execute(fallback_query, params)
-                row = cur.fetchone()
-            self.conn.commit()
 
         if not row:
             logger.debug("No work claimed (either no candidates or claim race lost)")
