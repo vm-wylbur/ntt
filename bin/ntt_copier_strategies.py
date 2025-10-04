@@ -17,6 +17,25 @@ import magic
 EMPTY_FILE_HASH = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 
+def sanitize_path(path_str: str) -> Path:
+    """
+    Convert database path string to filesystem path.
+
+    Handles escape sequences like \\r (stored as literal text) by converting
+    them to actual control characters for HFS+ metadata directories.
+
+    Args:
+        path_str: Path string from database (may contain literal \\r, \\n, etc.)
+
+    Returns:
+        Path object with escape sequences converted to actual characters
+    """
+    # Replace literal escape sequences with actual control characters
+    # This handles HFS+ Private Directory Data\r paths
+    sanitized = path_str.replace('\\r', '\r').replace('\\n', '\n')
+    return Path(sanitized)
+
+
 def detect_fs_type(source_path: Path) -> Optional[str]:
     """
     Detect filesystem type for a path.
@@ -160,7 +179,9 @@ def create_hardlinks_idempotent(hash_path: Path, paths_to_link: list[str],
     hash_path_stat = hash_path.stat()
     
     for path_str in paths_to_link:
-        archive_path = archive_root / path_str.lstrip('/')
+        # Sanitize path to handle HFS+ escape sequences
+        sanitized_path = path_str.replace('\\r', '\r').replace('\\n', '\n')
+        archive_path = archive_root / sanitized_path.lstrip('/')
         
         # Check if archive path exists
         if archive_path.exists():

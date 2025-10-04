@@ -177,10 +177,15 @@ class CopyWorker:
         with self.conn.cursor() as cur:
             cur.execute("""
                 SELECT EXISTS(
-                    SELECT 1 FROM inode
-                    WHERE copied = false
-                      AND claimed_by IS NULL
-                      AND medium_hash = ANY(%s)
+                    SELECT 1 FROM inode i
+                    WHERE i.copied = false
+                      AND i.claimed_by IS NULL
+                      AND i.medium_hash = ANY(%s)
+                      AND EXISTS (
+                        SELECT 1 FROM path p
+                        WHERE (p.medium_hash, p.ino) = (i.medium_hash, i.ino)
+                          AND p.exclude_reason IS NULL
+                      )
                     LIMIT 1
                 )
             """, (self.medium_hashes,))
@@ -195,17 +200,27 @@ class CopyWorker:
             if self.medium_hashes:
                 cur.execute("""
                     SELECT COUNT(*) as count
-                    FROM inode
-                    WHERE copied = false
-                      AND claimed_by IS NULL
-                      AND medium_hash = ANY(%s)
+                    FROM inode i
+                    WHERE i.copied = false
+                      AND i.claimed_by IS NULL
+                      AND i.medium_hash = ANY(%s)
+                      AND EXISTS (
+                        SELECT 1 FROM path p
+                        WHERE (p.medium_hash, p.ino) = (i.medium_hash, i.ino)
+                          AND p.exclude_reason IS NULL
+                      )
                 """, (self.medium_hashes,))
             else:
                 cur.execute("""
                     SELECT COUNT(*) as count
-                    FROM inode
-                    WHERE copied = false
-                      AND claimed_by IS NULL
+                    FROM inode i
+                    WHERE i.copied = false
+                      AND i.claimed_by IS NULL
+                      AND EXISTS (
+                        SELECT 1 FROM path p
+                        WHERE (p.medium_hash, p.ino) = (i.medium_hash, i.ino)
+                          AND p.exclude_reason IS NULL
+                      )
                 """)
             return cur.fetchone()['count']
 
@@ -240,11 +255,16 @@ class CopyWorker:
         # This is fast because TABLESAMPLE operates at block level before any filtering
         claim_query = f"""
             WITH sampled AS (
-                SELECT medium_hash, ino
-                FROM inode
+                SELECT i.medium_hash, i.ino
+                FROM inode i
                 TABLESAMPLE SYSTEM_ROWS(%(sample_size)s)
-                WHERE copied = false
-                  AND claimed_by IS NULL
+                WHERE i.copied = false
+                  AND i.claimed_by IS NULL
+                  AND EXISTS (
+                    SELECT 1 FROM path p
+                    WHERE (p.medium_hash, p.ino) = (i.medium_hash, i.ino)
+                      AND p.exclude_reason IS NULL
+                  )
                 ORDER BY RANDOM()
                 LIMIT 100
             ),
@@ -270,7 +290,8 @@ class CopyWorker:
             SELECT c.*,
                    (SELECT array_agg(p.path)
                     FROM path p
-                    WHERE (p.medium_hash, p.ino) = (c.medium_hash, c.ino)) as paths
+                    WHERE (p.medium_hash, p.ino) = (c.medium_hash, c.ino)
+                      AND p.exclude_reason IS NULL) as paths
             FROM claimed c;
         """
 
@@ -312,13 +333,47 @@ class CopyWorker:
         """Release claim on an inode after error."""
         with self.conn.cursor() as cur:
             cur.execute("""
-                UPDATE inode 
+                UPDATE inode
                 SET claimed_by = NULL, claimed_at = NULL
                 WHERE medium_hash = %s AND ino = %s
                   AND claimed_by = %s
             """, (inode_row['medium_hash'], inode_row['ino'],
                   self.worker_id))
         self.conn.commit()
+
+    def mark_path_excluded(self, path: str, medium_hash: str, ino: int, reason: str):
+        """Mark a specific path as excluded."""
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                UPDATE path
+                SET exclude_reason = %s
+                WHERE medium_hash = %s AND ino = %s AND path = %s
+            """, (reason, medium_hash, ino, path))
+        self.conn.commit()
+        logger.debug(f"Marked path as excluded: {path}, reason={reason}")
+
+    def check_all_paths_excluded(self, medium_hash: str, ino: int) -> bool:
+        """Check if all paths for an inode are excluded."""
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                SELECT NOT EXISTS (
+                    SELECT 1 FROM path
+                    WHERE medium_hash = %s AND ino = %s
+                      AND exclude_reason IS NULL
+                ) as all_excluded
+            """, (medium_hash, ino))
+            return cur.fetchone()['all_excluded']
+
+    def mark_inode_excluded(self, inode_row: dict):
+        """Mark inode as copied with EXCLUDED flag when all paths are excluded."""
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                UPDATE inode
+                SET copied = true, claimed_by = 'EXCLUDED', claimed_at = NOW()
+                WHERE medium_hash = %s AND ino = %s
+            """, (inode_row['medium_hash'], inode_row['ino']))
+        self.conn.commit()
+        logger.info(f"Marked inode as EXCLUDED: ino={inode_row['ino']}")
     
     def process_work_unit(self, work_unit: dict):
         """Process one work unit through Claim-Analyze-Execute."""
@@ -357,11 +412,35 @@ class CopyWorker:
         
         except AnalysisError as e:
             logger.error(f"Analysis failed ino={inode_row['ino']}, error={e}", exc_info=True)
+
+            # Check if it's a file-not-found error
+            error_str = str(e)
+            if 'No such file or directory' in error_str or '[Errno 2]' in error_str:
+                # Extract the path from the first available path
+                if work_unit['paths']:
+                    failed_path = work_unit['paths'][0]
+                    self.mark_path_excluded(failed_path, inode_row['medium_hash'],
+                                          inode_row['ino'], 'file_not_found')
+
+                    # Check if all paths are now excluded
+                    if self.check_all_paths_excluded(inode_row['medium_hash'], inode_row['ino']):
+                        self.mark_inode_excluded(inode_row)
+                        logger.info(f"All paths excluded for ino={inode_row['ino']}, marked as EXCLUDED")
+                        return
+
             self.release_claim(inode_row)
             self.stats['errors'] += 1
-        
+
         except ExecutionError as e:
             logger.error(f"Execution failed ino={inode_row['ino']}, error={e}", exc_info=True)
+
+            # Check if it's a file-not-found error (e.g., missing by-hash file)
+            error_str = str(e)
+            if 'No such file or directory' in error_str or '[Errno 2]' in error_str:
+                # This is likely a missing by-hash file, which means data integrity issue
+                # Don't mark as excluded, but log it specially
+                logger.warning(f"Missing by-hash file for ino={inode_row['ino']}, will retry on timeout")
+
             # Don't release claim - timeout will trigger retry
             self.stats['errors'] += 1
         
@@ -383,7 +462,7 @@ class CopyWorker:
         """Analyze an inode and create execution plan."""
         inode_row = work_unit['inode_row']
         paths = work_unit['paths']
-        source_path = Path(paths[0])  # Use first path for analysis
+        source_path = strategies.sanitize_path(paths[0])  # Use first path for analysis
         
         fs_type = inode_row.get('fs_type')
         if not fs_type:

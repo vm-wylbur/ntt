@@ -1008,7 +1008,14 @@ class NTTDashboard(App):
                         SELECT COUNT(*) as count
                         FROM inode i
                         JOIN medium m ON i.medium_hash = m.medium_hash
-                        WHERE i.copied = false AND m.health = 'ok'
+                        WHERE i.copied = false
+                          AND i.claimed_by IS NULL
+                          AND m.health = 'ok'
+                          AND EXISTS (
+                            SELECT 1 FROM path p
+                            WHERE (p.medium_hash, p.ino) = (i.medium_hash, i.ino)
+                              AND p.exclude_reason IS NULL
+                          )
                     """)
                     return cur.fetchone()['count']
 
