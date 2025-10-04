@@ -99,6 +99,12 @@ class CopyWorker:
             cur.execute("SET enable_seqscan = off;")
         self.conn.commit()
 
+        # Verify setting applied
+        with self.conn.cursor() as cur:
+            cur.execute("SHOW enable_seqscan;")
+            result = cur.fetchone()
+            logger.info(f"Worker {self.worker_id} enable_seqscan setting: {result}")
+
         # Set search_path if NTT_SEARCH_PATH is provided, adding 'public' for extensions
         if 'NTT_SEARCH_PATH' in os.environ:
             search_path = os.environ['NTT_SEARCH_PATH']
@@ -234,16 +240,23 @@ class CopyWorker:
         LONG_TAIL_THRESHOLD = 50000
 
         if self._queue_depth_cache > LONG_TAIL_THRESHOLD:
-            # Large queue: SELECT with SKIP LOCKED to avoid worker contention
+            # Large queue: TABLESAMPLE hybrid for true random selection (prevents sequential depletion)
             claim_query = f"""
-                WITH locked_row AS (
+                WITH sampled AS (
                     SELECT medium_hash, ino
                     FROM inode
+                    TABLESAMPLE SYSTEM_ROWS(%(sample_size)s)
                     WHERE copied = false
                       AND claimed_by IS NULL
                       {medium_filter}
+                    ORDER BY RANDOM()
                     LIMIT 1
-                    FOR UPDATE SKIP LOCKED
+                ),
+                locked_row AS (
+                    SELECT s.medium_hash, s.ino
+                    FROM sampled s
+                    JOIN inode i ON (i.medium_hash, i.ino) = (s.medium_hash, s.ino)
+                    FOR UPDATE OF i SKIP LOCKED
                 ),
                 claimed AS (
                     UPDATE inode i
@@ -285,7 +298,8 @@ class CopyWorker:
             """
 
         params = {
-            'worker_id': self.worker_id
+            'worker_id': self.worker_id,
+            'sample_size': self.sample_size
         }
         if self.medium_hashes:
             params['medium_hashes'] = self.medium_hashes
@@ -305,6 +319,37 @@ class CopyWorker:
 
         if (t4 - t0) > 0.05:  # Log if > 50ms
             logger.warning(f"Slow claim: total={((t4-t0)*1000):.1f}ms execute={((t2-t1)*1000):.1f}ms fetch={((t3-t2)*1000):.1f}ms commit={((t4-t3)*1000):.1f}ms")
+
+        # Fallback: if TABLESAMPLE returned empty, try direct query (edge case for sparse data)
+        if not row and self._queue_depth_cache > LONG_TAIL_THRESHOLD:
+            logger.debug("TABLESAMPLE returned empty, trying fallback query")
+            fallback_query = f"""
+                WITH locked_row AS (
+                    SELECT medium_hash, ino
+                    FROM inode
+                    WHERE copied = false
+                      AND claimed_by IS NULL
+                      {medium_filter}
+                    LIMIT 1
+                    FOR UPDATE SKIP LOCKED
+                ),
+                claimed AS (
+                    UPDATE inode i
+                    SET claimed_by = %(worker_id)s, claimed_at = NOW()
+                    FROM locked_row lr
+                    WHERE (i.medium_hash, i.ino) = (lr.medium_hash, lr.ino)
+                    RETURNING i.*
+                )
+                SELECT c.*,
+                       (SELECT array_agg(p.path)
+                        FROM path p
+                        WHERE (p.medium_hash, p.ino) = (c.medium_hash, c.ino)) as paths
+                FROM claimed c;
+            """
+            with self.conn.cursor() as cur:
+                cur.execute(fallback_query, params)
+                row = cur.fetchone()
+            self.conn.commit()
 
         if not row:
             logger.debug("No work claimed (either no candidates or claim race lost)")
