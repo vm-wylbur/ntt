@@ -8,6 +8,7 @@
 #     "blake3",
 #     "python-magic",
 #     "typer",
+#     "bitmath",
 # ]
 # ///
 #
@@ -31,8 +32,10 @@
 #   - Run with: sudo -E ntt-copier.py [options]
 
 import os
+import bitmath
 import shutil
 import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -60,10 +63,87 @@ class ExecutionError(Exception):
     pass
 
 
+def validate_destination_filesystem():
+    """
+    Validate /data/cold filesystem before starting worker.
+
+    Requirements:
+    1. Filesystem must be 'coldpool'
+    2. Available space must be > 5TB
+    3. Mount point must be /data/cold
+
+    Raises typer.Exit(1) if validation fails.
+    """
+    try:
+        # Run df -h and parse output
+        result = subprocess.run(
+            ['df', '-h', '/data/cold'],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+
+        # Parse df output (skip header line)
+        lines = result.stdout.strip().split('\n')
+        if len(lines) < 2:
+            logger.error("df command returned unexpected output")
+            raise typer.Exit(code=1)
+
+        # Parse the data line
+        # Format: Filesystem Size Used Avail Use% Mounted on
+        parts = lines[1].split()
+        if len(parts) < 6:
+            logger.error(f"df output malformed: {lines[1]}")
+            raise typer.Exit(code=1)
+
+        filesystem = parts[0]
+        avail_str = parts[3]
+        mounted_on = parts[5]
+
+        # Validation 1: Filesystem must be 'coldpool'
+        if filesystem != 'coldpool':
+            logger.error(f"Wrong filesystem: expected 'coldpool', got '{filesystem}'")
+            raise typer.Exit(code=1)
+
+        # Validation 2: Available space > 5TB
+        try:
+            # df -h uses shorthand: K, M, G, T, P (need to convert to bitmath format)
+            # bitmath expects: KiB, MiB, GiB, TiB, PiB
+            size_normalized = avail_str
+            if avail_str[-1] in 'KMGTP' and not avail_str.endswith('iB'):
+                size_normalized = avail_str[:-1] + avail_str[-1] + 'iB'
+
+            avail_size = bitmath.parse_string(size_normalized)
+            avail_tb = float(avail_size.TB)  # Convert to TB
+
+            if avail_tb <= 5.0:
+                logger.error(f"Insufficient space: {avail_str} available (need > 5T)")
+                raise typer.Exit(code=1)
+        except (ValueError, AttributeError) as e:
+            logger.error(f"Could not parse available space '{avail_str}': {e}")
+            raise typer.Exit(code=1)
+
+        # Validation 3: Mount point must be /data/cold
+        if mounted_on != '/data/cold':
+            logger.error(f"Wrong mount point: expected '/data/cold', got '{mounted_on}'")
+            raise typer.Exit(code=1)
+
+        logger.info(f"Filesystem validation passed: {filesystem} with {avail_str} available at {mounted_on}")
+
+    except subprocess.CalledProcessError as e:
+        logger.error(f"df command failed: {e}")
+        raise typer.Exit(code=1)
+    except typer.Exit:
+        raise  # Re-raise typer.Exit as-is
+    except Exception as e:
+        logger.error(f"Filesystem validation failed: {e}")
+        raise typer.Exit(code=1)
+
+
 class CopyWorker:
     """NTT copy worker using Claim-Analyze-Execute pattern."""
     
-    def __init__(self, worker_id: str, db_url: str, limit: int = 0, 
+    def __init__(self, worker_id: str, db_url: str, limit: int = 0,
                  dry_run: bool = False, sample_size: int = 1000,
                  medium_hashes: Optional[list[str]] = None):
         self.worker_id = worker_id
@@ -74,7 +154,10 @@ class CopyWorker:
         self.medium_hashes = medium_hashes
         self.shutdown = False
         self.processed_count = 0
-        
+
+        # Validate destination filesystem before doing anything
+        validate_destination_filesystem()
+
         # Environment configuration
         self.RAMDISK = Path(os.environ.get('NTT_RAMDISK', '/tmp/ram'))
         self.NVME_TMP = Path(os.environ.get('NTT_NVME_TMP', '/data/fast/tmp'))
@@ -194,33 +277,21 @@ class CopyWorker:
             return not work_exists
     
     def get_queue_depth(self) -> int:
-        """Get current queue depth for adaptive sampling (respects medium_hashes filter).
-        Health checked at startup via ntt-copy-workers."""
+        """Get fast queue depth from materialized counter (respects medium_hashes filter).
+        Reads from queue_stats table maintained by triggers - instant lookup."""
         with self.conn.cursor() as cur:
             if self.medium_hashes:
                 cur.execute("""
-                    SELECT COUNT(*) as count
-                    FROM inode i
-                    WHERE i.copied = false
-                      AND i.claimed_by IS NULL
-                      AND i.medium_hash = ANY(%s)
-                      AND EXISTS (
-                        SELECT 1 FROM path p
-                        WHERE (p.medium_hash, p.ino) = (i.medium_hash, i.ino)
-                          AND p.exclude_reason IS NULL
-                      )
+                    SELECT COALESCE(SUM(unclaimed_count), 0)::int as count
+                    FROM queue_stats
+                    WHERE medium_hash = ANY(%s)
                 """, (self.medium_hashes,))
             else:
                 cur.execute("""
-                    SELECT COUNT(*) as count
-                    FROM inode i
-                    WHERE i.copied = false
-                      AND i.claimed_by IS NULL
-                      AND EXISTS (
-                        SELECT 1 FROM path p
-                        WHERE (p.medium_hash, p.ino) = (i.medium_hash, i.ino)
-                          AND p.exclude_reason IS NULL
-                      )
+                    SELECT COALESCE(SUM(unclaimed_count), 0)::int as count
+                    FROM queue_stats qs
+                    JOIN medium m ON qs.medium_hash = m.medium_hash
+                    WHERE m.health = 'ok'
                 """)
             return cur.fetchone()['count']
 

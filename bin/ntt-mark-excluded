@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""
+ntt-mark-excluded - Mark paths matching ignore patterns as excluded
+
+Reads patterns from $NTT_IGNORE_PATTERNS and marks matching paths
+in the database with exclude_reason='pattern_match'.
+
+Usage:
+  source ~/.config/ntt/ntt.env && ntt-mark-excluded [--dry-run]
+"""
+
+import os
+import sys
+import re
+from pathlib import Path
+import psycopg
+from psycopg.rows import dict_row
+
+# Configuration from environment
+DB_URL = os.environ.get('NTT_DB_URL', 'postgresql:///copyjob')
+IGNORE_PATTERNS_FILE = os.environ.get('NTT_IGNORE_PATTERNS', '')
+
+# Set PostgreSQL user
+if 'SUDO_USER' in os.environ:
+    os.environ['PGUSER'] = os.environ['SUDO_USER']
+
+def load_patterns(patterns_file: str) -> list[str]:
+    """Load ignore patterns from file."""
+    if not patterns_file or not Path(patterns_file).exists():
+        print(f"Error: Patterns file not found: {patterns_file}")
+        print("Set NTT_IGNORE_PATTERNS environment variable")
+        sys.exit(1)
+
+    patterns = []
+    with open(patterns_file) as f:
+        for line in f:
+            line = line.strip()
+            # Skip comments and empty lines
+            if line and not line.startswith('#'):
+                patterns.append(line)
+
+    return patterns
+
+def mark_excluded_paths(dry_run: bool = False):
+    """Mark paths matching ignore patterns as excluded."""
+
+    patterns = load_patterns(IGNORE_PATTERNS_FILE)
+    print(f"Loaded {len(patterns)} patterns from {IGNORE_PATTERNS_FILE}")
+
+    # Add shell-unsafe character patterns
+    patterns.append('#')  # Hash character in paths
+
+    # Combine patterns into PostgreSQL regex
+    # Use alternation to match any pattern
+    postgres_regex = '|'.join(f'({p})' for p in patterns)
+
+    print(f"\nPostgreSQL regex pattern (first 200 chars):")
+    print(f"{postgres_regex[:200]}...")
+
+    with psycopg.connect(DB_URL) as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            # Count paths that would be excluded
+            cur.execute("""
+                SELECT COUNT(*) as count
+                FROM path
+                WHERE exclude_reason IS NULL
+                  AND path ~ %s
+            """, (postgres_regex,))
+
+            count = cur.fetchone()['count']
+            print(f"\nFound {count:,} paths matching exclusion patterns")
+
+            if count == 0:
+                print("No paths to exclude")
+                return
+
+            if dry_run:
+                print("\n[DRY RUN] Would mark these paths as excluded")
+
+                # Show sample of paths that would be excluded
+                cur.execute("""
+                    SELECT path, medium_hash, ino
+                    FROM path
+                    WHERE exclude_reason IS NULL
+                      AND path ~ %s
+                    LIMIT 20
+                """, (postgres_regex,))
+
+                print("\nSample paths to exclude:")
+                for row in cur.fetchall():
+                    print(f"  {row['path']}")
+
+                if count > 20:
+                    print(f"  ... and {count - 20:,} more")
+            else:
+                print(f"\nMarking {count:,} paths as excluded...")
+
+                # Mark paths as excluded
+                cur.execute("""
+                    UPDATE path
+                    SET exclude_reason = 'pattern_match'
+                    WHERE exclude_reason IS NULL
+                      AND path ~ %s
+                """, (postgres_regex,))
+
+                conn.commit()
+                print(f"✓ Marked {count:,} paths as excluded")
+
+                # Count inodes with ALL paths excluded
+                cur.execute("""
+                    SELECT COUNT(DISTINCT (i.medium_hash, i.ino)) as count
+                    FROM inode i
+                    WHERE i.copied = false
+                      AND NOT EXISTS (
+                        SELECT 1 FROM path p
+                        WHERE p.medium_hash = i.medium_hash
+                          AND p.ino = i.ino
+                          AND p.exclude_reason IS NULL
+                      )
+                """)
+
+                all_excluded_count = cur.fetchone()['count']
+                print(f"\nInodes with ALL paths excluded: {all_excluded_count:,}")
+
+                if all_excluded_count > 0:
+                    print(f"These inodes can be marked as copied=true with claimed_by='EXCLUDED'")
+                    print("Run: UPDATE inode SET copied=true, claimed_by='EXCLUDED' WHERE ...")
+
+if __name__ == '__main__':
+    dry_run = '--dry-run' in sys.argv
+
+    if dry_run:
+        print("=== DRY RUN MODE ===\n")
+
+    mark_excluded_paths(dry_run)

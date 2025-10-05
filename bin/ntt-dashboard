@@ -1003,19 +1003,13 @@ class NTTDashboard(App):
 
             # Query queue depth
             def query_queue_depth():
+                """Get fast queue depth from materialized counter."""
                 with self.db_conn.cursor() as cur:
                     cur.execute("""
-                        SELECT COUNT(*) as count
-                        FROM inode i
-                        JOIN medium m ON i.medium_hash = m.medium_hash
-                        WHERE i.copied = false
-                          AND i.claimed_by IS NULL
-                          AND m.health = 'ok'
-                          AND EXISTS (
-                            SELECT 1 FROM path p
-                            WHERE (p.medium_hash, p.ino) = (i.medium_hash, i.ino)
-                              AND p.exclude_reason IS NULL
-                          )
+                        SELECT COALESCE(SUM(unclaimed_count), 0)::int as count
+                        FROM queue_stats qs
+                        JOIN medium m ON qs.medium_hash = m.medium_hash
+                        WHERE m.health = 'ok'
                     """)
                     return cur.fetchone()['count']
 

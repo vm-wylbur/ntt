@@ -19,8 +19,16 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 # ---------- source config ----------
-if [[ -f ~/.config/ntt/ntt.env ]]; then
-  source ~/.config/ntt/ntt.env
+# Source config from actual user's home (not root's ~)
+if [[ -n "$SUDO_USER" ]]; then
+  USER_HOME=$(eval echo ~$SUDO_USER)
+  CONFIG_FILE="$USER_HOME/.config/ntt/ntt.env"
+else
+  CONFIG_FILE=~/.config/ntt/ntt.env
+fi
+
+if [[ -f "$CONFIG_FILE" ]]; then
+  source "$CONFIG_FILE"
 else
   # Fallback: use original user when running under sudo
   export PGUSER="${SUDO_USER:-$USER}"
@@ -28,12 +36,23 @@ fi
 
 # ---------- config ----------
 DB_URL="${NTT_DB_URL:-postgres:///copyjob}"
+DB_USER="${PGUSER:-${SUDO_USER:-$USER}}"
 IMAGE_ROOT="${NTT_IMAGE_ROOT:-/data/fast/images}"
 RAW_ROOT="${NTT_RAW_ROOT:-/data/fast/raw}"
 DST_ROOT="${NTT_DST_ROOT:-/data/cold/dst}"
 LOG_JSON="${NTT_ORCHESTRATOR_LOG:-/var/log/ntt/orchestrator.jsonl}"
+DIAGNOSTICS=""  # Global variable for storing device/image diagnostics
 mkdir -p "$(dirname "$LOG_JSON")"
 chmod 755 "$(dirname "$LOG_JSON")" 2>/dev/null || true
+
+# Wrapper for psql that handles running as root
+psql_as_user() {
+  if [[ $EUID -eq 0 ]] && [[ -n "$DB_USER" ]] && [[ "$DB_USER" != "root" ]]; then
+    sudo -u "$DB_USER" psql "$@"
+  else
+    psql "$@"
+  fi
+}
 
 # ---------- logging functions ----------
 log() {
@@ -54,25 +73,70 @@ fail() {
 # ---------- identification functions ----------
 identify_device() {
   local dev="$1"
+  local user_message="$2"
 
   if [[ ! -e "$dev" ]]; then
     fail "Device $dev not found"
   fi
 
+  # Comprehensive device diagnostics BEFORE content hash
+  local DIAG_FILE="/tmp/ntt-diag-$$"
+  {
+    echo "=== DISK HARDWARE INFO ==="
+    echo "--- hdparm identity ---"
+    sudo hdparm -I "$dev" 2>&1 || echo "hdparm failed"
+    echo ""
+    echo "--- lsblk overview ---"
+    lsblk "$dev" 2>&1 || echo "lsblk failed"
+    echo ""
+    echo "--- fdisk partition table ---"
+    sudo fdisk -l "$dev" 2>&1 || echo "fdisk failed"
+    echo ""
+    echo "--- parted partition info ---"
+    sudo parted "$dev" print 2>&1 || echo "parted failed"
+    echo ""
+
+    echo "=== HEALTH & SMART DATA ==="
+    # NOTE: For partitions (e.g., /dev/sdc1), USB bridges may block SMART access.
+    # Always check parent device (e.g., /dev/sdc) for real disk SMART data.
+    # TODO: Auto-detect partition and query parent device for SMART
+    sudo smartctl -a "$dev" 2>&1 || echo "smartctl failed or not available"
+    echo ""
+
+    echo "=== CONTENT ANALYSIS ==="
+    echo "--- file signature ---"
+    sudo file -s "$dev" 2>&1 || echo "file failed"
+    echo ""
+    echo "--- wipefs signatures ---"
+    sudo wipefs "$dev" 2>&1 || echo "wipefs failed"
+    echo ""
+    echo "--- blkid UUIDs ---"
+    sudo blkid "$dev"* 2>&1 || echo "blkid failed"
+    echo ""
+    echo "--- MBR/first sector (512 bytes hex dump) ---"
+    sudo dd if="$dev" bs=512 count=1 2>/dev/null | xxd 2>&1 || echo "dd/xxd failed"
+  } > "$DIAG_FILE"
+
+  # Store diagnostics for database insertion
+  DIAGNOSTICS=$(cat "$DIAG_FILE")
+  rm -f "$DIAG_FILE"
+
+  # Content hash from first 1MB + last 1MB (for deduplication)
+  SIG_FILE="/tmp/ntt-sig-$$"
+  head -c 1M "$dev" > "$SIG_FILE"
+  tail -c 1M "$dev" >> "$SIG_FILE"
+  local medium_hash=$(b3sum < "$SIG_FILE" | cut -d' ' -f1 | cut -c1-32)
+  rm -f "$SIG_FILE"
+
+  # Human name from device hardware info
   MODEL=$(lsblk -no MODEL "$dev" | tr -s ' ' '_')
   SERIAL=$(lsblk -no SERIAL "$dev" | tr -s ' ' '_')
   local medium_human="${MODEL:-unknown}_${SERIAL:-unknown}"
 
-  SIG_FILE="/tmp/ntt-sig-$$"
-  head -c 1M "$dev" > "$SIG_FILE"
-  tail -c 1M "$dev" >> "$SIG_FILE"
-  local medium_hash=$(b3sum < "$SIG_FILE" | cut -d' ' -f1)
-  rm -f "$SIG_FILE"
+  log identify "{\"medium_hash\":\"$medium_hash\",\"medium_human\":\"$medium_human\",\"message\":\"$user_message\",\"dev\":\"$dev\"}"
 
-  log identify "{\"medium_human\": \"$medium_human\", \"medium_hash\": \"$medium_hash\", \"dev\": \"$dev\"}"
-
-  # Return values via echo
-  echo "$medium_hash:$medium_human"
+  # Return: hash:human:message (diagnostics stored in global DIAGNOSTICS variable)
+  echo "$medium_hash:$medium_human:$user_message"
 }
 
 identify_path() {
@@ -94,6 +158,7 @@ identify_path() {
 
 identify_image() {
   local image_path="$1"
+  local user_message="${2:-}"
 
   if [[ ! -f "$image_path" ]]; then
     fail "Image file not found: $image_path"
@@ -103,6 +168,27 @@ identify_image() {
   local filename=$(basename "$image_path")
   local medium_human="${filename%.*}"
 
+  # Capture image diagnostics BEFORE content hash
+  local DIAG_FILE="/tmp/ntt-img-diag-$$"
+  {
+    echo "=== IMAGE METADATA ==="
+    echo "Image path: $image_path"
+    echo "Size: $(stat -c %s "$image_path") bytes ($(stat -c %s "$image_path" | numfmt --to=iec-i --suffix=B 2>/dev/null || stat -c %s "$image_path"))"
+    echo "Modified: $(stat -c %y "$image_path")"
+    echo ""
+
+    echo "=== FILESYSTEM SIGNATURE ==="
+    file -s "$image_path" 2>&1 || echo "file command failed"
+    echo ""
+
+    echo "=== BLKID OUTPUT ==="
+    echo "(Captured after loop device creation in mount_image)"
+  } > "$DIAG_FILE"
+
+  # Store diagnostics in temp file for parent process to read
+  cp "$DIAG_FILE" "/tmp/ntt-image-diag-$$"
+  rm -f "$DIAG_FILE"
+
   # Generate hash from image content (head + tail, like identify_device)
   SIG_FILE="/tmp/ntt-sig-$$"
   head -c 1M "$image_path" > "$SIG_FILE"
@@ -110,10 +196,10 @@ identify_image() {
   local medium_hash=$(b3sum < "$SIG_FILE" | cut -d' ' -f1 | cut -c1-32)
   rm -f "$SIG_FILE"
 
-  log identify "{\"medium_human\": \"$medium_human\", \"medium_hash\": \"$medium_hash\", \"image\": \"$image_path\"}"
+  log identify "{\"medium_human\": \"$medium_human\", \"medium_hash\": \"$medium_hash\", \"message\": \"$user_message\", \"image\": \"$image_path\"}"
 
-  # Return values via echo
-  echo "$medium_hash:$medium_human"
+  # Return: hash:human:message (diagnostics stored in global DIAGNOSTICS variable)
+  echo "$medium_hash:$medium_human:$user_message"
 }
 
 # ---------- health check functions ----------
@@ -141,7 +227,7 @@ check_duplicate() {
   local force="$2"
 
   if ! "$force"; then
-    EXISTS=$(psql "$DB_URL" -t -A -c "SELECT 1 FROM medium WHERE medium_hash='$medium_hash'" 2>/dev/null || echo "")
+    EXISTS=$(psql_as_user "$DB_URL" -t -A -c "SELECT 1 FROM medium WHERE medium_hash='$medium_hash'" 2>/dev/null || echo "")
     if [[ -n $EXISTS ]]; then
       log skip "{\"reason\": \"already ingested\"}"
       exit 2
@@ -153,75 +239,69 @@ insert_medium() {
   local medium_hash="$1"
   local medium_human="$2"
   local health="${3:-false}"
+  local message="${4:-}"
+  local diagnostics="${5:-}"
 
-  psql "$DB_URL" -c "INSERT INTO medium (medium_hash, medium_human, health)
-                     VALUES ('$medium_hash', '$medium_human', '${health}')
-                     ON CONFLICT DO NOTHING;" 2>/dev/null || true
+  # Use psql parameter binding to safely handle all special characters
+  psql_as_user "$DB_URL" \
+    -v hash="$medium_hash" \
+    -v human="$medium_human" \
+    -v health="$health" \
+    -v msg="$message" \
+    -v diag="$diagnostics" \
+<<'SQL'
+INSERT INTO medium (medium_hash, medium_human, health, message, diagnostics)
+VALUES (:'hash', :'human', :'health', :'msg', :'diag')
+ON CONFLICT (medium_hash) DO UPDATE
+SET message = EXCLUDED.message,
+    diagnostics = EXCLUDED.diagnostics;
+SQL
 }
 
 # ---------- mount/unmount functions ----------
-mount_device() {
-  local dev="$1"
-  local medium_hash="$2"
-  local image_first="$3"
-
-  if "$image_first"; then
-    IMG="$IMAGE_ROOT/${medium_hash}.img"
-    MAP="$IMAGE_ROOT/${medium_hash}.map"
-    log imager_spawn "{\"img\": \"$IMG\", \"map\": \"$MAP\"}"
-    ntt-imager "$dev" "$IMG" "$MAP"
-    LOOP=$(losetup -f --show -r "$IMG")
-    mkdir -p "/mnt/ntt/${medium_hash}"
-    mount -o ro,nodev,nosuid,noatime "$LOOP" "/mnt/ntt/${medium_hash}"
-    MNT="/mnt/ntt/${medium_hash}"
-  else
-    MNT="/mnt/medium/${medium_hash}"
-    mkdir -p "$MNT"
-    mount -o ro,nodev,nosuid,noatime "$dev" "$MNT"
-  fi
-
-  echo "$MNT"
-}
-
-unmount_device() {
-  local mnt="$1"
-  local image_first="$2"
-  local medium_hash="$3"
-
-  if "$image_first"; then
-    umount "$mnt" 2>/dev/null || true
-    IMG="$IMAGE_ROOT/${medium_hash}.img"
-    LOOP=$(losetup -j "$IMG" | cut -d: -f1)
-    [[ -n "$LOOP" ]] && losetup -d "$LOOP"
-  else
-    umount "$mnt" 2>/dev/null || true
-  fi
-}
-
 mount_image() {
   local image_path="$1"
   local medium_hash="$2"
 
-  # Create loop device
+  # Create loop device (read-only)
   local loop_device=$(losetup -f --show -r "$image_path")
   if [[ -z "$loop_device" ]]; then
     fail "Failed to create loop device for $image_path"
   fi
 
-  log mount_image "{\"image\": \"$image_path\", \"loop\": \"$loop_device\", \"medium_hash\": \"$medium_hash\"}"
+  # Get full blkid output for diagnostics
+  local blkid_full=$(blkid "$loop_device" 2>/dev/null || echo "")
+
+  # Extract filesystem type for mounting
+  local fs_type=$(blkid -o value -s TYPE "$loop_device" 2>/dev/null || echo "")
+
+  # Write blkid output to temp file for parent to append to diagnostics
+  if [[ -n "$blkid_full" ]]; then
+    echo "$blkid_full" > "/tmp/ntt-blkid-$$"
+  fi
+
+  log mount_image "{\"image\": \"$image_path\", \"loop\": \"$loop_device\", \"medium_hash\": \"$medium_hash\", \"fs_type\": \"$fs_type\"}"
 
   # Create mount point
   local mnt="/mnt/ntt/${medium_hash}"
   mkdir -p "$mnt"
 
-  # Mount read-only
-  if ! mount -o ro "$loop_device" "$mnt"; then
-    losetup -d "$loop_device"
-    rmdir "$mnt" 2>/dev/null || true
-    fail "Failed to mount $loop_device at $mnt"
+  # Mount with detected filesystem type (or fallback to auto-detect)
+  if [[ -n "$fs_type" ]]; then
+    if ! mount -t "$fs_type" -o ro,noatime,nodev,nosuid "$loop_device" "$mnt"; then
+      losetup -d "$loop_device"
+      rmdir "$mnt" 2>/dev/null || true
+      fail "Failed to mount $loop_device at $mnt (fs_type: $fs_type)"
+    fi
+  else
+    if ! mount -o ro,noatime,nodev,nosuid "$loop_device" "$mnt"; then
+      losetup -d "$loop_device"
+      rmdir "$mnt" 2>/dev/null || true
+      fail "Failed to mount $loop_device at $mnt"
+    fi
   fi
 
-  log mount_success "{\"mnt\": \"$mnt\", \"loop\": \"$loop_device\"}"
+  log mount_success "{\"mnt\": \"$mnt\", \"loop\": \"$loop_device\", \"fs_type\": \"$fs_type\"}"
 
   # Return mount path and loop device (separated by :)
   echo "$mnt:$loop_device"
@@ -282,7 +362,7 @@ run_copy_workers() {
 cleanup_image() {
   local medium_hash="$1"
 
-  COPIED=$(psql "$DB_URL" -t -A -c \
+  COPIED=$(psql_as_user "$DB_URL" -t -A -c \
     "SELECT count(*) FILTER (WHERE copied) = count(*) FROM inode WHERE medium_hash='$medium_hash'" 2>/dev/null || echo 0)
   if [[ $COPIED -eq 1 ]]; then
     rm -f "$IMAGE_ROOT/${medium_hash}.img" "$IMAGE_ROOT/${medium_hash}.map"
@@ -296,20 +376,49 @@ handle_device_mode() {
   local image_first="$2"
   local force="$3"
   local enum_only="$4"
+  local user_message="$5"
 
-  # Identify and check health
-  local identify_result=$(identify_device "$dev")
+  # Require --message for device mode
+  if [[ -z "$user_message" ]]; then
+    fail "Device mode requires --message flag (e.g., --message=\"old maxtor ide 300GB\")"
+  fi
+
+  # Identify device with user message
+  local identify_result=$(identify_device "$dev" "$user_message")
   local medium_hash="${identify_result%%:*}"
-  local medium_human="${identify_result#*:}"
+  local temp="${identify_result#*:}"
+  local medium_human="${temp%%:*}"
+  local message="${temp#*:}"
 
   check_duplicate "$medium_hash" "$force"
-  local IMAGE_FIRST=$(check_device_health "$dev")
 
-  # Insert into database
-  insert_medium "$medium_hash" "$medium_human" "$IMAGE_FIRST"
+  # Image the device using ntt-imager
+  local IMG="$IMAGE_ROOT/${medium_hash}.img"
+  local MAP="$IMAGE_ROOT/${medium_hash}.map"
+  log imager_spawn "{\"img\":\"$IMG\",\"map\":\"$MAP\",\"message\":\"$message\"}"
 
-  # Mount and process
-  MNT=$(mount_device "$dev" "$medium_hash" "$IMAGE_FIRST")
+  ntt-imager "$dev" "$IMG" "$MAP"
+  local exit_code=$?
+
+  if [[ $exit_code -eq 2 ]]; then
+    fail "ntt-imager failed with error (exit code 2)"
+  elif [[ $exit_code -eq 1 ]]; then
+    log imager_partial "{\"medium_hash\":\"$medium_hash\",\"msg\":\"Exhausted all recovery phases, some sectors unreadable\"}"
+  else
+    log imager_success "{\"medium_hash\":\"$medium_hash\",\"msg\":\"100% rescued\"}"
+  fi
+
+  # Insert into database with image_path, message, and diagnostics
+  insert_medium "$medium_hash" "$medium_human" "true" "$message" "$DIAGNOSTICS"
+  psql_as_user "$DB_URL" -c "UPDATE medium SET image_path = '$IMG' WHERE medium_hash = '$medium_hash';" 2>/dev/null || true
+
+  # Mount the image as loop device
+  LOOP=$(losetup -f --show -r "$IMG")
+  MNT="/mnt/ntt/${medium_hash}"
+  mkdir -p "$MNT"
+  mount -o ro,nodev,nosuid,noatime "$LOOP" "$MNT"
+
+  # Run enumeration
   RAW=$(run_enum "$MNT" "$medium_hash")
 
   # Run full pipeline unless --enum-only
@@ -319,8 +428,9 @@ handle_device_mode() {
   fi
 
   # Cleanup
-  unmount_device "$MNT" "$IMAGE_FIRST" "$medium_hash"
-  [[ "$IMAGE_FIRST" == "true" ]] && cleanup_image "$medium_hash"
+  umount "$MNT" || true
+  losetup -d "$LOOP" || true
+  rmdir "$MNT" 2>/dev/null || true
 }
 
 handle_directory_mode() {
@@ -358,6 +468,7 @@ handle_image_mode() {
   local image_path="$1"
   local force="$2"
   local enum_only="$3"
+  local user_message="${4:-}"
 
   # Setup cleanup trap for errors
   local loop_device=""
@@ -369,10 +480,18 @@ handle_image_mode() {
   }
   trap cleanup_on_error EXIT SIGINT SIGTERM
 
-  # Identify image (content-based hash)
-  local identify_result=$(identify_image "$image_path")
+  # Identify image (content-based hash) with message
+  local identify_result=$(identify_image "$image_path" "$user_message")
   local medium_hash="${identify_result%%:*}"
-  local medium_human="${identify_result#*:}"
+  local temp="${identify_result#*:}"
+  local medium_human="${temp%%:*}"
+  local message="${temp#*:}"
+
+  # Read image diagnostics from temp file
+  if [[ -f "/tmp/ntt-image-diag-$$" ]]; then
+    DIAGNOSTICS=$(cat "/tmp/ntt-image-diag-$$")
+    rm -f "/tmp/ntt-image-diag-$$"
+  fi
 
   # Check if raw file already exists
   RAW="$RAW_ROOT/${medium_hash}.raw"
@@ -382,15 +501,21 @@ handle_image_mode() {
 
   check_duplicate "$medium_hash" "$force"
 
-  # Insert into database with image_path
-  psql "$DB_URL" -c "INSERT INTO medium (medium_hash, medium_human, health, image_path)
-                     VALUES ('$medium_hash', '$medium_human', 'ok', '$image_path')
-                     ON CONFLICT DO NOTHING;" 2>/dev/null || true
-
-  # Mount image
+  # Mount image (writes blkid to temp file)
   local mount_result=$(mount_image "$image_path" "$medium_hash")
   mnt="${mount_result%%:*}"
   loop_device="${mount_result#*:}"
+
+  # Append blkid from temp file to diagnostics
+  if [[ -f "/tmp/ntt-blkid-$$" ]]; then
+    DIAGNOSTICS="${DIAGNOSTICS}
+$(cat /tmp/ntt-blkid-$$)"
+    rm -f "/tmp/ntt-blkid-$$"
+  fi
+
+  # Insert into database with image_path, message, and diagnostics
+  insert_medium "$medium_hash" "$medium_human" "ok" "$message" "$DIAGNOSTICS"
+  psql_as_user "$DB_URL" -c "UPDATE medium SET image_path = '$image_path' WHERE medium_hash = '$medium_hash';" 2>/dev/null || true
 
   # Run enum on mounted image
   RAW=$(run_enum "$mnt" "$medium_hash")
@@ -481,6 +606,7 @@ ENUM_ONLY=false
 TARGET=""
 LOAD_ONLY_FILE=""
 IMAGE_FILE=""
+USER_MESSAGE=""
 
 # Parse options first
 while [[ $# -gt 0 ]]; do
@@ -511,6 +637,16 @@ while [[ $# -gt 0 ]]; do
     --image-first)
       IMAGE_FIRST=true
       shift
+      ;;
+    --message)
+      shift
+      if [[ $# -ge 1 && "$1" != -* ]]; then
+        USER_MESSAGE="$1"
+        shift
+      else
+        echo "Error: --message requires a description string" >&2
+        usage
+      fi
       ;;
     --force)
       FORCE=true
@@ -557,9 +693,9 @@ fi
 if [[ "$LOAD_ONLY_MODE" == "true" ]]; then
   handle_load_only_mode "$LOAD_ONLY_FILE"
 elif [[ "$IMAGE_MODE" == "true" ]]; then
-  handle_image_mode "$IMAGE_FILE" "$FORCE" "$ENUM_ONLY"
+  handle_image_mode "$IMAGE_FILE" "$FORCE" "$ENUM_ONLY" "$USER_MESSAGE"
 elif [[ "$TARGET" == /dev/* ]]; then
-  handle_device_mode "$TARGET" "$IMAGE_FIRST" "$FORCE" "$ENUM_ONLY"
+  handle_device_mode "$TARGET" "$IMAGE_FIRST" "$FORCE" "$ENUM_ONLY" "$USER_MESSAGE"
 else
   handle_directory_mode "$TARGET" "$FORCE" "$ENUM_ONLY"
 fi

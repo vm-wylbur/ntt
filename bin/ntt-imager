@@ -1,0 +1,259 @@
+#!/usr/bin/env bash
+# Author: PB & Claude
+# Date: 2025-10-04
+# License: (c) HRDAG, 2025, GPL-2 or newer
+#
+# ------
+# ntt/bin/ntt-imager
+#
+# Progressive 7-phase ddrescue imaging - never give up until 100% or exhausted
+set -euo pipefail
+
+# ---------- Arguments ----------
+if [[ $# -lt 3 ]]; then
+  cat <<EOF
+Usage: $0 <device> <output.img> <mapfile>
+
+Progressive ddrescue imaging with 7 escalating phases.
+Runs until 100% rescued or all methods exhausted.
+
+Phases:
+  1. Quick first pass (large blocks, ~2-4 hours)
+  2. Trimming bad areas (small blocks, ~2-4 hours)
+  3. Aggressive scraping (10 retries, ~12-24 hours)
+  4. Reverse scraping (20 retries, ~12-24 hours)
+  5. Tiny blocks forward (100 retries, ~24-48 hours)
+  6. Tiny blocks reverse (100 retries, ~24-48 hours)
+  7. Direct disc access (bypass caching, ~12-24 hours)
+
+Exit codes:
+  0 = 100% rescued (SUCCESS)
+  1 = Exhausted all 7 phases, some sectors unreadable (PARTIAL)
+  2 = Error (device not found, disk full, etc.)
+
+Example:
+  sudo $0 /dev/sdc /data/fast/img/backup.img /data/fast/img/backup.map
+EOF
+  exit 2
+fi
+
+DEVICE="$1"
+OUTPUT="$2"
+MAPFILE="$3"
+LOGFILE="${OUTPUT%.img}-ddrescue.log"
+
+# ---------- Validation ----------
+if [[ ! -e "$DEVICE" ]]; then
+  echo "Error: Device $DEVICE not found" >&2
+  exit 2
+fi
+
+if [[ ! -b "$DEVICE" ]]; then
+  echo "Error: $DEVICE is not a block device" >&2
+  exit 2
+fi
+
+OUTPUT_DIR="$(dirname "$OUTPUT")"
+if [[ ! -d "$OUTPUT_DIR" ]]; then
+  echo "Error: Output directory $OUTPUT_DIR does not exist" >&2
+  exit 2
+fi
+
+if [[ ! -w "$OUTPUT_DIR" ]]; then
+  echo "Error: Output directory $OUTPUT_DIR is not writable" >&2
+  exit 2
+fi
+
+# Check for ddrescue
+if ! command -v ddrescue &>/dev/null; then
+  echo "Error: ddrescue not found. Install with: sudo apt install gddrescue" >&2
+  exit 2
+fi
+
+# ---------- Helper Functions ----------
+START_TIME=$(date +%s)
+
+log() {
+  echo "[$(date -Iseconds)] $*" | tee -a "$LOGFILE"
+}
+
+count_bad_sectors() {
+  local mapfile="$1"
+  if [[ ! -f "$mapfile" ]]; then
+    echo "0"
+    return
+  fi
+  # Count sectors in bad areas (status: ?, *, /, -)
+  grep -E '^[-?*/]' "$mapfile" 2>/dev/null | awk '{sum+=$3/512} END {print int(sum+0)}' || echo "0"
+}
+
+parse_mapfile_percentage() {
+  local mapfile="$1"
+  if [[ ! -f "$mapfile" ]]; then
+    echo "0.00"
+    return
+  fi
+
+  local rescued=$(grep '^+' "$mapfile" 2>/dev/null | awk '{sum+=$3} END {print sum+0}')
+  local total=$(grep -E '^[+?*/-]' "$mapfile" 2>/dev/null | awk '{sum+=$3} END {print sum+0}')
+
+  if [[ $total -eq 0 ]]; then
+    echo "0.00"
+  else
+    echo "scale=2; $rescued * 100 / $total" | bc
+  fi
+}
+
+check_stalled() {
+  local hours="$1"
+  local mapfile="$2"
+  local stall_file="${mapfile}.stall"
+
+  # Hash the bad sector list to detect changes
+  local bad_sectors_hash=$(grep -E '^[?*/-]' "$mapfile" 2>/dev/null | md5sum | cut -d' ' -f1)
+
+  if [[ -f "$stall_file" ]]; then
+    local prev_hash=$(cat "$stall_file")
+    local prev_time=$(stat -c %Y "$stall_file")
+    local curr_time=$(date +%s)
+    local elapsed=$(( (curr_time - prev_time) / 3600 ))
+
+    if [[ "$prev_hash" == "$bad_sectors_hash" && $elapsed -ge $hours ]]; then
+      return 0  # STALLED
+    fi
+  fi
+
+  # Update stall tracking
+  echo "$bad_sectors_hash" > "$stall_file"
+  touch "$stall_file"
+
+  return 1  # NOT stalled
+}
+
+run_phase() {
+  local phase="$1"
+  shift
+  local description="$1"
+  shift
+
+  log "======================================"
+  log "PHASE $phase: $description"
+  log "======================================"
+
+  # Run ddrescue with given arguments
+  ddrescue "$@" "$DEVICE" "$OUTPUT" "$MAPFILE" 2>&1 | tee -a "$LOGFILE" || true
+
+  local bad=$(count_bad_sectors "$MAPFILE")
+  local pct=$(parse_mapfile_percentage "$MAPFILE")
+  log "PHASE $phase COMPLETE: $bad bad sectors remaining (${pct}% rescued)"
+
+  # Check if 100% done
+  if [[ $bad -eq 0 ]]; then
+    local elapsed=$(( ($(date +%s) - START_TIME) / 3600 ))
+    log "======================================"
+    log "SUCCESS: 100% rescued after $elapsed hours"
+    log "======================================"
+    exit 0
+  fi
+}
+
+# ---------- Initial Status ----------
+log "======================================"
+log "NTT Progressive Imager Starting"
+log "======================================"
+log "Device: $DEVICE"
+log "Output: $OUTPUT"
+log "Mapfile: $MAPFILE"
+log "Log: $LOGFILE"
+
+if [[ -f "$MAPFILE" ]]; then
+  log "Existing mapfile found - will resume"
+  rescued=$(parse_mapfile_percentage "$MAPFILE")
+  bad=$(count_bad_sectors "$MAPFILE")
+  log "Current status: ${rescued}% rescued, $bad bad sectors"
+fi
+
+# ---------- PHASE 1: Quick First Pass ----------
+run_phase 1 "Quick first pass (large blocks, no scraping)" \
+  --force \
+  --no-scrape \
+  --no-trim \
+  --idirect \
+  --cluster-size=128
+
+# ---------- PHASE 2: Trimming ----------
+run_phase 2 "Trimming bad areas (small blocks, 5 retry passes)" \
+  --force \
+  --no-scrape \
+  --idirect \
+  --cluster-size=8 \
+  --retry-passes=5
+
+# ---------- PHASE 3: Aggressive Scraping ----------
+run_phase 3 "Aggressive scraping (10 retries per sector)" \
+  --force \
+  --idirect \
+  --max-retries=10 \
+  --retry-passes=10
+
+# Check for stall after Phase 3
+if check_stalled 4 "$MAPFILE"; then
+  log "WARNING: No progress for 4 hours, continuing to Phase 4 anyway"
+fi
+
+# ---------- PHASE 4: Reverse Scraping ----------
+run_phase 4 "Reverse scraping (20 retries, backwards)" \
+  --force \
+  --idirect \
+  --reverse \
+  --max-retries=20 \
+  --retry-passes=10
+
+# ---------- PHASE 5: Tiny Blocks Forward ----------
+run_phase 5 "Tiny blocks forward (512-byte reads, 100 retries)" \
+  --force \
+  --idirect \
+  --cluster-size=1 \
+  --sector-size=512 \
+  --max-retries=100 \
+  --retry-passes=20
+
+# ---------- PHASE 6: Tiny Blocks Reverse ----------
+run_phase 6 "Tiny blocks reverse (512-byte reads, 100 retries)" \
+  --force \
+  --idirect \
+  --reverse \
+  --cluster-size=1 \
+  --sector-size=512 \
+  --max-retries=100 \
+  --retry-passes=20
+
+# Check for stall after Phases 5-6
+if check_stalled 8 "$MAPFILE"; then
+  log "WARNING: No progress for 8 hours in Phase 5-6"
+fi
+
+# ---------- PHASE 7: Direct Disc Access ----------
+run_phase 7 "Direct disc access (bypass all caching, 50 retries)" \
+  --force \
+  --idirect \
+  --odirect \
+  --max-retries=50 \
+  --retry-passes=10
+
+# ---------- Final Status ----------
+bad=$(count_bad_sectors "$MAPFILE")
+elapsed=$(( ($(date +%s) - START_TIME) / 3600 ))
+rescued_pct=$(parse_mapfile_percentage "$MAPFILE")
+
+log "======================================"
+if [[ $bad -eq 0 ]]; then
+  log "SUCCESS: 100% rescued after $elapsed hours and 7 phases"
+  log "======================================"
+  exit 0
+else
+  log "EXHAUSTED: All 7 phases complete after $elapsed hours"
+  log "Final status: ${rescued_pct}% rescued, $bad sectors unreadable"
+  log "======================================"
+  exit 1
+fi
