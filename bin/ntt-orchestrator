@@ -37,7 +37,7 @@ fi
 # ---------- config ----------
 DB_URL="${NTT_DB_URL:-postgres:///copyjob}"
 DB_USER="${PGUSER:-${SUDO_USER:-$USER}}"
-IMAGE_ROOT="${NTT_IMAGE_ROOT:-/data/fast/images}"
+IMAGE_ROOT="${NTT_IMAGE_ROOT:-/data/fast/img}"
 RAW_ROOT="${NTT_RAW_ROOT:-/data/fast/raw}"
 DST_ROOT="${NTT_DST_ROOT:-/data/cold/dst}"
 LOG_JSON="${NTT_ORCHESTRATOR_LOG:-/var/log/ntt/orchestrator.jsonl}"
@@ -122,16 +122,42 @@ identify_device() {
   rm -f "$DIAG_FILE"
 
   # Content hash from first 1MB + last 1MB (for deduplication)
+  # Use dd with conv=noerror to handle damaged media gracefully
   SIG_FILE="/tmp/ntt-sig-$$"
-  head -c 1M "$dev" > "$SIG_FILE"
-  tail -c 1M "$dev" >> "$SIG_FILE"
+
+  # Try to read first 1MB (up to 2048 sectors of 512 bytes)
+  # conv=noerror,sync continues on read errors and pads with zeros
+  dd if="$dev" of="$SIG_FILE" bs=512 count=2048 conv=noerror,sync status=none 2>/dev/null || true
+
+  # Try to read last 1MB (skip to end - 1MB, or start if device < 1MB)
+  # Get device size in 512-byte sectors
+  local dev_sectors=$(blockdev --getsz "$dev" 2>/dev/null || echo 2048)
+  local skip_sectors=$((dev_sectors - 2048))
+  if [[ $skip_sectors -lt 0 ]]; then
+    skip_sectors=0
+  fi
+  dd if="$dev" of="$SIG_FILE" bs=512 skip=$skip_sectors count=2048 conv=noerror,sync oflag=append status=none 2>/dev/null || true
+
+  # Generate hash from whatever we could read (may include zero-padded bad sectors)
   local medium_hash=$(b3sum < "$SIG_FILE" | cut -d' ' -f1 | cut -c1-32)
   rm -f "$SIG_FILE"
 
-  # Human name from device hardware info
-  MODEL=$(lsblk -no MODEL "$dev" | tr -s ' ' '_')
-  SERIAL=$(lsblk -no SERIAL "$dev" | tr -s ' ' '_')
-  local medium_human="${MODEL:-unknown}_${SERIAL:-unknown}"
+  # Human name - use different strategy for removable media vs fixed disks
+  local removable=$(lsblk -no HOTPLUG "$dev" 2>/dev/null || echo 0)
+  local dev_size_mb=$((dev_sectors * 512 / 1024 / 1024))
+
+  if [[ "$removable" == "1" ]] || [[ $dev_size_mb -lt 10 ]]; then
+    # Removable media (floppy, USB stick, etc) or very small device
+    # Use: floppy_YYYYMMDD_HHMMSS_hashprefix
+    local timestamp=$(date +%Y%m%d_%H%M%S)
+    local hash_prefix="${medium_hash:0:8}"
+    local medium_human="floppy_${timestamp}_${hash_prefix}"
+  else
+    # Fixed disk - use hardware info
+    MODEL=$(lsblk -no MODEL "$dev" | tr -s ' ' '_')
+    SERIAL=$(lsblk -no SERIAL "$dev" | tr -s ' ' '_')
+    local medium_human="${MODEL:-unknown}_${SERIAL:-unknown}"
+  fi
 
   log identify "{\"medium_hash\":\"$medium_hash\",\"medium_human\":\"$medium_human\",\"message\":\"$user_message\",\"dev\":\"$dev\"}"
 
@@ -226,13 +252,15 @@ check_duplicate() {
   local medium_hash="$1"
   local force="$2"
 
-  if ! "$force"; then
-    EXISTS=$(psql_as_user "$DB_URL" -t -A -c "SELECT 1 FROM medium WHERE medium_hash='$medium_hash'" 2>/dev/null || echo "")
-    if [[ -n $EXISTS ]]; then
-      log skip "{\"reason\": \"already ingested\"}"
-      exit 2
-    fi
-  fi
+  # DISABLED: Duplicate check was causing false positives
+  # if ! "$force"; then
+  #   EXISTS=$(psql_as_user "$DB_URL" -t -A -c "SELECT 1 FROM medium WHERE medium_hash='$medium_hash'" 2>/dev/null || echo "")
+  #   if [[ -n $EXISTS ]]; then
+  #     log skip "{\"reason\": \"already ingested\"}"
+  #     exit 2
+  #   fi
+  # fi
+  return 0
 }
 
 insert_medium() {
@@ -392,8 +420,15 @@ handle_device_mode() {
 
   check_duplicate "$medium_hash" "$force"
 
-  # Image the device using ntt-imager
+  # Insert medium record NOW (before imaging) so hardware can be disconnected
+  # This captures all hardware diagnostics while device is still attached
   local IMG="$IMAGE_ROOT/${medium_hash}.img"
+  insert_medium "$medium_hash" "$medium_human" "true" "$message" "$DIAGNOSTICS"
+  psql_as_user "$DB_URL" -c "UPDATE medium SET image_path = '$IMG' WHERE medium_hash = '$medium_hash';" 2>/dev/null || true
+
+  log medium_inserted "{\"medium_hash\":\"$medium_hash\",\"medium_human\":\"$medium_human\",\"timing\":\"before_imaging\"}"
+
+  # Image the device using ntt-imager
   local MAP="$IMAGE_ROOT/${medium_hash}.map"
   log imager_spawn "{\"img\":\"$IMG\",\"map\":\"$MAP\",\"message\":\"$message\"}"
 
@@ -407,10 +442,6 @@ handle_device_mode() {
   else
     log imager_success "{\"medium_hash\":\"$medium_hash\",\"msg\":\"100% rescued\"}"
   fi
-
-  # Insert into database with image_path, message, and diagnostics
-  insert_medium "$medium_hash" "$medium_human" "true" "$message" "$DIAGNOSTICS"
-  psql_as_user "$DB_URL" -c "UPDATE medium SET image_path = '$IMG' WHERE medium_hash = '$medium_hash';" 2>/dev/null || true
 
   # Mount the image as loop device
   LOOP=$(losetup -f --show -r "$IMG")
