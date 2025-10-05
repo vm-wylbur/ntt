@@ -77,14 +77,24 @@ log() {
   echo "[$(date -Iseconds)] $*" | tee -a "$LOGFILE"
 }
 
-count_bad_sectors() {
+count_unfinished_sectors() {
   local mapfile="$1"
   if [[ ! -f "$mapfile" ]]; then
     echo "0"
     return
   fi
-  # Count sectors in bad areas (status: ?, *, /, -)
-  grep -E '^[-?*/]' "$mapfile" 2>/dev/null | awk '{sum+=$3/512} END {print int(sum+0)}' || echo "0"
+
+  # Get total size of device from mapfile (all data lines with 3 columns: pos size status)
+  # Column 2 is size in hex (0xNNNN), need to convert to decimal
+  # Skip comment lines and the current_pos line (has different format)
+  local total=$(grep -v '^#' "$mapfile" 2>/dev/null | awk 'NF==3 && $2 ~ /^0x/ {sum+=strtonum($2)} END {print sum+0}')
+
+  # Get rescued size (only lines where column 3 is + and size is hex)
+  local rescued=$(grep -v '^#' "$mapfile" 2>/dev/null | awk 'NF==3 && $2 ~ /^0x/ && $3=="+" {sum+=strtonum($2)} END {print sum+0}')
+
+  # Unfinished = total - rescued, convert bytes to sectors
+  local unfinished=$(( (total - rescued) / 512 ))
+  echo "$unfinished" | tr -d '\n'
 }
 
 parse_mapfile_percentage() {
@@ -143,12 +153,12 @@ run_phase() {
   # Run ddrescue with given arguments
   ddrescue "$@" "$DEVICE" "$OUTPUT" "$MAPFILE" 2>&1 | tee -a "$LOGFILE" || true
 
-  local bad=$(count_bad_sectors "$MAPFILE")
+  local unfinished=$(count_unfinished_sectors "$MAPFILE")
   local pct=$(parse_mapfile_percentage "$MAPFILE")
-  log "PHASE $phase COMPLETE: $bad bad sectors remaining (${pct}% rescued)"
+  log "PHASE $phase COMPLETE: $unfinished sectors remaining (${pct}% rescued)"
 
   # Check if 100% done
-  if [[ $bad -eq 0 ]]; then
+  if [[ $unfinished -eq 0 ]]; then
     local elapsed=$(( ($(date +%s) - START_TIME) / 3600 ))
     log "======================================"
     log "SUCCESS: 100% rescued after $elapsed hours"
@@ -169,8 +179,8 @@ log "Log: $LOGFILE"
 if [[ -f "$MAPFILE" ]]; then
   log "Existing mapfile found - will resume"
   rescued=$(parse_mapfile_percentage "$MAPFILE")
-  bad=$(count_bad_sectors "$MAPFILE")
-  log "Current status: ${rescued}% rescued, $bad bad sectors"
+  unfinished=$(count_unfinished_sectors "$MAPFILE")
+  log "Current status: ${rescued}% rescued, $unfinished sectors remaining"
 fi
 
 # ---------- PHASE 1: Quick First Pass ----------
@@ -193,7 +203,7 @@ run_phase 2 "Trimming bad areas (small blocks, 5 retry passes)" \
 run_phase 3 "Aggressive scraping (10 retries per sector)" \
   --force \
   --idirect \
-  --max-retries=10 \
+  --retry-passes=10 \
   --retry-passes=10
 
 # Check for stall after Phase 3
@@ -202,21 +212,47 @@ if check_stalled 4 "$MAPFILE"; then
 fi
 
 # ---------- PHASE 4: Reverse Scraping ----------
-run_phase 4 "Reverse scraping (20 retries, backwards)" \
+run_phase 4 "Reverse scraping (4 retries, backwards)" \
   --force \
   --idirect \
   --reverse \
-  --max-retries=20 \
-  --retry-passes=10
+  --retry-passes=4
+
+# Check if we've rescued enough (>99%) - skip expensive phases 5-7
+rescued_pct=$(parse_mapfile_percentage "$MAPFILE")
+if (( $(echo "$rescued_pct > 99" | bc -l) )); then
+  elapsed=$(( ($(date +%s) - START_TIME) / 3600 ))
+  log "======================================"
+  log "GOOD-ENOUGH: ${rescued_pct}% rescued after Phase 4 (>99% threshold)"
+  log "Skipping Phases 5-7 (diminishing returns)"
+  log "Total time: $elapsed hours"
+  log "======================================"
+  exit 0
+fi
+
+log "Rescued ${rescued_pct}% after Phase 4 (≤99%), continuing to expensive phases..."
 
 # ---------- PHASE 5: Tiny Blocks Forward ----------
-run_phase 5 "Tiny blocks forward (512-byte reads, 100 retries)" \
+run_phase 5 "Tiny blocks forward (512-byte reads, 6 retries)" \
   --force \
   --idirect \
   --cluster-size=1 \
   --sector-size=512 \
-  --max-retries=100 \
-  --retry-passes=20
+  --retry-passes=6
+
+# Check if we've rescued enough (>95%) - skip phases 6-7
+rescued_pct=$(parse_mapfile_percentage "$MAPFILE")
+if (( $(echo "$rescued_pct >= 95" | bc -l) )); then
+  elapsed=$(( ($(date +%s) - START_TIME) / 3600 ))
+  log "======================================"
+  log "GOOD-ENOUGH: ${rescued_pct}% rescued after Phase 5 (≥95% threshold)"
+  log "Skipping Phases 6-7 (severely damaged media only)"
+  log "Total time: $elapsed hours"
+  log "======================================"
+  exit 0
+fi
+
+log "Rescued ${rescued_pct}% after Phase 5 (<95%), continuing to phases 6-7 for severely damaged media..."
 
 # ---------- PHASE 6: Tiny Blocks Reverse ----------
 run_phase 6 "Tiny blocks reverse (512-byte reads, 100 retries)" \
@@ -225,7 +261,7 @@ run_phase 6 "Tiny blocks reverse (512-byte reads, 100 retries)" \
   --reverse \
   --cluster-size=1 \
   --sector-size=512 \
-  --max-retries=100 \
+  --retry-passes=100 \
   --retry-passes=20
 
 # Check for stall after Phases 5-6
@@ -238,22 +274,22 @@ run_phase 7 "Direct disc access (bypass all caching, 50 retries)" \
   --force \
   --idirect \
   --odirect \
-  --max-retries=50 \
+  --retry-passes=50 \
   --retry-passes=10
 
 # ---------- Final Status ----------
-bad=$(count_bad_sectors "$MAPFILE")
+unfinished=$(count_unfinished_sectors "$MAPFILE")
 elapsed=$(( ($(date +%s) - START_TIME) / 3600 ))
 rescued_pct=$(parse_mapfile_percentage "$MAPFILE")
 
 log "======================================"
-if [[ $bad -eq 0 ]]; then
+if [[ $unfinished -eq 0 ]]; then
   log "SUCCESS: 100% rescued after $elapsed hours and 7 phases"
   log "======================================"
   exit 0
 else
   log "EXHAUSTED: All 7 phases complete after $elapsed hours"
-  log "Final status: ${rescued_pct}% rescued, $bad sectors unreadable"
+  log "Final status: ${rescued_pct}% rescued, $unfinished sectors unreadable"
   log "======================================"
   exit 1
 fi
