@@ -322,49 +322,85 @@ class CopyWorker:
             self._queue_depth_check_counter = 0
             logger.debug(f"Queue depth: {self._queue_depth_cache}")
 
-        # TABLESAMPLE hybrid: sample from entire table FIRST, then filter
-        # This is fast because TABLESAMPLE operates at block level before any filtering
-        claim_query = f"""
-            WITH sampled AS (
-                SELECT i.medium_hash, i.ino
-                FROM inode i
-                TABLESAMPLE SYSTEM_ROWS(%(sample_size)s)
-                WHERE i.copied = false
-                  AND i.claimed_by IS NULL
-                  AND EXISTS (
-                    SELECT 1 FROM path p
-                    WHERE (p.medium_hash, p.ino) = (i.medium_hash, i.ino)
-                      AND p.exclude_reason IS NULL
-                  )
-                ORDER BY RANDOM()
-                LIMIT 100
-            ),
-            filtered AS (
-                SELECT medium_hash, ino
-                FROM sampled
-                {medium_filter.replace('AND', 'WHERE') if medium_filter else ''}
-                LIMIT 1
-            ),
-            locked_row AS (
-                SELECT f.medium_hash, f.ino
-                FROM filtered f
-                JOIN inode i ON (i.medium_hash, i.ino) = (f.medium_hash, f.ino)
-                FOR UPDATE OF i SKIP LOCKED
-            ),
-            claimed AS (
-                UPDATE inode i
-                SET claimed_by = %(worker_id)s, claimed_at = NOW()
-                FROM locked_row lr
-                WHERE (i.medium_hash, i.ino) = (lr.medium_hash, lr.ino)
-                RETURNING i.*
-            )
-            SELECT c.*,
-                   (SELECT array_agg(p.path)
-                    FROM path p
-                    WHERE (p.medium_hash, p.ino) = (c.medium_hash, c.ino)
-                      AND p.exclude_reason IS NULL) as paths
-            FROM claimed c;
-        """
+        # Adaptive query selection based on queue depth
+        if self._queue_depth_cache <= 5000:
+            # Small queue: use direct query with ORDER BY RANDOM()
+            # Fast for small tables (~1-2ms), reliable hit rate
+            claim_query = f"""
+                WITH candidate AS (
+                    SELECT i.medium_hash, i.ino
+                    FROM inode i
+                    WHERE i.copied = false
+                      AND i.claimed_by IS NULL
+                      {medium_filter}
+                      AND EXISTS (
+                        SELECT 1 FROM path p
+                        WHERE (p.medium_hash, p.ino) = (i.medium_hash, i.ino)
+                          AND p.exclude_reason IS NULL
+                      )
+                    ORDER BY RANDOM()
+                    LIMIT 1
+                    FOR UPDATE OF i SKIP LOCKED
+                ),
+                claimed AS (
+                    UPDATE inode i
+                    SET claimed_by = %(worker_id)s, claimed_at = NOW()
+                    FROM candidate c
+                    WHERE (i.medium_hash, i.ino) = (c.medium_hash, c.ino)
+                    RETURNING i.*
+                )
+                SELECT c.*,
+                       (SELECT array_agg(p.path)
+                        FROM path p
+                        WHERE (p.medium_hash, p.ino) = (c.medium_hash, c.ino)
+                          AND p.exclude_reason IS NULL) as paths
+                FROM claimed c;
+            """
+        else:
+            # Large queue: use TABLESAMPLE for performance
+            # TABLESAMPLE hybrid: sample from entire table FIRST, then filter
+            # This is fast because TABLESAMPLE operates at block level before any filtering
+            claim_query = f"""
+                WITH sampled AS (
+                    SELECT i.medium_hash, i.ino
+                    FROM inode i
+                    TABLESAMPLE SYSTEM_ROWS(%(sample_size)s)
+                    WHERE i.copied = false
+                      AND i.claimed_by IS NULL
+                      AND EXISTS (
+                        SELECT 1 FROM path p
+                        WHERE (p.medium_hash, p.ino) = (i.medium_hash, i.ino)
+                          AND p.exclude_reason IS NULL
+                      )
+                    ORDER BY RANDOM()
+                    LIMIT 100
+                ),
+                filtered AS (
+                    SELECT medium_hash, ino
+                    FROM sampled
+                    {medium_filter.replace('AND', 'WHERE') if medium_filter else ''}
+                    LIMIT 1
+                ),
+                locked_row AS (
+                    SELECT f.medium_hash, f.ino
+                    FROM filtered f
+                    JOIN inode i ON (i.medium_hash, i.ino) = (f.medium_hash, f.ino)
+                    FOR UPDATE OF i SKIP LOCKED
+                ),
+                claimed AS (
+                    UPDATE inode i
+                    SET claimed_by = %(worker_id)s, claimed_at = NOW()
+                    FROM locked_row lr
+                    WHERE (i.medium_hash, i.ino) = (lr.medium_hash, lr.ino)
+                    RETURNING i.*
+                )
+                SELECT c.*,
+                       (SELECT array_agg(p.path)
+                        FROM path p
+                        WHERE (p.medium_hash, p.ino) = (c.medium_hash, c.ino)
+                          AND p.exclude_reason IS NULL) as paths
+                FROM claimed c;
+            """
 
         params = {
             'worker_id': self.worker_id,
@@ -400,17 +436,52 @@ class CopyWorker:
 
         return {'inode_row': inode_row, 'paths': paths}
     
-    def release_claim(self, inode_row: dict):
-        """Release claim on an inode after error."""
+    def release_claim(self, inode_row: dict, error_msg: str = None):
+        """Release claim on an inode after error.
+
+        If error_msg is provided, tracks failure in errors array.
+        After 3 consecutive failures with same error, marks inode as EXCLUDED.
+        """
+        medium_hash = inode_row['medium_hash']
+        ino = inode_row['ino']
+
+        if error_msg:
+            # Track this error in the errors array
+            with self.conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE inode
+                    SET errors = array_append(errors, %s)
+                    WHERE medium_hash = %s AND ino = %s
+                    RETURNING array_length(errors, 1) as error_count, errors
+                """, (error_msg, medium_hash, ino))
+                result = cur.fetchone()
+                self.conn.commit()
+
+                if result:
+                    error_count = result['error_count']
+                    errors = result['errors']
+
+                    # Check if last 3 errors are identical (persistent failure)
+                    if error_count >= 3 and len(set(errors[-3:])) == 1:
+                        logger.warning(f"Persistent failure detected for ino={ino}: {error_msg}")
+                        logger.warning(f"Marking as EXCLUDED after {error_count} failures")
+                        self.mark_inode_excluded(inode_row, reason=f"persistent_failure: {error_msg}")
+                        return
+
+                    logger.info(f"Released claim on ino={ino} after error (attempt {error_count}): {error_msg}")
+
+        # Normal release - clear claim
         with self.conn.cursor() as cur:
             cur.execute("""
                 UPDATE inode
                 SET claimed_by = NULL, claimed_at = NULL
                 WHERE medium_hash = %s AND ino = %s
                   AND claimed_by = %s
-            """, (inode_row['medium_hash'], inode_row['ino'],
-                  self.worker_id))
+            """, (medium_hash, ino, self.worker_id))
         self.conn.commit()
+
+        if not error_msg:
+            logger.debug(f"Released claim on ino={ino}")
 
     def mark_path_excluded(self, path: str, medium_hash: str, ino: int, reason: str):
         """Mark a specific path as excluded."""
@@ -435,16 +506,17 @@ class CopyWorker:
             """, (medium_hash, ino))
             return cur.fetchone()['all_excluded']
 
-    def mark_inode_excluded(self, inode_row: dict):
+    def mark_inode_excluded(self, inode_row: dict, reason: str = None):
         """Mark inode as copied with EXCLUDED flag when all paths are excluded."""
+        claimed_by = f'EXCLUDED: {reason}' if reason else 'EXCLUDED'
         with self.conn.cursor() as cur:
             cur.execute("""
                 UPDATE inode
-                SET copied = true, claimed_by = 'EXCLUDED', claimed_at = NOW()
+                SET copied = true, claimed_by = %s, claimed_at = NOW()
                 WHERE medium_hash = %s AND ino = %s
-            """, (inode_row['medium_hash'], inode_row['ino']))
+            """, (claimed_by, inode_row['medium_hash'], inode_row['ino']))
         self.conn.commit()
-        logger.info(f"Marked inode as EXCLUDED: ino={inode_row['ino']}")
+        logger.info(f"Marked inode as EXCLUDED: ino={inode_row['ino']}, reason={reason or 'all_paths_excluded'}")
     
     def process_work_unit(self, work_unit: dict):
         """Process one work unit through Claim-Analyze-Execute."""
@@ -499,7 +571,8 @@ class CopyWorker:
                         logger.info(f"All paths excluded for ino={inode_row['ino']}, marked as EXCLUDED")
                         return
 
-            self.release_claim(inode_row)
+            # Release with error tracking
+            self.release_claim(inode_row, error_msg=f"AnalysisError: {str(e)[:100]}")
             self.stats['errors'] += 1
 
         except ExecutionError as e:
@@ -509,15 +582,19 @@ class CopyWorker:
             error_str = str(e)
             if 'No such file or directory' in error_str or '[Errno 2]' in error_str:
                 # This is likely a missing by-hash file, which means data integrity issue
-                # Don't mark as excluded, but log it specially
-                logger.warning(f"Missing by-hash file for ino={inode_row['ino']}, will retry on timeout")
+                # Release with error tracking for persistent failures
+                self.release_claim(inode_row, error_msg=f"ExecutionError: missing by-hash file")
+            else:
+                # Other execution errors - release with tracking
+                self.release_claim(inode_row, error_msg=f"ExecutionError: {str(e)[:100]}")
 
-            # Don't release claim - timeout will trigger retry
             self.stats['errors'] += 1
-        
+
         except Exception as e:
             logger.error(f"Unexpected error ino={inode_row['ino']}, error={e}", exc_info=True)
-            self.release_claim(inode_row)
+            # Release with error tracking
+            error_type = type(e).__name__
+            self.release_claim(inode_row, error_msg=f"{error_type}: {str(e)[:100]}")
             self.stats['errors'] += 1
         
         finally:
@@ -790,7 +867,9 @@ class CopyWorker:
     
     def execute_directory_fs(self, plan: dict):
         """Filesystem operations for directory."""
-        for path_str in plan['paths']:
+        for path_bytes in plan['paths']:
+            # Decode bytes to str (paths are stored as bytea in database)
+            path_str = path_bytes.decode('utf-8', errors='replace') if isinstance(path_bytes, bytes) else path_bytes
             archive_path = self.ARCHIVE_ROOT / path_str.lstrip('/')
             if not archive_path.exists():
                 archive_path.mkdir(parents=True, exist_ok=True, mode=0o755)
@@ -799,7 +878,9 @@ class CopyWorker:
     def execute_symlink_fs(self, plan: dict):
         """Filesystem operations for symlink."""
         target = plan['target']
-        for path_str in plan['paths']:
+        for path_bytes in plan['paths']:
+            # Decode bytes to str (paths are stored as bytea in database)
+            path_str = path_bytes.decode('utf-8', errors='replace') if isinstance(path_bytes, bytes) else path_bytes
             archive_path = self.ARCHIVE_ROOT / path_str.lstrip('/')
             if not archive_path.exists() and not archive_path.is_symlink():
                 archive_path.parent.mkdir(parents=True, exist_ok=True)
