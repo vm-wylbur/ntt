@@ -17,19 +17,31 @@ import magic
 EMPTY_FILE_HASH = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 
-def sanitize_path(path_str: str) -> Path:
+def sanitize_path(path: str | bytes) -> Path:
     """
-    Convert database path string to filesystem path.
+    Convert database path (text or bytea) to filesystem path.
 
-    Handles escape sequences like \\r (stored as literal text) by converting
+    Handles both text and bytea from database:
+    - bytea: Decoded using surrogateescape to preserve invalid UTF-8 bytes
+    - text: Used directly
+
+    Also handles escape sequences like \\r (stored as literal text) by converting
     them to actual control characters for HFS+ metadata directories.
 
     Args:
-        path_str: Path string from database (may contain literal \\r, \\n, etc.)
+        path: Path from database (str or bytes, may contain literal \\r, \\n, etc.)
 
     Returns:
         Path object with escape sequences converted to actual characters
     """
+    # Handle bytea from PostgreSQL
+    if isinstance(path, bytes):
+        # Use surrogateescape to preserve invalid UTF-8 bytes
+        # This allows round-tripping through Python back to filesystem
+        path_str = path.decode('utf-8', errors='surrogateescape')
+    else:
+        path_str = path
+
     # Replace literal escape sequences with actual control characters
     # This handles HFS+ Private Directory Data\r paths
     sanitized = path_str.replace('\\r', '\r').replace('\\n', '\n')
@@ -178,7 +190,14 @@ def create_hardlinks_idempotent(hash_path: Path, paths_to_link: list[str],
     created_count = 0
     hash_path_stat = hash_path.stat()
     
-    for path_str in paths_to_link:
+    for path in paths_to_link:
+        # Handle both str and bytes from database
+        if isinstance(path, bytes):
+            # Decode bytea using surrogateescape to preserve invalid UTF-8
+            path_str = path.decode('utf-8', errors='surrogateescape')
+        else:
+            path_str = path
+
         # Sanitize path to handle HFS+ escape sequences
         sanitized_path = path_str.replace('\\r', '\r').replace('\\n', '\n')
         archive_path = archive_root / sanitized_path.lstrip('/')
