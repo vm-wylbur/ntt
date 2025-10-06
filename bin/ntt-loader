@@ -166,15 +166,34 @@ INSERT INTO medium (medium_hash, added_at)
 VALUES ('$MEDIUM_HASH', now())
 ON CONFLICT DO NOTHING;
 
+-- SAFETY CHECK: Verify partitions are attached before proceeding
+-- This catches spontaneous detachment issues early
+DO \$\$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_inherits
+    WHERE inhrelid = 'path_p_${PARTITION_SUFFIX}'::regclass
+      AND inhparent = 'path'::regclass
+  ) THEN
+    RAISE EXCEPTION 'SAFETY CHECK FAILED: partition path_p_${PARTITION_SUFFIX} is not attached to parent table';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_inherits
+    WHERE inhrelid = 'inode_p_${PARTITION_SUFFIX}'::regclass
+      AND inhparent = 'inode'::regclass
+  ) THEN
+    RAISE EXCEPTION 'SAFETY CHECK FAILED: partition inode_p_${PARTITION_SUFFIX} is not attached to parent table';
+  END IF;
+END\$\$;
+
 -- Clear any existing data for this medium (loads are always fresh/complete)
--- DELETE directly from partition to avoid locking all partitions
--- (DELETE on parent table locks all partitions even with WHERE clause)
-DELETE FROM path_p_${PARTITION_SUFFIX};
-DELETE FROM inode_p_${PARTITION_SUFFIX};
+-- Use TRUNCATE instead of DELETE (faster, simpler, no FK cascade complexity)
+-- Safe with P2P FK architecture - only affects this partition pair
+TRUNCATE path_p_${PARTITION_SUFFIX}, inode_p_${PARTITION_SUFFIX};
 
 -- inode rows: Use DISTINCT ON instead of GROUP BY with MAX
 -- DISTINCT ON is faster and correct since inode metadata is identical for hardlinks
--- No ON CONFLICT needed - partition is now empty (DELETE above)
+-- No ON CONFLICT needed - partition is now empty (TRUNCATE above)
 INSERT INTO inode (medium_hash,dev,ino,nlink,size,mtime)
 SELECT DISTINCT ON (medium_hash, ino)
        '$MEDIUM_HASH' as medium_hash, dev, ino, nlink, size, mtime
@@ -183,7 +202,7 @@ ORDER BY medium_hash, ino;
 
 -- path rows: Direct SELECT (no GROUP BY needed - verified zero duplicate ino,path pairs)
 -- Convert Latin1 text to bytea to preserve exact bytes from filesystem
--- No ON CONFLICT needed - partition is now empty (DELETE above)
+-- No ON CONFLICT needed - partition is now empty (TRUNCATE above)
 INSERT INTO path (medium_hash,dev,ino,path)
 SELECT '$MEDIUM_HASH' as medium_hash, dev, ino, convert_to(path, 'LATIN1')
 FROM   $TABLE_NAME;
