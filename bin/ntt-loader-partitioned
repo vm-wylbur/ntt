@@ -166,27 +166,23 @@ INSERT INTO medium (medium_hash, added_at)
 VALUES ('$MEDIUM_HASH', now())
 ON CONFLICT DO NOTHING;
 
--- Clear any existing data for this medium (loads are always fresh/complete)
--- DELETE directly from partition to avoid locking all partitions
--- (DELETE on parent table locks all partitions even with WHERE clause)
-DELETE FROM path_p_${PARTITION_SUFFIX};
-DELETE FROM inode_p_${PARTITION_SUFFIX};
-
 -- inode rows: Use DISTINCT ON instead of GROUP BY with MAX
 -- DISTINCT ON is faster and correct since inode metadata is identical for hardlinks
--- No ON CONFLICT needed - partition is now empty (DELETE above)
+-- With partitioning: inserts into empty partition (zero ON CONFLICT overhead)
 INSERT INTO inode (medium_hash,dev,ino,nlink,size,mtime)
 SELECT DISTINCT ON (medium_hash, ino)
        '$MEDIUM_HASH' as medium_hash, dev, ino, nlink, size, mtime
 FROM   $TABLE_NAME
-ORDER BY medium_hash, ino;
+ORDER BY medium_hash, ino
+ON CONFLICT (medium_hash,ino) DO NOTHING;
 
 -- path rows: Direct SELECT (no GROUP BY needed - verified zero duplicate ino,path pairs)
 -- Convert Latin1 text to bytea to preserve exact bytes from filesystem
--- No ON CONFLICT needed - partition is now empty (DELETE above)
+-- With partitioning: inserts into empty partition (zero ON CONFLICT overhead)
 INSERT INTO path (medium_hash,dev,ino,path)
 SELECT '$MEDIUM_HASH' as medium_hash, dev, ino, convert_to(path, 'LATIN1')
-FROM   $TABLE_NAME;
+FROM   $TABLE_NAME
+ON CONFLICT (medium_hash,path) DO NOTHING;
 " || fail "Failed to deduplicate into final tables"
 
 # ---------- 4. cleanup and summary ----------

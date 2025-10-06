@@ -79,47 +79,98 @@ identify_device() {
     fail "Device $dev not found"
   fi
 
+  echo "[$(date -Iseconds)] Identifying device $dev..." >&2
+
+  # Detect removable devices FIRST (lsblk doesn't access device, so it's safe)
+  local removable=$(lsblk -no HOTPLUG "$dev" 2>/dev/null || echo 0)
+  local is_small_or_removable=false
+  local dev_sectors=0
+  local dev_size_mb=0
+
+  # If removable, assume it's small/problematic and skip device access
+  if [[ "$removable" == "1" ]]; then
+    is_small_or_removable=true
+    dev_sectors=2880  # Typical floppy size for naming purposes
+    dev_size_mb=1
+  else
+    # Only try to get size if not removable (blockdev can hang on floppies)
+    dev_sectors=$(blockdev --getsz "$dev" 2>/dev/null || echo 2048)
+    dev_size_mb=$((dev_sectors * 512 / 1024 / 1024))
+    if [[ $dev_size_mb -lt 10 ]]; then
+      is_small_or_removable=true
+    fi
+  fi
+
   # Comprehensive device diagnostics BEFORE content hash
   local DIAG_FILE="/tmp/ntt-diag-$$"
   {
     echo "=== DISK HARDWARE INFO ==="
-    echo "--- hdparm identity ---"
-    sudo hdparm -I "$dev" 2>&1 || echo "hdparm failed"
-    echo ""
+
+    # Skip hdparm/smartctl for small/removable devices (they hang on floppies)
+    if [[ "$is_small_or_removable" == "true" ]]; then
+      echo "--- hdparm identity ---"
+      echo "Skipped for small/removable device"
+      echo ""
+    else
+      echo "--- hdparm identity ---"
+      sudo hdparm -I "$dev" 2>&1 || echo "hdparm failed"
+      echo ""
+    fi
+
     echo "--- lsblk overview ---"
     lsblk "$dev" 2>&1 || echo "lsblk failed"
     echo ""
     echo "--- fdisk partition table ---"
     sudo fdisk -l "$dev" 2>&1 || echo "fdisk failed"
     echo ""
-    echo "--- parted partition info ---"
-    sudo parted "$dev" print 2>&1 || echo "parted failed"
-    echo ""
+
+    # Skip parted for small/removable devices (hangs on floppies)
+    if [[ "$is_small_or_removable" == "true" ]]; then
+      echo "--- parted partition info ---"
+      echo "Skipped for small/removable device"
+      echo ""
+    else
+      echo "--- parted partition info ---"
+      sudo parted "$dev" print 2>&1 || echo "parted failed"
+      echo ""
+    fi
 
     echo "=== HEALTH & SMART DATA ==="
-    # NOTE: For partitions (e.g., /dev/sdc1), USB bridges may block SMART access.
-    # Always check parent device (e.g., /dev/sdc) for real disk SMART data.
-    # TODO: Auto-detect partition and query parent device for SMART
-    sudo smartctl -a "$dev" 2>&1 || echo "smartctl failed or not available"
-    echo ""
+    if [[ "$is_small_or_removable" == "true" ]]; then
+      echo "Skipped for small/removable device"
+      echo ""
+    else
+      # NOTE: For partitions (e.g., /dev/sdc1), USB bridges may block SMART access.
+      # Always check parent device (e.g., /dev/sdc) for real disk SMART data.
+      # TODO: Auto-detect partition and query parent device for SMART
+      sudo smartctl -a "$dev" 2>&1 || echo "smartctl failed or not available"
+      echo ""
+    fi
 
     echo "=== CONTENT ANALYSIS ==="
-    echo "--- file signature ---"
-    sudo file -s "$dev" 2>&1 || echo "file failed"
-    echo ""
-    echo "--- wipefs signatures ---"
-    sudo wipefs "$dev" 2>&1 || echo "wipefs failed"
-    echo ""
-    echo "--- blkid UUIDs ---"
-    sudo blkid "$dev"* 2>&1 || echo "blkid failed"
-    echo ""
-    echo "--- MBR/first sector (512 bytes hex dump) ---"
-    sudo dd if="$dev" bs=512 count=1 2>/dev/null | xxd 2>&1 || echo "dd/xxd failed"
+    # Skip content analysis for small/removable devices (they hang on floppies)
+    if [[ "$is_small_or_removable" == "true" ]]; then
+      echo "Skipped for small/removable device (will analyze from image)"
+    else
+      echo "--- file signature ---"
+      sudo file -s "$dev" 2>&1 || echo "file failed"
+      echo ""
+      echo "--- wipefs signatures ---"
+      sudo wipefs "$dev" 2>&1 || echo "wipefs failed"
+      echo ""
+      echo "--- blkid UUIDs ---"
+      sudo blkid "$dev"* 2>&1 || echo "blkid failed"
+      echo ""
+      echo "--- MBR/first sector (512 bytes hex dump) ---"
+      sudo dd if="$dev" bs=512 count=1 2>/dev/null | xxd 2>&1 || echo "dd/xxd failed"
+    fi
   } > "$DIAG_FILE"
 
   # Store diagnostics for database insertion
   DIAGNOSTICS=$(cat "$DIAG_FILE")
   rm -f "$DIAG_FILE"
+
+  echo "[$(date -Iseconds)] Generating content hash..." >&2
 
   # Content hash from first 1MB + last 1MB (for deduplication)
   # Use dd with conv=noerror to handle damaged media gracefully
@@ -130,8 +181,7 @@ identify_device() {
   dd if="$dev" of="$SIG_FILE" bs=512 count=2048 conv=noerror,sync status=none 2>/dev/null || true
 
   # Try to read last 1MB (skip to end - 1MB, or start if device < 1MB)
-  # Get device size in 512-byte sectors
-  local dev_sectors=$(blockdev --getsz "$dev" 2>/dev/null || echo 2048)
+  # dev_sectors already calculated above
   local skip_sectors=$((dev_sectors - 2048))
   if [[ $skip_sectors -lt 0 ]]; then
     skip_sectors=0
@@ -143,10 +193,8 @@ identify_device() {
   rm -f "$SIG_FILE"
 
   # Human name - use different strategy for removable media vs fixed disks
-  local removable=$(lsblk -no HOTPLUG "$dev" 2>/dev/null || echo 0)
-  local dev_size_mb=$((dev_sectors * 512 / 1024 / 1024))
-
-  if [[ "$removable" == "1" ]] || [[ $dev_size_mb -lt 10 ]]; then
+  # (removable and dev_size_mb already calculated above)
+  if [[ "$is_small_or_removable" == "true" ]]; then
     # Removable media (floppy, USB stick, etc) or very small device
     # Use: floppy_YYYYMMDD_HHMMSS_hashprefix
     local timestamp=$(date +%Y%m%d_%H%M%S)
@@ -160,6 +208,8 @@ identify_device() {
   fi
 
   log identify "{\"medium_hash\":\"$medium_hash\",\"medium_human\":\"$medium_human\",\"message\":\"$user_message\",\"dev\":\"$dev\"}"
+
+  echo "[$(date -Iseconds)] Identified as: $medium_human (hash: $medium_hash)" >&2
 
   # Return: hash:human:message (diagnostics stored in global DIAGNOSTICS variable)
   echo "$medium_hash:$medium_human:$user_message"
@@ -423,6 +473,7 @@ handle_device_mode() {
   # Insert medium record NOW (before imaging) so hardware can be disconnected
   # This captures all hardware diagnostics while device is still attached
   local IMG="$IMAGE_ROOT/${medium_hash}.img"
+  echo "[$(date -Iseconds)] Inserting medium record to database..." >&2
   insert_medium "$medium_hash" "$medium_human" "true" "$message" "$DIAGNOSTICS"
   psql_as_user "$DB_URL" -c "UPDATE medium SET image_path = '$IMG' WHERE medium_hash = '$medium_hash';" 2>/dev/null || true
 
@@ -430,6 +481,7 @@ handle_device_mode() {
 
   # Image the device using ntt-imager
   local MAP="$IMAGE_ROOT/${medium_hash}.map"
+  echo "[$(date -Iseconds)] Starting imaging: $dev -> $IMG" >&2
   log imager_spawn "{\"img\":\"$IMG\",\"map\":\"$MAP\",\"message\":\"$message\"}"
 
   ntt-imager "$dev" "$IMG" "$MAP"
@@ -458,10 +510,9 @@ handle_device_mode() {
     run_copy_workers "$medium_hash"
   fi
 
-  # Cleanup
-  umount "$MNT" || true
-  losetup -d "$LOOP" || true
-  rmdir "$MNT" 2>/dev/null || true
+  # Leave image mounted for copy workers
+  # Cleanup will be handled by ntt-cleanup-mounts periodic job
+  log mount_persisted "{\"mnt\": \"$MNT\", \"loop\": \"$LOOP\", \"note\": \"left mounted for workers\"}"
 }
 
 handle_directory_mode() {
@@ -557,9 +608,10 @@ $(cat /tmp/ntt-blkid-$$)"
     run_copy_workers "$medium_hash"
   fi
 
-  # Cleanup (unmount and detach loop)
-  unmount_image "$mnt" "$loop_device"
-  trap - EXIT SIGINT SIGTERM  # Clear trap after successful cleanup
+  # Leave image mounted for copy workers
+  # Cleanup will be handled by ntt-cleanup-mounts periodic job
+  log mount_persisted "{\"mnt\": \"$mnt\", \"loop\": \"$loop_device\", \"note\": \"left mounted for workers\"}"
+  trap - EXIT SIGINT SIGTERM  # Clear trap - we're keeping the mount
 }
 
 # ---------- load-only mode handler ----------

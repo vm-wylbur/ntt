@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# Author: PB and Claude
+# Date: 2025-10-05
+# License: (c) HRDAG, 2025, GPL-2 or newer
+#
+# ------
+# ntt/bin/ntt-mount-helper
+#
+# Sudo wrapper for mounting/unmounting NTT disk images
+# Validates inputs and uses standard mount paths
+
+set -euo pipefail
+
+usage() {
+  cat <<EOF
+Usage:
+  $0 mount <medium_hash> <image_path>    Mount image to /mnt/ntt/<medium_hash>
+  $0 unmount <medium_hash>               Unmount and detach loop device
+  $0 status <medium_hash>                Check if mounted (exit 0=yes, 1=no)
+
+Security:
+  - Only mounts to /mnt/ntt/<hash> (no arbitrary paths)
+  - Validates medium_hash format (hex only)
+  - Read-only mounts with nosuid,nodev,noatime
+EOF
+  exit 1
+}
+
+# Validate medium hash (32-64 hex chars)
+validate_hash() {
+  local hash="$1"
+  if [[ ! "$hash" =~ ^[a-f0-9]{16,64}$ ]]; then
+    echo "Error: Invalid medium_hash format (must be 16-64 hex chars)" >&2
+    exit 1
+  fi
+}
+
+# Mount command
+do_mount() {
+  local medium_hash="$1"
+  local image_path="$2"
+
+  validate_hash "$medium_hash"
+
+  if [[ ! -f "$image_path" ]]; then
+    echo "Error: Image file not found: $image_path" >&2
+    exit 1
+  fi
+
+  local mount_point="/mnt/ntt/$medium_hash"
+
+  # Check if already mounted
+  if findmnt "$mount_point" >/dev/null 2>&1; then
+    echo "Already mounted at $mount_point"
+    exit 0
+  fi
+
+  # Create mount point
+  mkdir -p "$mount_point"
+
+  # Create loop device (read-only)
+  local loop_device
+  loop_device=$(losetup -f --show -r "$image_path")
+  if [[ -z "$loop_device" ]]; then
+    rmdir "$mount_point" 2>/dev/null || true
+    echo "Error: Failed to create loop device for $image_path" >&2
+    exit 1
+  fi
+
+  # Detect filesystem type
+  local fs_type
+  fs_type=$(blkid -o value -s TYPE "$loop_device" 2>/dev/null || echo "")
+
+  # Mount with detected filesystem type (or auto-detect)
+  if [[ -n "$fs_type" ]]; then
+    if mount -t "$fs_type" -o ro,noatime,nodev,nosuid "$loop_device" "$mount_point" 2>/dev/null; then
+      echo "Mounted $loop_device at $mount_point (fs_type: $fs_type)"
+      exit 0
+    fi
+  fi
+
+  # Fallback: try auto-detect
+  if mount -o ro,noatime,nodev,nosuid "$loop_device" "$mount_point" 2>/dev/null; then
+    echo "Mounted $loop_device at $mount_point (auto-detected fs_type)"
+    exit 0
+  fi
+
+  # Mount failed - cleanup
+  losetup -d "$loop_device" 2>/dev/null || true
+  rmdir "$mount_point" 2>/dev/null || true
+  echo "Error: Failed to mount $loop_device" >&2
+  exit 1
+}
+
+# Unmount command
+do_unmount() {
+  local medium_hash="$1"
+
+  validate_hash "$medium_hash"
+
+  local mount_point="/mnt/ntt/$medium_hash"
+
+  # Check if mounted
+  if ! findmnt "$mount_point" >/dev/null 2>&1; then
+    echo "Not mounted: $mount_point"
+    # Still try to cleanup mount point if it exists
+    rmdir "$mount_point" 2>/dev/null || true
+    exit 0
+  fi
+
+  # Get loop device before unmounting
+  local loop_device
+  loop_device=$(findmnt -n -o SOURCE "$mount_point" || echo "")
+
+  # Unmount
+  if umount "$mount_point" 2>/dev/null; then
+    echo "Unmounted $mount_point"
+  else
+    echo "Warning: Failed to unmount $mount_point" >&2
+  fi
+
+  # Detach loop device if found
+  if [[ -n "$loop_device" ]] && [[ "$loop_device" =~ ^/dev/loop ]]; then
+    if losetup -d "$loop_device" 2>/dev/null; then
+      echo "Detached loop device $loop_device"
+    else
+      echo "Warning: Failed to detach $loop_device" >&2
+    fi
+  fi
+
+  # Remove mount point
+  rmdir "$mount_point" 2>/dev/null || true
+
+  exit 0
+}
+
+# Status command
+do_status() {
+  local medium_hash="$1"
+
+  validate_hash "$medium_hash"
+
+  local mount_point="/mnt/ntt/$medium_hash"
+
+  if findmnt "$mount_point" >/dev/null 2>&1; then
+    echo "Mounted at $mount_point"
+    exit 0
+  else
+    echo "Not mounted: $mount_point"
+    exit 1
+  fi
+}
+
+# Main dispatch
+[[ $# -ge 1 ]] || usage
+
+case "$1" in
+  mount)
+    [[ $# -eq 3 ]] || usage
+    do_mount "$2" "$3"
+    ;;
+  unmount)
+    [[ $# -eq 2 ]] || usage
+    do_unmount "$2"
+    ;;
+  status)
+    [[ $# -eq 2 ]] || usage
+    do_status "$2"
+    ;;
+  *)
+    usage
+    ;;
+esac

@@ -104,8 +104,10 @@ parse_mapfile_percentage() {
     return
   fi
 
-  local rescued=$(grep '^+' "$mapfile" 2>/dev/null | awk '{sum+=$3} END {print sum+0}')
-  local total=$(grep -E '^[+?*/-]' "$mapfile" 2>/dev/null | awk '{sum+=$3} END {print sum+0}')
+  # Mapfile format: pos(hex) size(hex) status
+  # Status in column 3: + (rescued), - (bad), ? (non-tried), * (non-trimmed), / (non-scraped)
+  local rescued=$(grep -v '^#' "$mapfile" 2>/dev/null | awk 'NF==3 && $2 ~ /^0x/ && $3=="+" {sum+=strtonum($2)} END {print sum+0}')
+  local total=$(grep -v '^#' "$mapfile" 2>/dev/null | awk 'NF==3 && $2 ~ /^0x/ {sum+=strtonum($2)} END {print sum+0}')
 
   if [[ $total -eq 0 ]]; then
     echo "0.00"
@@ -210,6 +212,33 @@ run_phase 3 "Aggressive scraping (10 retries per sector)" \
 if check_stalled 4 "$MAPFILE"; then
   log "WARNING: No progress for 4 hours, continuing to Phase 4 anyway"
 fi
+
+# Check rescue percentage after Phase 3 for early bailouts
+rescued_pct=$(parse_mapfile_percentage "$MAPFILE")
+
+# Bailout if excellent recovery (>99%) - no need for expensive phases
+if (( $(echo "$rescued_pct > 99" | bc -l) )); then
+  elapsed=$(( ($(date +%s) - START_TIME) / 3600 ))
+  log "======================================"
+  log "EXCELLENT: ${rescued_pct}% rescued after Phase 3 (>99% threshold)"
+  log "Skipping phases 4-7 (diminishing returns)"
+  log "Total time: $elapsed hours"
+  log "======================================"
+  exit 0  # Exit with code 0 (success)
+fi
+
+# Bailout if disk is likely dead (≤25% rescued after aggressive scraping)
+if (( $(echo "$rescued_pct <= 25" | bc -l) )); then
+  elapsed=$(( ($(date +%s) - START_TIME) / 3600 ))
+  log "======================================"
+  log "LIKELY-DEAD: Only ${rescued_pct}% rescued after Phase 3 (≤25% threshold)"
+  log "Disk appears severely damaged, skipping phases 4-7"
+  log "Total time: $elapsed hours"
+  log "======================================"
+  exit 1  # Exit with code 1 (partial rescue)
+fi
+
+log "Rescued ${rescued_pct}% after Phase 3 (26-99%), continuing to Phase 4..."
 
 # ---------- PHASE 4: Reverse Scraping ----------
 run_phase 4 "Reverse scraping (4 retries, backwards)" \

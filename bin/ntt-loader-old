@@ -1,18 +1,12 @@
 #!/usr/bin/env bash
 # Author: PB, Claude, and Kimi
-# Date: 2025-10-05
+# Date: 2025-01-02
 # License: (c) HRDAG, 2025, GPL-2 or newer
 #
 # ------
-# ntt/bin/ntt-loader-partitioned
+# ntt/bin/ntt-loader
 #
-# NTT loader with partition support – streaming .raw (034/NUL) → Postgres partitioned tables
-#
-# Key differences from ntt-loader:
-#   - Auto-creates partition for new medium_hash before INSERT
-#   - Dramatically faster dedupe phase (empty partition = zero ON CONFLICT overhead)
-#
-# Expected performance: bb22 (11.2M paths) ~5min COPY + ~30sec dedupe = ~6min total
+# NTT loader – streaming .raw (034/NUL) → Postgres
 set -euo pipefail
 
 FILE=${1:?file.raw required}
@@ -39,24 +33,6 @@ fail() {
   log error "{\"msg\": \"$1\"}"
   exit 1
 }
-
-# ---------- 0. auto-create partition for this medium ----------
-echo "[$(date -Iseconds)] Creating partition for medium $MEDIUM_HASH..." >&2
-log partition_check "{\"medium_hash\": \"$MEDIUM_HASH\"}"
-
-# Use first 8 chars of medium_hash for partition name
-PARTITION_SUFFIX="${MEDIUM_HASH:0:8}"
-
-# Auto-create partitions (IF NOT EXISTS makes this idempotent)
-sudo -u "${SUDO_USER:-$USER}" psql "$DB_URL" -c "
-CREATE TABLE IF NOT EXISTS inode_p_${PARTITION_SUFFIX}
-    PARTITION OF inode FOR VALUES IN ('$MEDIUM_HASH');
-
-CREATE TABLE IF NOT EXISTS path_p_${PARTITION_SUFFIX}
-    PARTITION OF path FOR VALUES IN ('$MEDIUM_HASH');
-" || fail "Failed to create partitions for medium $MEDIUM_HASH"
-
-echo "[$(date -Iseconds)] Partition ready (inode_p_${PARTITION_SUFFIX}, path_p_${PARTITION_SUFFIX})" >&2
 
 # ---------- 1. create working table ----------
 TABLE_NAME="tmp_path_$$"
@@ -144,7 +120,7 @@ SELECT '$MEDIUM_HASH', dev, ino, nlink, size, mtime, path
 FROM $TEMP_TABLE;
 " || fail "Failed to transfer data to working table"
 
-# Create indexes on working table for fast deduplication operations
+# Create indexes on working table for fast GROUP BY operations
 echo "[$(date -Iseconds)] Creating indexes on working table..." >&2
 sudo -u "${SUDO_USER:-$USER}" psql "$DB_URL" -c "
 CREATE INDEX idx_${TABLE_NAME}_ino ON $TABLE_NAME(ino);
@@ -166,27 +142,23 @@ INSERT INTO medium (medium_hash, added_at)
 VALUES ('$MEDIUM_HASH', now())
 ON CONFLICT DO NOTHING;
 
--- Clear any existing data for this medium (loads are always fresh/complete)
--- DELETE directly from partition to avoid locking all partitions
--- (DELETE on parent table locks all partitions even with WHERE clause)
-DELETE FROM path_p_${PARTITION_SUFFIX};
-DELETE FROM inode_p_${PARTITION_SUFFIX};
-
 -- inode rows: Use DISTINCT ON instead of GROUP BY with MAX
 -- DISTINCT ON is faster and correct since inode metadata is identical for hardlinks
--- No ON CONFLICT needed - partition is now empty (DELETE above)
+-- Profiled: 3.69s vs 3.98s on 11.2M rows (1.08x faster)
 INSERT INTO inode (medium_hash,dev,ino,nlink,size,mtime)
 SELECT DISTINCT ON (medium_hash, ino)
        '$MEDIUM_HASH' as medium_hash, dev, ino, nlink, size, mtime
 FROM   $TABLE_NAME
-ORDER BY medium_hash, ino;
+ORDER BY medium_hash, ino
+ON CONFLICT (medium_hash,ino) DO NOTHING;
 
 -- path rows: Direct SELECT (no GROUP BY needed - verified zero duplicate ino,path pairs)
 -- Convert Latin1 text to bytea to preserve exact bytes from filesystem
--- No ON CONFLICT needed - partition is now empty (DELETE above)
+-- Profiled: 3.15s vs 6.91s on 11.2M rows (2.19x faster)
 INSERT INTO path (medium_hash,dev,ino,path)
 SELECT '$MEDIUM_HASH' as medium_hash, dev, ino, convert_to(path, 'LATIN1')
-FROM   $TABLE_NAME;
+FROM   $TABLE_NAME
+ON CONFLICT (medium_hash,ino,path) DO NOTHING;
 " || fail "Failed to deduplicate into final tables"
 
 # ---------- 4. cleanup and summary ----------

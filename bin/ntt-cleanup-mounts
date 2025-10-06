@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# Author: PB and Claude
+# Date: 2025-10-05
+# License: (c) HRDAG, 2025, GPL-2 or newer
+#
+# ------
+# ntt/bin/ntt-cleanup-mounts
+#
+# Periodic cleanup of mounted NTT disk images
+# Unmounts images where all inodes have been successfully copied
+# Run via cron (e.g., hourly)
+
+set -euo pipefail
+
+DB_URL="${NTT_DB_URL:-postgres:///copyjob}"
+MOUNT_ROOT="/mnt/ntt"
+IDLE_HOURS="${NTT_CLEANUP_IDLE_HOURS:-1}"  # Unmount after 1 hour of idle time
+
+# Wrapper for psql that handles running as root
+psql_as_user() {
+  local db_user="${PGUSER:-${SUDO_USER:-$USER}}"
+  if [[ $EUID -eq 0 ]] && [[ -n "$db_user" ]] && [[ "$db_user" != "root" ]]; then
+    sudo -u "$db_user" psql "$@"
+  else
+    psql "$@"
+  fi
+}
+
+# Check if all inodes for a medium are copied
+all_inodes_copied() {
+  local medium_hash="$1"
+
+  local result=$(psql_as_user "$DB_URL" -t -A -c "
+    SELECT CASE
+      WHEN COUNT(*) FILTER (WHERE NOT copied) = 0 THEN 'true'
+      ELSE 'false'
+    END
+    FROM inode
+    WHERE medium_hash = '$medium_hash'
+  " 2>/dev/null || echo "false")
+
+  [[ "$result" == "true" ]]
+}
+
+# Check if mount is older than N hours
+mount_older_than() {
+  local mount_point="$1"
+  local hours="$2"
+
+  if [[ ! -d "$mount_point" ]]; then
+    return 1  # Not mounted
+  fi
+
+  # Get mount time from /proc/mounts
+  local mount_time
+  mount_time=$(stat -c %Y "$mount_point" 2>/dev/null || echo 0)
+  local current_time=$(date +%s)
+  local age_hours=$(( (current_time - mount_time) / 3600 ))
+
+  [[ $age_hours -ge $hours ]]
+}
+
+# Main cleanup loop
+cleanup_mounts() {
+  if [[ ! -d "$MOUNT_ROOT" ]]; then
+    echo "[$(date -Iseconds)] Mount root $MOUNT_ROOT does not exist, nothing to clean"
+    exit 0
+  fi
+
+  local cleaned=0
+  local kept=0
+
+  for mount_point in "$MOUNT_ROOT"/*; do
+    [[ -d "$mount_point" ]] || continue
+
+    local medium_hash=$(basename "$mount_point")
+
+    # Validate hash format
+    if [[ ! "$medium_hash" =~ ^[a-f0-9]{16,64}$ ]]; then
+      echo "[$(date -Iseconds)] Skipping invalid hash: $medium_hash"
+      continue
+    fi
+
+    # Check if still mounted
+    if ! findmnt "$mount_point" >/dev/null 2>&1; then
+      echo "[$(date -Iseconds)] $medium_hash: Not mounted, removing empty directory"
+      rmdir "$mount_point" 2>/dev/null || true
+      continue
+    fi
+
+    # Check if all inodes copied
+    if all_inodes_copied "$medium_hash"; then
+      # Check if mount is old enough
+      if mount_older_than "$mount_point" "$IDLE_HOURS"; then
+        echo "[$(date -Iseconds)] $medium_hash: All inodes copied and idle >$IDLE_HOURS hours, unmounting..."
+        if ntt-mount-helper unmount "$medium_hash" 2>/dev/null; then
+          echo "[$(date -Iseconds)] $medium_hash: Successfully unmounted"
+          ((cleaned++))
+        else
+          echo "[$(date -Iseconds)] $medium_hash: Failed to unmount" >&2
+        fi
+      else
+        echo "[$(date -Iseconds)] $medium_hash: All copied but recently accessed, keeping mounted"
+        ((kept++))
+      fi
+    else
+      echo "[$(date -Iseconds)] $medium_hash: Copying in progress, keeping mounted"
+      ((kept++))
+    fi
+  done
+
+  echo "[$(date -Iseconds)] Cleanup complete: unmounted=$cleaned, kept=$kept"
+}
+
+# Run cleanup
+cleanup_mounts

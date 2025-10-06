@@ -203,9 +203,12 @@ class CopyWorker:
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
         
-        logger.info(f"Worker {self.worker_id} initialized", 
+        logger.info(f"Worker {self.worker_id} initialized",
                    limit=self.limit, dry_run=self.dry_run, sample_size=self.sample_size)
-    
+
+        # Track which media we've already ensured are mounted (cache to avoid repeated checks)
+        self._mounted_media = set()
+
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals gracefully."""
         logger.info(f"Received signal {signum}, shutting down...")
@@ -236,7 +239,17 @@ class CopyWorker:
                 continue
             
             consecutive_no_work = 0  # Reset on successful claim
-            
+
+            # Ensure medium is mounted before processing
+            medium_hash = work_unit['inode_row']['medium_hash']
+            try:
+                self.ensure_medium_mounted(medium_hash)
+            except Exception as e:
+                logger.error(f"Failed to ensure mount for {medium_hash}: {e}")
+                self.release_claim(work_unit['inode_row'], error_msg=f"Mount failed: {str(e)[:100]}")
+                self.stats['errors'] += 1
+                continue
+
             logger.info(f"Processing work unit ino={work_unit['inode_row']['ino']}")
             self.process_work_unit(work_unit)
             self.processed_count += 1
@@ -294,6 +307,64 @@ class CopyWorker:
                     WHERE m.health = 'ok'
                 """)
             return cur.fetchone()['count']
+
+    def get_image_path(self, medium_hash: str) -> Optional[str]:
+        """Get image path for a medium from database."""
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                SELECT image_path
+                FROM medium
+                WHERE medium_hash = %s
+            """, (medium_hash,))
+            result = cur.fetchone()
+            return result['image_path'] if result else None
+
+    def ensure_medium_mounted(self, medium_hash: str) -> str:
+        """Ensure medium is mounted, mount if needed.
+
+        Returns mount path or raises exception if cannot mount.
+        Uses cache to avoid repeated filesystem checks for same medium.
+        """
+        # Check cache first
+        if medium_hash in self._mounted_media:
+            return f"/mnt/ntt/{medium_hash}"
+
+        mount_point = f"/mnt/ntt/{medium_hash}"
+
+        # Check if already mounted using findmnt
+        result = subprocess.run(['findmnt', mount_point],
+                              capture_output=True, text=True)
+
+        if result.returncode == 0:
+            # Already mounted
+            self._mounted_media.add(medium_hash)
+            logger.info(f"Medium {medium_hash} already mounted at {mount_point}")
+            return mount_point
+
+        # Not mounted - need to mount it
+        logger.info(f"Medium {medium_hash} not mounted, attempting to mount...")
+
+        # Get image path from database
+        image_path = self.get_image_path(medium_hash)
+        if not image_path:
+            raise Exception(f"No image_path in database for medium {medium_hash}")
+
+        if not Path(image_path).exists():
+            raise Exception(f"Image file not found: {image_path}")
+
+        # Mount via helper (requires sudo)
+        try:
+            subprocess.run(['sudo', 'ntt-mount-helper', 'mount',
+                          medium_hash, image_path],
+                         check=True, capture_output=True, text=True)
+
+            self._mounted_media.add(medium_hash)
+            logger.info(f"Successfully mounted {medium_hash} at {mount_point}")
+            return mount_point
+
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Failed to mount {medium_hash}: {e.stderr}")
+            raise Exception(f"Mount failed for {medium_hash}: {e.stderr}")
 
     def fetch_and_claim_work_unit(self) -> Optional[dict]:
         """

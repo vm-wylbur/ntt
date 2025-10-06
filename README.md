@@ -10,7 +10,7 @@
 3. set env (edit ~/.config/ntt/ntt.env)
 ```
    export NTT_DB_URL="postgres:///copyjob"
-   export NTT_IMAGE_ROOT="/data/fast/images"
+   export NTT_IMAGE_ROOT="/data/fast/img"
    export NTT_RAW_ROOT="/data/fast/raw"
    export NTT_DST_ROOT="/data/cold/dst"
    export NTT_LOG_JSON="/var/log/ntt/orchestrator.jsonl"
