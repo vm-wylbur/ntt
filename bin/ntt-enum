@@ -51,17 +51,18 @@ if [[ -n "$IGNORE_PATTERNS" && -f "$IGNORE_PATTERNS" ]]; then
   # Build extended regex from patterns file (skip comments and empty lines)
   PATTERNS=$(grep -v '^#' "$IGNORE_PATTERNS" | grep -v '^[[:space:]]*$' | paste -sd '|')
   if [[ -n "$PATTERNS" ]]; then
-    log filter_enabled "{\"patterns_file\": \"$IGNORE_PATTERNS\", \"patterns\": \"$PATTERNS\"}"
+    log filter_enabled "{\"patterns_file\": \"$IGNORE_PATTERNS\"}"
     # Filter out paths matching any pattern (grep -v inverts, -z for null-terminated)
     FILTER_CMD="grep -zv -E '$PATTERNS'"
   fi
 fi
 
-# %m fs-type, %D dev, %i ino, %n nlink, %s size, %Ts mtime-epoch-seconds, %p path
+# %y file type, %D dev, %i ino, %n nlink, %s size, %Ts mtime-epoch-seconds, %p path
+# File types: f=file, d=dir, l=symlink, b=block, c=char, p=fifo, s=socket
 # Suppress find errors (inaccessible paths, corrupted filenames) - we skip those files
 # Disable pipefail temporarily because pv can exit non-zero on broken pipe which is normal
 set +e
-find "$MNT" -xdev -printf '%m\034%D\034%i\034%n\034%s\034%Ts\034%p\0' 2>/dev/null \
+find "$MNT" -xdev -printf '%y\034%D\034%i\034%n\034%s\034%Ts\034%p\0' 2>/dev/null \
 | eval "$FILTER_CMD" \
 | tee >(tr -cd '\0' | wc -c > /tmp/ntt-count-$$) \
 | pv -0 -l -f \
@@ -72,7 +73,9 @@ set -e
 sleep 1
 
 # Check if we got output - if we have rows, it worked regardless of exit codes
-ROWS=$(cat /tmp/ntt-count-$$ 2>/dev/null || echo 0)
+ROWS=$(cat /tmp/ntt-count-$$ 2>/dev/null || echo "0")
+# Ensure ROWS is a number (default to 0 if empty or non-numeric)
+ROWS=${ROWS:-0}
 rm -f /tmp/ntt-count-$$ 2>/dev/null || true
 
 if [ "$ROWS" -gt 0 ] && [ -f "$OUT" ]; then

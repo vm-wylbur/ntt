@@ -142,18 +142,21 @@ def validate_destination_filesystem():
 
 class CopyWorker:
     """NTT copy worker using Claim-Analyze-Execute pattern."""
-    
-    def __init__(self, worker_id: str, db_url: str, limit: int = 0,
-                 dry_run: bool = False, sample_size: int = 1000,
-                 medium_hashes: Optional[list[str]] = None):
+
+    def __init__(self, worker_id: str, db_url: str, medium_hash: str, limit: int = 0,
+                 dry_run: bool = False, batch_size: int = 100):
         self.worker_id = worker_id
         self.db_url = db_url
+        self.medium_hash = medium_hash
         self.limit = limit
         self.dry_run = dry_run
-        self.sample_size = sample_size
-        self.medium_hashes = medium_hashes
+        self.batch_size = batch_size
         self.shutdown = False
         self.processed_count = 0
+
+        # Validate medium_hash is provided
+        if not medium_hash:
+            raise ValueError("medium_hash is required")
 
         # Validate destination filesystem before doing anything
         validate_destination_filesystem()
@@ -163,9 +166,9 @@ class CopyWorker:
         self.NVME_TMP = Path(os.environ.get('NTT_NVME_TMP', '/data/fast/tmp'))
         self.BY_HASH_ROOT = Path(os.environ.get('NTT_BY_HASH_ROOT', '/data/cold/by-hash'))
         self.ARCHIVE_ROOT = Path(os.environ.get('NTT_ARCHIVE_ROOT', '/data/cold/archived'))
-        
+
         logger.info(f"Worker {self.worker_id} paths: by-hash={self.BY_HASH_ROOT}, archive={self.ARCHIVE_ROOT}")
-        
+
         # Stats
         self.stats = {
             'copied': 0,
@@ -173,7 +176,7 @@ class CopyWorker:
             'errors': 0,
             'bytes': 0,
         }
-        
+
         # Database connection
         self.conn = psycopg.connect(self.db_url, row_factory=dict_row, autocommit=False)
 
@@ -195,16 +198,26 @@ class CopyWorker:
                 # Include 'public' so extensions like tsm_system_rows are accessible
                 cur.execute(f"SET search_path = {search_path}, public")
             self.conn.commit()
-        
+
         # MIME type detector (reused across files)
         self.mime_detector = magic.Magic(mime=True)
-        
+
+        # Calculate max_id for this medium (used for random probe strategy)
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                SELECT MAX(id) FROM inode WHERE medium_hash = %s
+            """, (self.medium_hash,))
+            result = cur.fetchone()
+            self.max_id = result['max'] if result and result['max'] else 0
+
+        logger.info(f"Worker {self.worker_id} max_id for medium {self.medium_hash}: {self.max_id}")
+
         # Setup signal handlers
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
-        
+
         logger.info(f"Worker {self.worker_id} initialized",
-                   limit=self.limit, dry_run=self.dry_run, sample_size=self.sample_size)
+                   limit=self.limit, dry_run=self.dry_run, batch_size=self.batch_size)
 
         # Track which media we've already ensured are mounted (cache to avoid repeated checks)
         self._mounted_media = set()
@@ -213,100 +226,48 @@ class CopyWorker:
         """Handle shutdown signals gracefully."""
         logger.info(f"Received signal {signum}, shutting down...")
         self.shutdown = True
-    
+
     def run(self):
-        """Main worker loop."""
-        logger.info(f"Worker {self.worker_id} starting")
-        
+        """Main worker loop - batch processing mode."""
+        logger.info(f"Worker {self.worker_id} starting (batch mode, batch_size={self.batch_size})")
+
+        # Ensure medium is mounted before starting
+        try:
+            self.ensure_medium_mounted(self.medium_hash)
+        except Exception as e:
+            logger.error(f"Failed to ensure mount for {self.medium_hash}: {e}")
+            raise
+
+        # One-time startup check for inodes that exceeded max retries
+        self.mark_max_retries_exceeded()
+
         consecutive_no_work = 0
-        max_no_work_attempts = 10  # Check for exhaustion after 10 failed claims
-        
+        max_no_work_attempts = 3  # Exit after 3 consecutive empty batches
+
         while not self.shutdown:
-            work_unit = self.fetch_and_claim_work_unit()
-            if not work_unit:
+            # Process one batch
+            batch_processed = self.process_batch()
+
+            if not batch_processed:
                 consecutive_no_work += 1
-                
-                # If we have medium_hashes filter and consistently finding no work,
-                # check if work is truly exhausted for our media
-                if self.medium_hashes and consecutive_no_work >= max_no_work_attempts:
-                    if self.check_media_exhausted():
-                        logger.info(f"No remaining work for assigned media, exiting")
-                        break
-                    consecutive_no_work = 0  # Reset counter, work exists but claim race
-                
+
+                if consecutive_no_work >= max_no_work_attempts:
+                    logger.info(f"No work found after {max_no_work_attempts} attempts, exiting")
+                    break
+
                 logger.debug("No work available, waiting...")
-                time.sleep(0.01)  # 10ms - fast retry on claim race
-                continue
-            
-            consecutive_no_work = 0  # Reset on successful claim
-
-            # Ensure medium is mounted before processing
-            medium_hash = work_unit['inode_row']['medium_hash']
-            try:
-                self.ensure_medium_mounted(medium_hash)
-            except Exception as e:
-                logger.error(f"Failed to ensure mount for {medium_hash}: {e}")
-                self.release_claim(work_unit['inode_row'], error_msg=f"Mount failed: {str(e)[:100]}")
-                self.stats['errors'] += 1
+                time.sleep(0.1)  # 100ms between batch attempts
                 continue
 
-            logger.info(f"Processing work unit ino={work_unit['inode_row']['ino']}")
-            self.process_work_unit(work_unit)
-            self.processed_count += 1
-            logger.info(f"Completed work unit, processed_count={self.processed_count}")
-            
+            consecutive_no_work = 0  # Reset on successful batch
+
+            # Check limit (limit is in inodes processed, not batches)
             if self.limit > 0 and self.processed_count >= self.limit:
                 logger.info(f"Limit reached: {self.limit}")
                 break
-        
+
         logger.info(f"Worker {self.worker_id} finished", stats=self.stats)
         self.conn.close()
-    
-    def check_media_exhausted(self) -> bool:
-        """
-        Check if there are any unclaimed inodes left for our assigned media.
-        (Health checked at startup via ntt-copy-workers)
-
-        Returns:
-            True if no work remains, False if work still exists
-        """
-        with self.conn.cursor() as cur:
-            cur.execute("""
-                SELECT EXISTS(
-                    SELECT 1 FROM inode i
-                    WHERE i.copied = false
-                      AND i.claimed_by IS NULL
-                      AND i.medium_hash = ANY(%s)
-                      AND EXISTS (
-                        SELECT 1 FROM path p
-                        WHERE (p.medium_hash, p.ino) = (i.medium_hash, i.ino)
-                          AND p.exclude_reason IS NULL
-                      )
-                    LIMIT 1
-                )
-            """, (self.medium_hashes,))
-            result = cur.fetchone()
-            work_exists = result['exists'] if result else False
-            return not work_exists
-    
-    def get_queue_depth(self) -> int:
-        """Get fast queue depth from materialized counter (respects medium_hashes filter).
-        Reads from queue_stats table maintained by triggers - instant lookup."""
-        with self.conn.cursor() as cur:
-            if self.medium_hashes:
-                cur.execute("""
-                    SELECT COALESCE(SUM(unclaimed_count), 0)::int as count
-                    FROM queue_stats
-                    WHERE medium_hash = ANY(%s)
-                """, (self.medium_hashes,))
-            else:
-                cur.execute("""
-                    SELECT COALESCE(SUM(unclaimed_count), 0)::int as count
-                    FROM queue_stats qs
-                    JOIN medium m ON qs.medium_hash = m.medium_hash
-                    WHERE m.health = 'ok'
-                """)
-            return cur.fetchone()['count']
 
     def get_image_path(self, medium_hash: str) -> Optional[str]:
         """Get image path for a medium from database."""
@@ -332,6 +293,7 @@ class CopyWorker:
         mount_point = f"/mnt/ntt/{medium_hash}"
 
         # Check if already mounted using findmnt
+        # First try the direct path
         result = subprocess.run(['findmnt', mount_point],
                               capture_output=True, text=True)
 
@@ -340,6 +302,18 @@ class CopyWorker:
             self._mounted_media.add(medium_hash)
             logger.info(f"Medium {medium_hash} already mounted at {mount_point}")
             return mount_point
+
+        # If mount_point is a symlink, check if the target is mounted
+        if Path(mount_point).is_symlink():
+            real_path = str(Path(mount_point).resolve())
+            result = subprocess.run(['findmnt', real_path],
+                                  capture_output=True, text=True)
+
+            if result.returncode == 0:
+                # Target is mounted
+                self._mounted_media.add(medium_hash)
+                logger.info(f"Medium {medium_hash} symlink target already mounted at {real_path}")
+                return mount_point
 
         # Not mounted - need to mount it
         logger.info(f"Medium {medium_hash} not mounted, attempting to mount...")
@@ -354,7 +328,7 @@ class CopyWorker:
 
         # Mount via helper (requires sudo)
         try:
-            subprocess.run(['sudo', 'ntt-mount-helper', 'mount',
+            subprocess.run(['sudo', '/home/pball/projects/ntt/bin/ntt-mount-helper', 'mount',
                           medium_hash, image_path],
                          check=True, capture_output=True, text=True)
 
@@ -366,147 +340,363 @@ class CopyWorker:
             logger.error(f"Failed to mount {medium_hash}: {e.stderr}")
             raise Exception(f"Mount failed for {medium_hash}: {e.stderr}")
 
-    def fetch_and_claim_work_unit(self) -> Optional[dict]:
+    def mark_max_retries_exceeded(self):
         """
-        Atomically claim one inode with all its paths.
+        One-time startup check: mark inodes with >= 5 errors as permanently failed.
 
-        Uses adaptive sampling:
-        - TABLESAMPLE for large queues (>50K) - fast random sampling
-        - Direct query for small queues (<=50K) - handles sparse long-tail
-
-        Returns:
-            {'inode_row': {...}, 'paths': ['/path1', ...]} or None
+        This prevents them from being claimed by workers. Runs once at startup,
+        not on every batch (that would scan millions of rows constantly).
         """
-        # Build WHERE clause for medium_hash filter
-        medium_filter = ""
-        if self.medium_hashes:
-            medium_filter = "AND medium_hash = ANY(%(medium_hashes)s)"
-
-        # Check queue depth every 100 claims to decide sampling strategy
-        if not hasattr(self, '_queue_depth_cache'):
-            self._queue_depth_cache = None
-            self._queue_depth_check_counter = 0
-
-        self._queue_depth_check_counter += 1
-        if self._queue_depth_check_counter >= 1000 or self._queue_depth_cache is None:
-            self._queue_depth_cache = self.get_queue_depth()
-            self._queue_depth_check_counter = 0
-            logger.debug(f"Queue depth: {self._queue_depth_cache}")
-
-        # Adaptive query selection based on queue depth
-        if self._queue_depth_cache <= 5000:
-            # Small queue: use direct query with ORDER BY RANDOM()
-            # Fast for small tables (~1-2ms), reliable hit rate
-            claim_query = f"""
-                WITH candidate AS (
-                    SELECT i.medium_hash, i.ino
-                    FROM inode i
-                    WHERE i.copied = false
-                      AND i.claimed_by IS NULL
-                      {medium_filter}
-                      AND EXISTS (
-                        SELECT 1 FROM path p
-                        WHERE (p.medium_hash, p.ino) = (i.medium_hash, i.ino)
-                          AND p.exclude_reason IS NULL
-                      )
-                    ORDER BY RANDOM()
-                    LIMIT 1
-                    FOR UPDATE OF i SKIP LOCKED
-                ),
-                claimed AS (
-                    UPDATE inode i
-                    SET claimed_by = %(worker_id)s, claimed_at = NOW()
-                    FROM candidate c
-                    WHERE (i.medium_hash, i.ino) = (c.medium_hash, c.ino)
-                    RETURNING i.*
-                )
-                SELECT c.*,
-                       (SELECT array_agg(p.path)
-                        FROM path p
-                        WHERE (p.medium_hash, p.ino) = (c.medium_hash, c.ino)
-                          AND p.exclude_reason IS NULL) as paths
-                FROM claimed c;
-            """
-        else:
-            # Large queue: use TABLESAMPLE for performance
-            # TABLESAMPLE hybrid: sample from entire table FIRST, then filter
-            # This is fast because TABLESAMPLE operates at block level before any filtering
-            claim_query = f"""
-                WITH sampled AS (
-                    SELECT i.medium_hash, i.ino
-                    FROM inode i
-                    TABLESAMPLE SYSTEM_ROWS(%(sample_size)s)
-                    WHERE i.copied = false
-                      AND i.claimed_by IS NULL
-                      AND EXISTS (
-                        SELECT 1 FROM path p
-                        WHERE (p.medium_hash, p.ino) = (i.medium_hash, i.ino)
-                          AND p.exclude_reason IS NULL
-                      )
-                    ORDER BY RANDOM()
-                    LIMIT 100
-                ),
-                filtered AS (
-                    SELECT medium_hash, ino
-                    FROM sampled
-                    {medium_filter.replace('AND', 'WHERE') if medium_filter else ''}
-                    LIMIT 1
-                ),
-                locked_row AS (
-                    SELECT f.medium_hash, f.ino
-                    FROM filtered f
-                    JOIN inode i ON (i.medium_hash, i.ino) = (f.medium_hash, f.ino)
-                    FOR UPDATE OF i SKIP LOCKED
-                ),
-                claimed AS (
-                    UPDATE inode i
-                    SET claimed_by = %(worker_id)s, claimed_at = NOW()
-                    FROM locked_row lr
-                    WHERE (i.medium_hash, i.ino) = (lr.medium_hash, lr.ino)
-                    RETURNING i.*
-                )
-                SELECT c.*,
-                       (SELECT array_agg(p.path)
-                        FROM path p
-                        WHERE (p.medium_hash, p.ino) = (c.medium_hash, c.ino)
-                          AND p.exclude_reason IS NULL) as paths
-                FROM claimed c;
-            """
-
-        params = {
-            'worker_id': self.worker_id,
-            'sample_size': self.sample_size
-        }
-        if self.medium_hashes:
-            params['medium_hashes'] = self.medium_hashes
-
-        import time
-        t0 = time.time()
+        logger.info(f"Checking for inodes with max retries exceeded...")
 
         with self.conn.cursor() as cur:
-            t1 = time.time()
-            cur.execute(claim_query, params)
-            t2 = time.time()
-            row = cur.fetchone()
-            t3 = time.time()
+            cur.execute("""
+                UPDATE inode
+                SET copied = true, claimed_by = 'MAX_RETRIES_EXCEEDED'
+                WHERE medium_hash = %s
+                  AND copied = false
+                  AND claimed_by IS NULL
+                  AND array_length(errors, 1) >= 5
+                RETURNING id, ino, errors
+            """, (self.medium_hash,))
 
-        self.conn.commit()  # Auto-commit the claim
-        t4 = time.time()
+            exceeded = cur.fetchall()
+            if exceeded:
+                for row in exceeded:
+                    last_error = row['errors'][-1] if row['errors'] else 'unknown'
+                    logger.error(f"PERMANENTLY FAILED ino={row['ino']} after {len(row['errors'])} errors: {last_error}")
+                logger.info(f"Marked {len(exceeded)} inodes as MAX_RETRIES_EXCEEDED")
+            else:
+                logger.info(f"No inodes exceeded max retries")
 
-        if (t4 - t0) > 0.05:  # Log if > 50ms
-            logger.warning(f"Slow claim: total={((t4-t0)*1000):.1f}ms execute={((t2-t1)*1000):.1f}ms fetch={((t3-t2)*1000):.1f}ms commit={((t4-t3)*1000):.1f}ms")
+            self.conn.commit()
 
-        if not row:
-            logger.debug("No work claimed (either no candidates or claim race lost)")
+    def fetch_and_claim_batch(self) -> Optional[list[dict]]:
+        """
+        Atomically claim a batch of inodes using random ID probe strategy.
+
+        Tries 3 random probes (id >= random_start), then falls back to sequential scan.
+        This avoids partition sampling issues with TABLESAMPLE on partitioned tables.
+
+        Returns:
+            List of claimed inode dicts, or None if no work available
+        """
+        import random
+
+        # CRITICAL: UPDATE WHERE clause uses composite PK (medium_hash, ino) for partition pruning
+        # Using WHERE i.id = c.id would scan ALL partitions (~7000ms)
+        # Using WHERE (i.medium_hash, i.ino) = (c.medium_hash, c.ino) enables runtime partition
+        # pruning - PostgreSQL can determine target partition from CTE rows (~13ms)
+        # Performance: 500x faster (verified 2025-10-07 via EXPLAIN ANALYZE)
+        claim_query_with_probe = """
+            WITH candidate AS (
+                SELECT medium_hash, ino, dev, size, mtime, nlink, id
+                FROM inode
+                WHERE medium_hash = %s
+                  AND copied = false
+                  AND claimed_by IS NULL
+                  AND id >= %s
+                ORDER BY id
+                LIMIT %s
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE inode i
+            SET claimed_by = %s, claimed_at = NOW()
+            FROM candidate c
+            WHERE (i.medium_hash, i.ino) = (c.medium_hash, c.ino)
+            RETURNING i.*;
+        """
+
+        # Same partition pruning optimization as above (composite PK for runtime pruning)
+        claim_query_sequential = """
+            WITH candidate AS (
+                SELECT medium_hash, ino, dev, size, mtime, nlink, id
+                FROM inode
+                WHERE medium_hash = %s
+                  AND copied = false
+                  AND claimed_by IS NULL
+                ORDER BY id
+                LIMIT %s
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE inode i
+            SET claimed_by = %s, claimed_at = NOW()
+            FROM candidate c
+            WHERE (i.medium_hash, i.ino) = (c.medium_hash, c.ino)
+            RETURNING i.*;
+        """
+
+        claimed_inodes = None
+
+        t0 = time.time()
+
+        # Try 3 random probes
+        for attempt in range(3):
+            start_id = random.randint(0, self.max_id) if self.max_id > 0 else 0
+
+            with self.conn.cursor() as cur:
+                cur.execute(claim_query_with_probe,
+                           (self.medium_hash, start_id, self.batch_size, self.worker_id))
+                claimed_inodes = cur.fetchall()
+
+            if claimed_inodes:
+                logger.debug(f"Claimed {len(claimed_inodes)} inodes on probe attempt {attempt + 1}")
+                break
+
+        # Fallback: sequential scan (cleanup phase)
+        if not claimed_inodes:
+            with self.conn.cursor() as cur:
+                cur.execute(claim_query_sequential,
+                           (self.medium_hash, self.batch_size, self.worker_id))
+                claimed_inodes = cur.fetchall()
+
+            if claimed_inodes:
+                logger.debug(f"Claimed {len(claimed_inodes)} inodes via sequential fallback")
+
+        # NOTE: Do NOT commit here - locks must be held until entire batch is processed
+        # Commit happens at end of process_batch() after all updates
+
+        t1 = time.time()
+        if claimed_inodes and (t1 - t0) > 0.05:  # Log if > 50ms
+            logger.warning(f"Slow batch claim: {((t1-t0)*1000):.1f}ms for {len(claimed_inodes)} inodes")
+
+        if not claimed_inodes:
+            logger.debug("No work claimed")
             return None
 
-        logger.debug(f"Claimed inode ino={row['ino']}, paths={len(row.get('paths', []))}")
+        return claimed_inodes
 
-        inode_row = dict(row)
-        paths = inode_row.pop('paths', [])
+    def process_inode_for_batch(self, work_unit: dict) -> Optional[str]:
+        """
+        Process one inode for batch mode - does filesystem operations, returns blob_id.
+        Does NOT update database (that's done in batch).
 
-        return {'inode_row': inode_row, 'paths': paths}
-    
+        Returns blob_id on success, None on failure.
+        """
+        inode_row = work_unit['inode_row']
+        temp_file_path = None
+
+        try:
+            # PHASE 1: ANALYSIS
+            plan = self.analyze_inode(work_unit)
+            temp_file_path = plan.get('temp_file_path')
+
+            if plan['action'] == 'skip':
+                logger.debug(f"Skipping inode ino={inode_row['ino']}, reason={plan['reason']}")
+                return None
+
+            if self.dry_run:
+                logger.debug(f"[DRY-RUN] Would process ino={inode_row['ino']}, action={plan['action']}")
+                return None
+
+            # PHASE 2: FILESYSTEM OPERATIONS ONLY (no DB update)
+            if plan['action'] == 'copy_new_file':
+                self.execute_copy_new_file_fs(plan)
+            elif plan['action'] == 'link_existing_file':
+                self.execute_link_existing_file_fs(plan)
+            elif plan['action'] == 'handle_empty_file':
+                self.execute_empty_file_fs(plan)
+            elif plan['action'] == 'create_directory':
+                self.execute_directory_fs(plan)
+            elif plan['action'] == 'create_symlink':
+                self.execute_symlink_fs(plan)
+            elif plan['action'] == 'record_special':
+                pass  # No filesystem work, no blob_id needed
+
+            # Return blob_id (if applicable)
+            blob_id = plan.get('blobid')
+            if blob_id:
+                self.stats['bytes'] += inode_row.get('size', 0)
+
+            return blob_id
+
+        except Exception as e:
+            logger.warning(f"Failed to process inode ino={inode_row['ino']}: {e}")
+            return None
+
+        finally:
+            # Cleanup temp file
+            if temp_file_path and temp_file_path.exists():
+                temp_file_path.unlink(missing_ok=True)
+
+    def process_batch(self) -> bool:
+        """
+        Process one batch of inodes with timeout protection.
+
+        Returns True if work was processed, False if no work available.
+        """
+        try:
+            with self.conn.cursor() as cur:
+                # Set timeout for this transaction (auto-resets after commit/rollback)
+                cur.execute("SET LOCAL statement_timeout = '5min'")
+
+                # 1. Claim batch
+                claimed_inodes = self.fetch_and_claim_batch()
+                if not claimed_inodes:
+                    return False  # No work
+
+                logger.info(f"Claimed batch of {len(claimed_inodes)} inodes")
+
+                # 2. Get paths for all inodes in batch
+                inos = [row['ino'] for row in claimed_inodes]
+                cur.execute("""
+                    SELECT medium_hash, ino, path
+                    FROM path
+                    WHERE medium_hash = %s AND ino = ANY(%s)
+                      AND exclude_reason IS NULL
+                """, (self.medium_hash, inos))
+                paths_rows = cur.fetchall()
+
+                # Group paths by (medium_hash, ino)
+                paths_by_inode = {}
+                for path_row in paths_rows:
+                    key = (path_row['medium_hash'], path_row['ino'])
+                    if key not in paths_by_inode:
+                        paths_by_inode[key] = []
+                    paths_by_inode[key].append(path_row['path'])
+
+                logger.debug(f"Retrieved {len(paths_rows)} paths for {len(paths_by_inode)} inodes")
+
+                # 3. Process each inode (file I/O - if >5min, transaction aborts)
+                results_by_inode = {}  # {(medium_hash, ino): blob_id or None}
+
+                for inode_row in claimed_inodes:
+                    key = (inode_row['medium_hash'], inode_row['ino'])
+                    paths = paths_by_inode.get(key, [])
+
+                    if not paths:
+                        logger.warning(f"No paths found for inode {key}, skipping")
+                        results_by_inode[key] = None
+                        continue
+
+                    # Create work_unit in old format for process_work_unit
+                    work_unit = {
+                        'inode_row': dict(inode_row),
+                        'paths': paths
+                    }
+
+                    try:
+                        # Process this inode (copy file, dedupe, etc.) WITHOUT db update
+                        blob_id = self.process_inode_for_batch(work_unit)
+                        results_by_inode[key] = blob_id
+                    except Exception as e:
+                        error_type = type(e).__name__
+                        error_msg = str(e)[:200]  # Truncate long messages
+                        logger.error(f"Error processing inode {key}: {error_type}: {error_msg}")
+                        results_by_inode[key] = {
+                            'error_type': error_type,
+                            'error_msg': error_msg
+                        }
+
+                # 4. Build update arrays
+                # For paths table
+                medium_hashes, inos_for_paths, blob_ids = [], [], []
+                for (mh, ino), blob_id in results_by_inode.items():
+                    if blob_id:  # Only update if we have a blob_id
+                        medium_hashes.append(mh)
+                        inos_for_paths.append(ino)
+                        blob_ids.append(blob_id)
+
+                # For inode table - separate success and failures
+                success_ids, success_blob_ids = [], []
+                failed_inodes = []  # List of {id, ino, error_type, error_msg}
+
+                for inode_row in claimed_inodes:
+                    key = (inode_row['medium_hash'], inode_row['ino'])
+                    result = results_by_inode.get(key)
+
+                    if result and isinstance(result, str):
+                        # Success: result is blob_id string
+                        success_ids.append(inode_row['id'])
+                        success_blob_ids.append(result)
+                    elif result and isinstance(result, dict):
+                        # Failure: result is error info dict
+                        failed_inodes.append({
+                            'id': inode_row['id'],
+                            'ino': inode_row['ino'],
+                            'error_type': result['error_type'],
+                            'error_msg': result['error_msg']
+                        })
+                    else:
+                        # No result (shouldn't happen, but handle gracefully)
+                        failed_inodes.append({
+                            'id': inode_row['id'],
+                            'ino': inode_row['ino'],
+                            'error_type': 'UnknownError',
+                            'error_msg': 'No result returned'
+                        })
+
+                # 5. Batch update both tables
+                import time
+                t_start = time.time()
+
+                if medium_hashes:
+                    t0 = time.time()
+                    cur.execute("""
+                        UPDATE path SET blobid = updates.blob_id
+                        FROM unnest(%s::bigint[], %s::text[])
+                             AS updates(ino, blob_id)
+                        WHERE path.medium_hash = %s
+                          AND path.ino = updates.ino
+                          AND path.exclude_reason IS NULL
+                    """, (inos_for_paths, blob_ids, self.medium_hash))
+                    t1 = time.time()
+                    logger.info(f"TIMING: UPDATE path: {t1-t0:.3f}s for {len(medium_hashes)} paths")
+
+                if success_ids:
+                    t2 = time.time()
+                    cur.execute("""
+                        UPDATE inode SET copied = true, blobid = updates.blob_id
+                        FROM unnest(%s::bigint[], %s::text[]) AS updates(id, blob_id)
+                        WHERE inode.id = updates.id
+                          AND inode.medium_hash = %s
+                    """, (success_ids, success_blob_ids, self.medium_hash))
+                    t3 = time.time()
+                    logger.info(f"TIMING: UPDATE inode (success): {t3-t2:.3f}s for {len(success_ids)} inodes")
+
+                if failed_inodes:
+                    t4 = time.time()
+                    # Update each failed inode with error tracking
+                    for f in failed_inodes:
+                        error_entry = f"{f['error_type']}: {f['error_msg']}"
+                        cur.execute("""
+                            UPDATE inode
+                            SET claimed_by = NULL,
+                                claimed_at = NULL,
+                                errors = array_append(errors, %s::text)
+                            WHERE id = %s
+                        """, (error_entry, f['id']))
+
+                        # Log each error clearly
+                        logger.warning(f"Failed inode id={f['id']} ino={f['ino']}: {f['error_type']}: {f['error_msg']}")
+
+                    t5 = time.time()
+                    logger.info(f"TIMING: UPDATE inode (failed): {t5-t4:.3f}s for {len(failed_inodes)} inodes")
+
+                # 6. Commit
+                t6 = time.time()
+                self.conn.commit()
+                t7 = time.time()
+                t_total = t7 - t_start
+                logger.info(f"TIMING: commit: {t7-t6:.3f}s, total_db_ops: {t_total:.3f}s")
+                logger.info(f"Completed batch: {len(success_ids)} copied, {len(failed_inodes)} failed")
+
+                # Update stats
+                self.stats['copied'] += len(success_ids)
+                self.stats['errors'] += len(failed_inodes)
+                self.processed_count += len(success_ids)
+
+                return True
+
+        except psycopg.errors.QueryCanceled:
+            logger.warning("Batch processing exceeded 5min timeout, transaction aborted")
+            self.conn.rollback()
+            return False
+        except Exception as e:
+            logger.error(f"Batch processing error: {e}")
+            self.conn.rollback()
+            return False
+
     def release_claim(self, inode_row: dict, error_msg: str = None):
         """Release claim on an inode after error.
 
@@ -588,42 +778,42 @@ class CopyWorker:
             """, (claimed_by, inode_row['medium_hash'], inode_row['ino']))
         self.conn.commit()
         logger.info(f"Marked inode as EXCLUDED: ino={inode_row['ino']}, reason={reason or 'all_paths_excluded'}")
-    
+
     def process_work_unit(self, work_unit: dict):
         """Process one work unit through Claim-Analyze-Execute."""
         plan = None
         temp_file_path = None
         inode_row = work_unit['inode_row']
-        
+
         try:
             # PHASE 1: ANALYSIS (read-only, no locks)
             plan = self.analyze_inode(work_unit)
             temp_file_path = plan.get('temp_file_path')
-            
+
             logger.info(f"Analysis complete: action={plan['action']}, ino={inode_row['ino']}")
-            
+
             if plan['action'] == 'skip':
                 logger.warning(f"Skipping inode ino={inode_row['ino']}, reason={plan['reason']}")
                 self.release_claim(inode_row)
                 return
-            
+
             if self.dry_run:
-                logger.info("[DRY-RUN] Would execute", 
+                logger.info("[DRY-RUN] Would execute",
                            action=plan['action'],
                            ino=inode_row['ino'],
                            paths=len(work_unit['paths']))
                 self.release_claim(inode_row)
                 return
-            
+
             # PHASE 2: EXECUTION (filesystem first, then DB)
             logger.info(f"Starting execution: action={plan['action']}, ino={inode_row['ino']}")
             self.execute_plan(plan)
-            
+
             logger.info(f"Work unit completed: action={plan['action']}, ino={inode_row['ino']}")
-            logger.debug("Work unit completed", 
+            logger.debug("Work unit completed",
                         ino=inode_row['ino'],
                         action=plan['action'])
-        
+
         except AnalysisError as e:
             logger.error(f"Analysis failed ino={inode_row['ino']}, error={e}", exc_info=True)
 
@@ -667,28 +857,28 @@ class CopyWorker:
             error_type = type(e).__name__
             self.release_claim(inode_row, error_msg=f"{error_type}: {str(e)[:100]}")
             self.stats['errors'] += 1
-        
+
         finally:
             # Cleanup temp file
             if temp_file_path and temp_file_path.exists():
                 temp_file_path.unlink(missing_ok=True)
-    
+
     # ========================================
     # PHASE 1: ANALYSIS FUNCTIONS
     # ========================================
-    
+
     def analyze_inode(self, work_unit: dict) -> dict:
         """Analyze an inode and create execution plan."""
         inode_row = work_unit['inode_row']
         paths = work_unit['paths']
         source_path = strategies.sanitize_path(paths[0])  # Use first path for analysis
-        
+
         fs_type = inode_row.get('fs_type')
         if not fs_type:
             fs_type = strategies.detect_fs_type(source_path)
             if not fs_type:
                 return {'action': 'skip', 'reason': 'Cannot detect fs_type'}
-        
+
         # Strategy dispatch
         if fs_type == 'f':
             return self.analyze_file(work_unit, source_path)
@@ -700,12 +890,15 @@ class CopyWorker:
             return self.analyze_special(work_unit, fs_type)
         else:
             return {'action': 'skip', 'reason': f'Unknown fs_type: {fs_type}'}
-    
+
     def analyze_file(self, work_unit: dict, source_path: Path) -> dict:
         """Analyze regular file - copy to temp and hash."""
+        import time
+        t0 = time.time()
+
         inode_row = work_unit['inode_row']
         size = inode_row['size']
-        
+
         # Empty file special case
         if size == 0:
             return {
@@ -715,23 +908,33 @@ class CopyWorker:
                 'inode_row': inode_row,
                 'mime_type': 'application/x-empty'
             }
-        
+
         # Copy to temp and hash
         temp_path = self.get_temp_path(inode_row)
         try:
+            t1 = time.time()
             strategies.copy_file_to_temp(source_path, temp_path, size)
+            t2 = time.time()
             hash_value = strategies.hash_file(temp_path)
+            t3 = time.time()
+            logger.info(f"TIMING: copy={t2-t1:.3f}s hash={t3-t2:.3f}s size={size}")
         except Exception as e:
             if temp_path.exists():
                 temp_path.unlink()
             raise AnalysisError(f"Failed to copy/hash: {e}")
-        
+
         # Detect MIME type
+        t4 = time.time()
         mime_type = strategies.detect_mime_type(self.mime_detector, source_path)
-        
+        t5 = time.time()
+        logger.info(f"TIMING: mime={t5-t4:.3f}s")
+
         # Check if blob already exists (deduplication)
+        t6 = time.time()
         blob_exists = self.check_blob_exists(hash_value)
-        
+        t7 = time.time()
+        logger.info(f"TIMING: blob_check={t7-t6:.3f}s total={t7-t0:.3f}s")
+
         if blob_exists:
             temp_path.unlink()  # No longer needed
             return {
@@ -750,7 +953,7 @@ class CopyWorker:
                 'inode_row': inode_row,
                 'mime_type': mime_type
             }
-    
+
     def analyze_directory(self, work_unit: dict) -> dict:
         """Analyze directory."""
         return {
@@ -758,21 +961,21 @@ class CopyWorker:
             'paths': work_unit['paths'],
             'inode_row': work_unit['inode_row']
         }
-    
+
     def analyze_symlink(self, work_unit: dict, source_path: Path) -> dict:
         """Analyze symlink."""
         try:
             target = strategies.read_symlink_target(source_path)
         except Exception as e:
             raise AnalysisError(f"Failed to read symlink: {e}")
-        
+
         return {
             'action': 'create_symlink',
             'target': target,
             'paths': work_unit['paths'],
             'inode_row': work_unit['inode_row']
         }
-    
+
     def analyze_special(self, work_unit: dict, fs_type: str) -> dict:
         """Analyze special file (block/char device, pipe, socket)."""
         return {
@@ -780,35 +983,35 @@ class CopyWorker:
             'fs_type': fs_type,
             'inode_row': work_unit['inode_row']
         }
-    
+
     def get_temp_path(self, inode_row: dict) -> Path:
         """Get temporary file path for an inode."""
         size = inode_row['size']
         ino = inode_row['ino']
-        
+
         if size < 100 * 1024 * 1024:  # < 100MB: use per-worker tmpfs
             base = self.RAMDISK / self.worker_id
         else:  # >= 100MB: use NVME
             base = self.NVME_TMP
-        
+
         base.mkdir(parents=True, exist_ok=True)
         return base / f"{ino}.tmp"
-    
+
     def check_blob_exists(self, hash_value: str) -> bool:
         """Check if a blob already exists."""
         with self.conn.cursor() as cur:
             cur.execute("SELECT 1 FROM blobs WHERE blobid = %s", (hash_value,))
             return cur.fetchone() is not None
-    
+
     # ========================================
     # PHASE 2: EXECUTION FUNCTIONS
     # ========================================
-    
+
     def execute_plan(self, plan: dict):
         """Execute plan - filesystem first, then database transaction."""
-        
+
         by_hash_created_by_this_worker = False
-        
+
         # ========================================
         # STEP 1: FILESYSTEM (outside transaction)
         # ========================================
@@ -817,27 +1020,27 @@ class CopyWorker:
                 logger.info(f"Calling execute_copy_new_file_fs for ino={plan['inode_row']['ino']}")
                 by_hash_created_by_this_worker = self.execute_copy_new_file_fs(plan)
                 logger.info(f"execute_copy_new_file_fs returned: {by_hash_created_by_this_worker}")
-            
+
             elif plan['action'] == 'link_existing_file':
                 self.execute_link_existing_file_fs(plan)
-            
+
             elif plan['action'] == 'handle_empty_file':
                 self.execute_empty_file_fs(plan)
-            
+
             elif plan['action'] == 'create_directory':
                 self.execute_directory_fs(plan)
-            
+
             elif plan['action'] == 'create_symlink':
                 self.execute_symlink_fs(plan)
-            
+
             elif plan['action'] == 'record_special':
                 pass  # No filesystem work
-        
+
         except (OSError, PermissionError) as e:
             # Filesystem failure - release claim for retry
             self.release_claim(plan['inode_row'])
             raise ExecutionError(f"Filesystem failed: {e}")
-        
+
         # ========================================
         # STEP 2: DATABASE (atomic transaction)
         # ========================================
@@ -852,44 +1055,44 @@ class CopyWorker:
                         len(plan['paths_to_link']),
                         plan.get('mime_type')
                     )
-                
+
                 elif plan['action'] == 'create_directory':
                     self.update_db_for_directory(plan['inode_row'])
-                
+
                 elif plan['action'] == 'create_symlink':
                     self.update_db_for_symlink(plan['inode_row'])
-                
+
                 elif plan['action'] == 'record_special':
                     self.update_db_for_special(plan['inode_row'], plan['fs_type'])
-            
+
             # Explicit commit (transaction context should auto-commit, but being explicit)
             self.conn.commit()
             logger.info(f"DB transaction committed for ino={plan['inode_row']['ino']}")
-        
+
         except Exception as e:
             # DB failure - filesystem is correct, claim stays set
             # Next run will fix DB state
             logger.error(f"DB transaction failed: {e}", exc_info=True)
             raise ExecutionError(f"Database failed: {e}")
-        
+
         # Update stats
         self.update_stats(plan, by_hash_created_by_this_worker)
-    
+
     def execute_copy_new_file_fs(self, plan: dict) -> bool:
         """Filesystem operations for new file. Returns True if we created by-hash."""
         hash_val = plan['blobid']
         hash_path = self.BY_HASH_ROOT / hash_val[:2] / hash_val[2:4] / hash_val
         temp_file = plan['temp_file_path']
-        
+
         logger.info(f"execute_copy_new_file_fs: temp={temp_file}, exists={temp_file.exists()}, hash_path={hash_path}")
-        
+
         try:
             hash_path.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
             logger.info(f"Created parent dir: {hash_path.parent}")
         except Exception as e:
             logger.error(f"Failed to create parent dir {hash_path.parent}: {e}")
             raise
-        
+
         try:
             # Atomic move
             shutil.move(str(temp_file), str(hash_path))
@@ -903,39 +1106,45 @@ class CopyWorker:
         except Exception as e:
             logger.error(f"Failed to move {temp_file} to {hash_path}: {e}")
             raise
-        
+
         # Create hardlinks (idempotent)
-        strategies.create_hardlinks_idempotent(
-            hash_path, 
-            plan['paths_to_link'],
-            self.ARCHIVE_ROOT
-        )
-        
-        return by_hash_created
-    
-    def execute_link_existing_file_fs(self, plan: dict):
-        """Filesystem operations for deduplicated file."""
-        hash_val = plan['blobid']
-        hash_path = self.BY_HASH_ROOT / hash_val[:2] / hash_val[2:4] / hash_val
-        
         strategies.create_hardlinks_idempotent(
             hash_path,
             plan['paths_to_link'],
             self.ARCHIVE_ROOT
         )
-    
+
+        return by_hash_created
+
+    def execute_link_existing_file_fs(self, plan: dict):
+        """Filesystem operations for deduplicated file."""
+        import time
+        t0 = time.time()
+
+        hash_val = plan['blobid']
+        hash_path = self.BY_HASH_ROOT / hash_val[:2] / hash_val[2:4] / hash_val
+
+        strategies.create_hardlinks_idempotent(
+            hash_path,
+            plan['paths_to_link'],
+            self.ARCHIVE_ROOT
+        )
+
+        t1 = time.time()
+        logger.info(f"TIMING: create_hardlinks n_paths={len(plan['paths_to_link'])} time={t1-t0:.3f}s")
+
     def execute_empty_file_fs(self, plan: dict):
         """Filesystem operations for empty file."""
         hash_path = self.BY_HASH_ROOT / plan['blobid'][:2] / plan['blobid'][2:4] / plan['blobid']
         hash_path.parent.mkdir(parents=True, exist_ok=True)
         hash_path.touch(exist_ok=True)
-        
+
         strategies.create_hardlinks_idempotent(
             hash_path,
             plan['paths_to_link'],
             self.ARCHIVE_ROOT
         )
-    
+
     def execute_directory_fs(self, plan: dict):
         """Filesystem operations for directory."""
         for path_bytes in plan['paths']:
@@ -945,7 +1154,7 @@ class CopyWorker:
             if not archive_path.exists():
                 archive_path.mkdir(parents=True, exist_ok=True, mode=0o755)
                 strategies.ensure_directory_ownership(archive_path, self.ARCHIVE_ROOT)
-    
+
     def execute_symlink_fs(self, plan: dict):
         """Filesystem operations for symlink."""
         target = plan['target']
@@ -959,11 +1168,11 @@ class CopyWorker:
                     archive_path.symlink_to(target)
                 except FileExistsError:
                     pass  # Race with another worker
-    
+
     # ========================================
     # DATABASE UPDATE FUNCTIONS
     # ========================================
-    
+
     def update_db_for_file(self, inode_row, hash_val, by_hash_created, num_links, mime_type):
         """Single atomic DB transaction for file."""
         with self.conn.cursor() as cur:
@@ -980,14 +1189,14 @@ class CopyWorker:
                 WHERE medium_hash = %s AND ino = %s
             """, (hash_val, by_hash_created, mime_type,
                   inode_row['medium_hash'], inode_row['ino']))
-            
+
             # Update path.blobid for all paths of this inode
             cur.execute("""
                 UPDATE path
                 SET blobid = %s
                 WHERE medium_hash = %s AND ino = %s
             """, (hash_val, inode_row['medium_hash'], inode_row['ino']))
-            
+
             # Upsert blob (atomic increment)
             cur.execute("""
                 INSERT INTO blobs (blobid, n_hardlinks)
@@ -995,7 +1204,7 @@ class CopyWorker:
                 ON CONFLICT (blobid) DO UPDATE
                 SET n_hardlinks = blobs.n_hardlinks + EXCLUDED.n_hardlinks
             """, (hash_val, num_links))
-    
+
     def update_db_for_directory(self, inode_row):
         """Update DB for directory."""
         with self.conn.cursor() as cur:
@@ -1009,7 +1218,7 @@ class CopyWorker:
                     claimed_at = NULL
                 WHERE medium_hash = %s AND ino = %s
             """, (inode_row['medium_hash'], inode_row['ino']))
-    
+
     def update_db_for_symlink(self, inode_row):
         """Update DB for symlink."""
         with self.conn.cursor() as cur:
@@ -1023,7 +1232,7 @@ class CopyWorker:
                     claimed_at = NULL
                 WHERE medium_hash = %s AND ino = %s
             """, (inode_row['medium_hash'], inode_row['ino']))
-    
+
     def update_db_for_special(self, inode_row, fs_type):
         """Update DB for special file."""
         mime_type = {
@@ -1032,7 +1241,7 @@ class CopyWorker:
             'p': 'inode/fifo',
             's': 'inode/socket'
         }.get(fs_type, 'inode/special')
-        
+
         with self.conn.cursor() as cur:
             cur.execute("""
                 UPDATE inode
@@ -1045,7 +1254,7 @@ class CopyWorker:
                 WHERE medium_hash = %s AND ino = %s
             """, (mime_type,
                   inode_row['medium_hash'], inode_row['ino']))
-    
+
     def update_stats(self, plan: dict, by_hash_created: bool):
         """Update worker statistics."""
         if plan['action'] in ['copy_new_file', 'link_existing_file', 'handle_empty_file']:
@@ -1058,55 +1267,56 @@ class CopyWorker:
 
 @app.command()
 def main(
+    medium_hash: str = typer.Option(..., "--medium-hash", "-m", help="Medium hash to process (required)"),
     limit: int = typer.Option(0, "--limit", "-l", help="Process at most N inodes (0 = unlimited)"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Log actions without making changes"),
-    sample_size: int = typer.Option(1000, "--sample-size", help="TABLESAMPLE size for work selection"),
+    batch_size: int = typer.Option(100, "--batch-size", "-b", help="Number of inodes to claim per batch"),
     worker_id: str = typer.Option(None, "--worker-id", help="Worker ID (defaults to w{pid})"),
-    medium_hashes: str = typer.Option(None, "--medium-hashes", help="Comma-separated medium_hashes to restrict worker to"),
 ):
     """
-    NTT Copy Worker - Deduplicates and archives filesystem content.
-    
-    Must run as root/sudo: sudo -E ntt-copier.py [options]
+    NTT Copy Worker - Deduplicates and archives filesystem content (batch mode).
+
+    Must run as root/sudo: sudo -E ntt-copier.py --medium-hash=<hash> [options]
     """
-    
+
     # Setup logging
     logger.remove()  # Remove default handler
     logger.add(sys.stderr, level="INFO")
-    
+
+    # CRITICAL: Must run as root to read all files from mounted images
+    if os.geteuid() != 0:
+        logger.error("ERROR: ntt-copier must run as root/sudo")
+        logger.error("Run with: sudo bin/ntt-copier.py --medium-hash=<hash> [options]")
+        sys.exit(1)
+
     # Set PostgreSQL user to original user when running under sudo
     if 'SUDO_USER' in os.environ:
         os.environ['PGUSER'] = os.environ['SUDO_USER']
-    
+
     # Get database URL
     db_url = os.environ.get('NTT_DB_URL', 'postgresql:///copyjob')
     if os.geteuid() == 0 and 'SUDO_USER' in os.environ:
         if '://' in db_url and '@' not in db_url:
             db_url = db_url.replace(':///', f"://{os.environ['SUDO_USER']}@localhost/")
-    
-    logger.info("NTT Copier starting", 
-                limit=limit, 
+
+    logger.info("NTT Copier starting (batch mode)",
+                medium_hash=medium_hash,
+                limit=limit,
                 dry_run=dry_run,
-                sample_size=sample_size)
-    
+                batch_size=batch_size)
+
     # Single worker mode (this process is one worker)
     # Use provided worker_id or default to w{pid}
     if worker_id is None:
         worker_id = f'w{os.getpid()}'
-    
-    # Parse medium_hashes if provided
-    medium_hash_list = None
-    if medium_hashes:
-        medium_hash_list = [h.strip() for h in medium_hashes.split(',')]
-        logger.info(f"Restricting to {len(medium_hash_list)} media")
-    
+
     worker = CopyWorker(
         worker_id=worker_id,
         db_url=db_url,
+        medium_hash=medium_hash,
         limit=limit,
         dry_run=dry_run,
-        sample_size=sample_size,
-        medium_hashes=medium_hash_list
+        batch_size=batch_size
     )
     worker.run()
 
