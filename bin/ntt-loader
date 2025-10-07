@@ -206,6 +206,19 @@ ORDER BY medium_hash, ino;
 INSERT INTO path (medium_hash,dev,ino,path)
 SELECT '$MEDIUM_HASH' as medium_hash, dev, ino, convert_to(path, 'LATIN1')
 FROM   $TABLE_NAME;
+
+-- Initialize queue_stats for this medium (faster than triggers for bulk load)
+-- Copier workers check queue_stats to determine TABLESAMPLE vs ORDER BY RANDOM() strategy
+INSERT INTO queue_stats (medium_hash, unclaimed_count, total_count)
+SELECT
+  '$MEDIUM_HASH',
+  COUNT(*) FILTER (WHERE copied = false AND claimed_by IS NULL),
+  COUNT(*)
+FROM inode_p_${PARTITION_SUFFIX}
+ON CONFLICT (medium_hash) DO UPDATE
+SET unclaimed_count = EXCLUDED.unclaimed_count,
+    total_count = EXCLUDED.total_count,
+    last_updated = NOW();
 " || fail "Failed to deduplicate into final tables"
 
 # ---------- 4. cleanup and summary ----------

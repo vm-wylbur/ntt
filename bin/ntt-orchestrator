@@ -423,7 +423,7 @@ run_loader() {
   local raw="$2"
 
   log loader_spawn "{\"raw\": \"$raw\"}"
-  ntt-loader "$raw" "$medium_hash"
+  /home/pball/projects/ntt/bin/ntt-loader "$raw" "$medium_hash"
 }
 
 run_copy_workers() {
@@ -636,7 +636,7 @@ handle_load_only_mode() {
   log load_only_start "{\"raw_file\": \"$raw_file\", \"medium_hash\": \"$medium_hash\"}"
 
   # Run loader directly (no enum, no copy workers)
-  ntt-loader "$raw_file" "$medium_hash"
+  /home/pball/projects/ntt/bin/ntt-loader "$raw_file" "$medium_hash"
 
   log load_only_done "{\"medium_hash\": \"$medium_hash\", \"exit\": 0}"
 }
