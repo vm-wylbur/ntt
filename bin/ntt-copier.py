@@ -525,6 +525,9 @@ class CopyWorker:
 
         Returns True if work was processed, False if no work available.
         """
+        import time
+        t_batch_start = time.time()
+
         try:
             with self.conn.cursor() as cur:
                 # Set timeout for this transaction (auto-resets after commit/rollback)
@@ -537,7 +540,20 @@ class CopyWorker:
 
                 logger.info(f"Claimed batch of {len(claimed_inodes)} inodes")
 
+                # Calculate size distribution for this batch
+                size_dist = {
+                    '<1KB': sum(1 for r in claimed_inodes if r['size'] < 1024),
+                    '1-10KB': sum(1 for r in claimed_inodes if 1024 <= r['size'] < 10240),
+                    '10-100KB': sum(1 for r in claimed_inodes if 10240 <= r['size'] < 102400),
+                    '100KB-1MB': sum(1 for r in claimed_inodes if 102400 <= r['size'] < 1048576),
+                    '1-10MB': sum(1 for r in claimed_inodes if 1048576 <= r['size'] < 10485760),
+                    '>10MB': sum(1 for r in claimed_inodes if r['size'] >= 10485760),
+                }
+                total_size_mb = sum(r['size'] for r in claimed_inodes) / 1024 / 1024
+                logger.info(f"BATCH SIZE_DIST: {size_dist} total_mb={total_size_mb:.1f}")
+
                 # 2. Get paths for all inodes in batch
+                t_fetch_start = time.time()
                 inos = [row['ino'] for row in claimed_inodes]
                 cur.execute("""
                     SELECT medium_hash, ino, path
@@ -546,6 +562,7 @@ class CopyWorker:
                       AND exclude_reason IS NULL
                 """, (self.medium_hash, inos))
                 paths_rows = cur.fetchall()
+                t_fetch_end = time.time()
 
                 # Group paths by (medium_hash, ino)
                 paths_by_inode = {}
@@ -558,7 +575,10 @@ class CopyWorker:
                 logger.debug(f"Retrieved {len(paths_rows)} paths for {len(paths_by_inode)} inodes")
 
                 # 3. Process each inode (file I/O - if >5min, transaction aborts)
+                t_process_start = time.time()
                 results_by_inode = {}  # {(medium_hash, ino): blob_id or None}
+                action_counts = {}  # Track action types
+                size_by_action = {}  # Track bytes per action
 
                 for inode_row in claimed_inodes:
                     key = (inode_row['medium_hash'], inode_row['ino'])
@@ -577,6 +597,14 @@ class CopyWorker:
 
                     try:
                         # Process this inode (copy file, dedupe, etc.) WITHOUT db update
+                        # Also get the plan to track action type
+                        plan = self.analyze_inode(work_unit)
+                        action = plan.get('action', 'unknown')
+
+                        # Track action and size
+                        action_counts[action] = action_counts.get(action, 0) + 1
+                        size_by_action[action] = size_by_action.get(action, 0) + inode_row.get('size', 0)
+
                         blob_id = self.process_inode_for_batch(work_unit)
                         results_by_inode[key] = blob_id
                     except Exception as e:
@@ -587,8 +615,12 @@ class CopyWorker:
                             'error_type': error_type,
                             'error_msg': error_msg
                         }
+                        action_counts['error'] = action_counts.get('error', 0) + 1
+
+                t_process_end = time.time()
 
                 # 4. Build update arrays
+                t_build_start = time.time()
                 # For paths table
                 medium_hashes, inos_for_paths, blob_ids = [], [], []
                 for (mh, ino), blob_id in results_by_inode.items():
@@ -626,9 +658,10 @@ class CopyWorker:
                             'error_msg': 'No result returned'
                         })
 
+                t_build_end = time.time()
+
                 # 5. Batch update both tables
-                import time
-                t_start = time.time()
+                t_db_start = time.time()
 
                 if medium_hashes:
                     t0 = time.time()
@@ -677,8 +710,26 @@ class CopyWorker:
                 t6 = time.time()
                 self.conn.commit()
                 t7 = time.time()
-                t_total = t7 - t_start
-                logger.info(f"TIMING: commit: {t7-t6:.3f}s, total_db_ops: {t_total:.3f}s")
+                t_db_total = t7 - t_db_start
+                logger.info(f"TIMING: commit: {t7-t6:.3f}s, total_db_ops: {t_db_total:.3f}s")
+
+                t_batch_end = time.time()
+                t_batch_total = t_batch_end - t_batch_start
+
+                # Comprehensive batch summary
+                logger.info(f"TIMING_BATCH: "
+                           f"total={t_batch_total:.3f}s "
+                           f"fetch_paths={t_fetch_end-t_fetch_start:.3f}s "
+                           f"process_files={t_process_end-t_process_start:.3f}s "
+                           f"build_arrays={t_build_end-t_build_start:.3f}s "
+                           f"db_ops={t_db_total:.3f}s")
+
+                logger.info(f"BATCH_ACTIONS: {action_counts}")
+
+                # Log size per action in MB
+                size_by_action_mb = {k: v/1024/1024 for k, v in size_by_action.items()}
+                logger.info(f"BATCH_SIZE_BY_ACTION_MB: {size_by_action_mb}")
+
                 logger.info(f"Completed batch: {len(success_ids)} copied, {len(failed_inodes)} failed")
 
                 # Update stats

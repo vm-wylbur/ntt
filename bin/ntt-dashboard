@@ -223,9 +223,9 @@ class ThroughputGraph(PlotextPlot):
         x_labels[-1] = "now"  # Rightmost is "now"
         self.plt.xticks(list(range(WINDOW_SIZE)), x_labels)
 
-        # Fixed Y-axis: 0 to 3500 with 3 labels only
-        self.plt.ylim(0, 3500)
-        self.plt.yticks([0, 1750, 3500], ["0", "1750", "3500"])
+        # Fixed Y-axis: 0 to 10000 with 3 labels only
+        self.plt.ylim(0, 10000)
+        self.plt.yticks([0, 5000, 10000], ["0", "5000", "10000"])
         self.plt.yfrequency(0)  # Disable auto ticks
 
         # Styling (no title for more vertical space)
