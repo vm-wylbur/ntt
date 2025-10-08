@@ -692,11 +692,16 @@ class CopyWorker:
                     result = results_by_inode.get(key)
 
                     if result and isinstance(result, str):
-                        # Success: result is blob_id string
+                        # Success: result is blob_id string (regular files)
                         success_ids.append(inode_row['id'])
                         success_blob_ids.append(result)
+                    elif result is None:
+                        # Success: no blob_id needed (directories, symlinks, special files)
+                        success_ids.append(inode_row['id'])
+                        success_blob_ids.append(None)
                     elif result and isinstance(result, dict):
                         # Failure: result is error info dict
+                        # FIXME: Missing medium_hash in dict - causes all-partition scan in UPDATE below (line ~750)
                         failed_inodes.append({
                             'id': inode_row['id'],
                             'ino': inode_row['ino'],
@@ -704,12 +709,13 @@ class CopyWorker:
                             'error_msg': result['error_msg']
                         })
                     else:
-                        # No result (shouldn't happen, but handle gracefully)
+                        # Truly unknown result type (shouldn't happen)
+                        # FIXME: Missing medium_hash in dict - causes all-partition scan in UPDATE below (line ~750)
                         failed_inodes.append({
                             'id': inode_row['id'],
                             'ino': inode_row['ino'],
                             'error_type': 'UnknownError',
-                            'error_msg': 'No result returned'
+                            'error_msg': f'Unexpected result type: {type(result)}'
                         })
 
                 t_build_end = time.time()
@@ -746,6 +752,9 @@ class CopyWorker:
                     # Update each failed inode with error tracking
                     for f in failed_inodes:
                         error_entry = f"{f['error_type']}: {f['error_msg']}"
+                        # FIXME: WHERE clause missing medium_hash (partition key)
+                        # This causes PostgreSQL to scan all 36 partitions, acquiring 482 locks
+                        # Can hang for 1+ hours. Need: WHERE id = %s AND medium_hash = %s
                         cur.execute("""
                             UPDATE inode
                             SET claimed_by = NULL,
