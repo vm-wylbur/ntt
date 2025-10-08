@@ -187,11 +187,15 @@ CREATE INDEX idx_${TABLE_NAME}_ino_path ON $TABLE_NAME(ino, path);
 echo "[$(date -Iseconds)] Deduplicating into final tables..." >&2
 log dedupe_start "{\"medium_hash\": \"$MEDIUM_HASH\"}"
 
+# Capture start time for performance monitoring
+DEDUPE_START=$(date +%s)
+
 sudo -u "${SUDO_USER:-$USER}" psql "$DB_URL" -c "
 -- Performance tuning for bulk load
 SET work_mem = '256MB';
 SET maintenance_work_mem = '1GB';
 SET synchronous_commit = OFF;
+SET statement_timeout = '5min';  -- Prevent indefinite hangs
 
 -- medium row (if new) - use known medium_hash instead of scanning table
 INSERT INTO medium (medium_hash, added_at)
@@ -273,7 +277,17 @@ ON CONFLICT (medium_hash) DO UPDATE
 SET unclaimed_count = EXCLUDED.unclaimed_count,
     total_count = EXCLUDED.total_count,
     last_updated = NOW();
+
+-- Ensure fresh statistics for query planner (prevents first-query planning issues)
+ANALYZE inode_p_${PARTITION_SUFFIX};
+ANALYZE path_p_${PARTITION_SUFFIX};
 " || fail "Failed to deduplicate into final tables"
+
+# Log deduplication performance
+DEDUPE_END=$(date +%s)
+DEDUPE_DURATION=$((DEDUPE_END - DEDUPE_START))
+echo "[$(date -Iseconds)] Deduplication completed in ${DEDUPE_DURATION}s" >&2
+log dedupe_complete "{\"duration_sec\": $DEDUPE_DURATION, \"medium_hash\": \"$MEDIUM_HASH\"}"
 
 # Count excluded inodes (those with ALL paths excluded)
 EXCLUDED_INODES=$(sudo -u "${SUDO_USER:-$USER}" psql "$DB_URL" -t -A -c "

@@ -226,11 +226,37 @@ Mark complete → Archive → Done
 
 ## 9. Always Archive Everything
 
-Even corrupted/unreadable disks should be archived:
+Even corrupted/unreadable disks should be archived.
+
+**Files to archive for each ${HASH}:**
+- `${HASH}.img` - Disk image
+- `${HASH}.map` - ddrescue map file (current state)
+- `${HASH}.map.bak` - ddrescue map backup
+- `${HASH}.map.stall` - ddrescue stall detection
+- `${HASH}-ddrescue.log` - ddrescue log file
+
+**IMPORTANT**: Use explicit file list, NOT wildcards like `${HASH}.*` which will miss `-ddrescue.log`
+
 ```bash
+# Archive all files for a disk (CORRECT METHOD)
 cd /data/fast/img
-sudo tar -I 'zstd -T0' -cvf /data/cold/img-read/${HASH}.tar.zst ${HASH}*
-sudo rm ${HASH}*
+HASH="f95834a4b718f54edc7b549ca854aef8"  # example
+
+sudo tar -I 'zstd -T0' -cvf /data/cold/img-read/${HASH}.tar.zst \
+  ${HASH}.img \
+  ${HASH}.map \
+  ${HASH}.map.bak \
+  ${HASH}.map.stall \
+  ${HASH}-ddrescue.log
+
+# Verify archive contents
+sudo tar -I 'zstd -d' -tvf /data/cold/img-read/${HASH}.tar.zst
+
+# Mark as complete in database
+psql -d copyjob -c "UPDATE medium SET copy_done = NOW() WHERE medium_hash = '${HASH}'"
+
+# Remove source files from fast storage
+sudo rm ${HASH}.img ${HASH}.map ${HASH}.map.bak ${HASH}.map.stall ${HASH}-ddrescue.log
 ```
 
 **Rationale**: Preservation of disk image even if unreadable now - may have recovery techniques later.
