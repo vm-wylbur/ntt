@@ -165,35 +165,78 @@ def read_symlink_target(symlink_path: Path) -> str:
     return os.readlink(symlink_path)
 
 
-def create_hardlinks_idempotent(hash_path: Path, paths_to_link: list[str], 
+def filter_longest_paths(paths: list[str]) -> set[str]:
+    """
+    Filter to keep only the longest (leaf) paths, removing ancestor directories.
+
+    Since mkdir(parents=True) creates all ancestors automatically, we only need
+    to create the deepest directories. This reduces redundant syscalls.
+
+    Args:
+        paths: List of directory path strings
+
+    Returns:
+        Set of leaf directory paths (those with no children in the input set)
+    """
+    sorted_paths = sorted(paths)
+    result = []
+
+    for i, path in enumerate(sorted_paths):
+        # Check if any subsequent path has this as a directory prefix
+        is_prefix = False
+        for j in range(i + 1, len(sorted_paths)):
+            # Lexicographic sorting means once we don't match prefix, we're done
+            if not sorted_paths[j].startswith(path):
+                break
+            # Check if it's a proper directory prefix (not just string prefix)
+            if sorted_paths[j].startswith(path + '/'):
+                is_prefix = True
+                break
+
+        if not is_prefix:
+            result.append(path)
+
+    return set(result)
+
+
+def create_hardlinks_idempotent(hash_path: Path, paths_to_link: list[str],
                                 archive_root: Path) -> int:
     """
     Idempotently create hardlinks for a list of paths.
-    
+
     This function is designed to be safely re-runnable. It will:
     - Create parent directories as needed (mode 0o755)
     - Create hardlinks for paths that don't exist
     - Replace paths that exist but aren't hardlinked to the correct by-hash inode
     - Ignore FileExistsError from concurrent workers
-    
+
+    Performance optimization: Batch directory creation by filtering to leaf
+    directories only (those with no children). mkdir(parents=True) on leaves
+    creates all ancestors automatically, reducing syscalls from O(n*depth) to O(leaves*depth).
+
     Args:
         hash_path: Path to by-hash file (link source)
         paths_to_link: List of absolute paths to create links for
         archive_root: Archive root directory
-        
+
     Returns:
         Number of new hardlinks actually created
-        
+
     Raises:
         OSError: On filesystem errors other than FileExistsError
     """
-    created_count = 0
+    if not paths_to_link:
+        return 0
+
     hash_path_stat = hash_path.stat()
-    
+
+    # Phase 1: Collect all unique parent directories and sanitize paths
+    parent_dirs = []
+    sanitized_paths = {}  # Original path -> (sanitized_str, archive_path)
+
     for path in paths_to_link:
         # Handle both str and bytes from database
         if isinstance(path, bytes):
-            # Decode bytea using surrogateescape to preserve invalid UTF-8
             path_str = path.decode('utf-8', errors='surrogateescape')
         else:
             path_str = path
@@ -201,7 +244,22 @@ def create_hardlinks_idempotent(hash_path: Path, paths_to_link: list[str],
         # Sanitize path to handle HFS+ escape sequences
         sanitized_path = path_str.replace('\\r', '\r').replace('\\n', '\n')
         archive_path = archive_root / sanitized_path.lstrip('/')
-        
+
+        sanitized_paths[path] = (sanitized_path, archive_path)
+        parent_dirs.append(str(archive_path.parent))
+
+    # Phase 2: Filter to leaf directories only (removes ancestors)
+    leaf_dirs = filter_longest_paths(parent_dirs)
+
+    # Phase 3: Create all leaf directories (ancestors created automatically)
+    for dir_str in leaf_dirs:
+        Path(dir_str).mkdir(parents=True, exist_ok=True, mode=0o755)
+
+    # Phase 4: Create all hardlinks
+    created_count = 0
+    for path in paths_to_link:
+        _, archive_path = sanitized_paths[path]
+
         # Check if archive path exists
         if archive_path.exists():
             # Verify it's the same inode (proper hardlink)
@@ -211,19 +269,16 @@ def create_hardlinks_idempotent(hash_path: Path, paths_to_link: list[str],
             else:
                 # Orphaned hardlink to old by-hash inode - replace it
                 archive_path.unlink()
-        
+
         try:
-            # Create parent directory with proper permissions
-            archive_path.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
-            
             # Create hardlink
             os.link(hash_path, archive_path)
             created_count += 1
-            
+
         except FileExistsError:
             # Another worker/process created it concurrently - safe to ignore
             pass
-    
+
     return created_count
 
 

@@ -24,6 +24,14 @@ ENUM_LOG=${NTT_ENUM_LOG:-/var/log/ntt/enum.jsonl}
 mkdir -p "$(dirname "$LOG_JSON")"
 chmod 755 "$(dirname "$LOG_JSON")" 2>/dev/null || true
 
+# Validate ignore patterns file exists
+IGNORE_PATTERNS="${NTT_IGNORE_PATTERNS:-/home/pball/.config/ntt/ignore-patterns.txt}"
+if [[ ! -f "$IGNORE_PATTERNS" ]]; then
+  echo "Error: Ignore patterns file not found: $IGNORE_PATTERNS" >&2
+  echo "Set NTT_IGNORE_PATTERNS environment variable or create default file" >&2
+  exit 1
+fi
+
 # ---------- logging functions ----------
 log() {
   jq -cn --arg ts "$(date -Iseconds)" \
@@ -67,7 +75,7 @@ log start "{\"file\": \"$FILE\", \"medium_hash\": \"$MEDIUM_HASH\"}"
 TEMP_TABLE="raw_$$"
 sudo -u "${SUDO_USER:-$USER}" psql "$DB_URL" -c "
 CREATE TABLE $TEMP_TABLE (
-  mode        text,
+  fs_type     char(1),
   dev         bigint,
   ino         bigint,
   nlink       int,
@@ -78,12 +86,14 @@ CREATE TABLE $TEMP_TABLE (
 
 CREATE TABLE $TABLE_NAME (
   medium_hash text,
+  fs_type     char(1),
   dev         bigint,
   ino         bigint,
   nlink       int,
   size        bigint,
   mtime       numeric,
-  path        text
+  path        text,
+  exclude_reason text
 );
 " || fail "Failed to create working tables"
 
@@ -111,7 +121,7 @@ if perl -pe 'BEGIN{$/=\1} s/\\/\\\\/g; s/\r/\\r/g; s/\n/\\n/g; s/\0/\n/g' < "$FI
     sudo -u "${SUDO_USER:-$USER}" psql "$DB_URL" -c "
 SET client_encoding = 'LATIN1';
 
-COPY $TEMP_TABLE(mode,dev,ino,nlink,size,mtime,path)
+COPY $TEMP_TABLE(fs_type,dev,ino,nlink,size,mtime,path)
 FROM STDIN
 WITH (FORMAT text, DELIMITER E'\\034', NULL '');
 " > "$TEMP_OUTPUT" 2>&1; then
@@ -139,10 +149,32 @@ fi
 # Transfer data to working table with medium_hash
 # Note: path is kept as text in temp tables, will be converted to bytea when inserting to final path table
 sudo -u "${SUDO_USER:-$USER}" psql "$DB_URL" -c "
-INSERT INTO $TABLE_NAME (medium_hash,dev,ino,nlink,size,mtime,path)
-SELECT '$MEDIUM_HASH', dev, ino, nlink, size, mtime, path
+INSERT INTO $TABLE_NAME (medium_hash,fs_type,dev,ino,nlink,size,mtime,path)
+SELECT '$MEDIUM_HASH', fs_type, dev, ino, nlink, size, mtime, path
 FROM $TEMP_TABLE;
 " || fail "Failed to transfer data to working table"
+
+# ---------- 2.5 mark excluded paths ----------
+echo "[$(date -Iseconds)] Marking excluded paths..." >&2
+
+# Load patterns from file, skip comments and empty lines, combine with | for regex alternation
+PATTERNS=$(grep -v '^#' "$IGNORE_PATTERNS" | grep -v '^$' | paste -sd '|' -)
+
+# Add shell-unsafe characters to exclude list
+PATTERNS="${PATTERNS}|#"
+
+echo "[$(date -Iseconds)] Applying $(grep -cv '^#\|^$' "$IGNORE_PATTERNS") patterns..." >&2
+
+# Mark paths matching patterns (path is text in working table, no conversion needed)
+EXCLUDED_COUNT=$(sudo -u "${SUDO_USER:-$USER}" psql "$DB_URL" -t -A -c "
+  UPDATE $TABLE_NAME
+  SET exclude_reason = 'pattern_match'
+  WHERE path ~ '$PATTERNS';
+  SELECT COUNT(*) FROM $TABLE_NAME WHERE exclude_reason = 'pattern_match';
+" | tail -1)
+
+echo "[$(date -Iseconds)] Marked $EXCLUDED_COUNT paths as excluded" >&2
+log exclusions "{\"excluded\": \"$EXCLUDED_COUNT\", \"medium_hash\": \"$MEDIUM_HASH\"}"
 
 # Create indexes on working table for fast deduplication operations
 echo "[$(date -Iseconds)] Creating indexes on working table..." >&2
@@ -194,18 +226,40 @@ TRUNCATE path_p_${PARTITION_SUFFIX}, inode_p_${PARTITION_SUFFIX};
 -- inode rows: Use DISTINCT ON instead of GROUP BY with MAX
 -- DISTINCT ON is faster and correct since inode metadata is identical for hardlinks
 -- No ON CONFLICT needed - partition is now empty (TRUNCATE above)
-INSERT INTO inode (medium_hash,dev,ino,nlink,size,mtime)
+-- Mark non-files (directories, symlinks, special files) as already copied
+INSERT INTO inode (medium_hash,fs_type,dev,ino,nlink,size,mtime,copied,claimed_by)
 SELECT DISTINCT ON (medium_hash, ino)
-       '$MEDIUM_HASH' as medium_hash, dev, ino, nlink, size, mtime
+       '$MEDIUM_HASH' as medium_hash,
+       fs_type,
+       dev,
+       ino,
+       nlink,
+       size,
+       mtime,
+       CASE WHEN fs_type = 'f' THEN false ELSE true END as copied,
+       CASE WHEN fs_type = 'f' THEN NULL ELSE 'NON_FILE' END as claimed_by
 FROM   $TABLE_NAME
 ORDER BY medium_hash, ino;
 
 -- path rows: Direct SELECT (no GROUP BY needed - verified zero duplicate ino,path pairs)
 -- Convert Latin1 text to bytea to preserve exact bytes from filesystem
 -- No ON CONFLICT needed - partition is now empty (TRUNCATE above)
-INSERT INTO path (medium_hash,dev,ino,path)
-SELECT '$MEDIUM_HASH' as medium_hash, dev, ino, convert_to(path, 'LATIN1')
+INSERT INTO path (medium_hash,dev,ino,path,exclude_reason)
+SELECT '$MEDIUM_HASH' as medium_hash, dev, ino, convert_to(path, 'LATIN1'), exclude_reason
 FROM   $TABLE_NAME;
+
+-- Mark inodes as EXCLUDED if all their paths are excluded
+-- This prevents copier from claiming them (saves infinite loop)
+UPDATE inode
+SET copied = true, claimed_by = 'EXCLUDED'
+WHERE medium_hash = '$MEDIUM_HASH'
+  AND copied = false
+  AND NOT EXISTS (
+    SELECT 1 FROM path
+    WHERE path.medium_hash = inode.medium_hash
+      AND path.ino = inode.ino
+      AND path.exclude_reason IS NULL
+  );
 
 -- Initialize queue_stats for this medium (faster than triggers for bulk load)
 -- Copier workers check queue_stats to determine TABLESAMPLE vs ORDER BY RANDOM() strategy
@@ -220,6 +274,28 @@ SET unclaimed_count = EXCLUDED.unclaimed_count,
     total_count = EXCLUDED.total_count,
     last_updated = NOW();
 " || fail "Failed to deduplicate into final tables"
+
+# Count excluded inodes (those with ALL paths excluded)
+EXCLUDED_INODES=$(sudo -u "${SUDO_USER:-$USER}" psql "$DB_URL" -t -A -c "
+  SELECT COUNT(*)
+  FROM inode
+  WHERE medium_hash = '$MEDIUM_HASH'
+    AND claimed_by = 'EXCLUDED'
+" 2>/dev/null | grep -o '[0-9]*' | head -1 || echo "0")
+
+echo "[$(date -Iseconds)] Marked $EXCLUDED_INODES inodes as EXCLUDED (all paths excluded)" >&2
+log excluded_inodes "{\"count\": \"$EXCLUDED_INODES\", \"medium_hash\": \"$MEDIUM_HASH\"}"
+
+# Count non-file inodes (directories, symlinks, special files)
+NON_FILE_INODES=$(sudo -u "${SUDO_USER:-$USER}" psql "$DB_URL" -t -A -c "
+  SELECT COUNT(*)
+  FROM inode
+  WHERE medium_hash = '$MEDIUM_HASH'
+    AND claimed_by = 'NON_FILE'
+" 2>/dev/null | grep -o '[0-9]*' | head -1 || echo "0")
+
+echo "[$(date -Iseconds)] Marked $NON_FILE_INODES inodes as NON_FILE (directories, symlinks, special files)" >&2
+log non_file_inodes "{\"count\": \"$NON_FILE_INODES\", \"medium_hash\": \"$MEDIUM_HASH\"}"
 
 # ---------- 4. cleanup and summary ----------
 ROWS=$(sudo -u "${SUDO_USER:-$USER}" psql "$DB_URL" -t -A -c "SELECT count(*) FROM path WHERE medium_hash='$MEDIUM_HASH'" 2>/dev/null | grep -o '[0-9]*' | head -1 || echo "unknown")

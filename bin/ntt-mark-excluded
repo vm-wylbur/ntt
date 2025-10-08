@@ -5,6 +5,11 @@ ntt-mark-excluded - Mark paths matching ignore patterns as excluded
 Reads patterns from $NTT_IGNORE_PATTERNS and marks matching paths
 in the database with exclude_reason='pattern_match'.
 
+IMPORTANT: Paths in database are stored as bytea (to preserve invalid UTF-8).
+The loader uses convert_to(path, 'LATIN1') when storing paths.
+We must use convert_from(path, 'LATIN1') to convert back to text for regex matching.
+LATIN1 encoding is 1-to-1 byte mapping, so no information is lost.
+
 Usage:
   source ~/.config/ntt/ntt.env && ntt-mark-excluded [--dry-run]
 """
@@ -60,11 +65,12 @@ def mark_excluded_paths(dry_run: bool = False):
     with psycopg.connect(DB_URL) as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             # Count paths that would be excluded
+            # Note: convert_from(path, 'LATIN1') reverses the convert_to() used in loader
             cur.execute("""
                 SELECT COUNT(*) as count
                 FROM path
                 WHERE exclude_reason IS NULL
-                  AND path ~ %s
+                  AND convert_from(path, 'LATIN1') ~ %s
             """, (postgres_regex,))
 
             count = cur.fetchone()['count']
@@ -79,10 +85,10 @@ def mark_excluded_paths(dry_run: bool = False):
 
                 # Show sample of paths that would be excluded
                 cur.execute("""
-                    SELECT path, medium_hash, ino
+                    SELECT convert_from(path, 'LATIN1') as path, medium_hash, ino
                     FROM path
                     WHERE exclude_reason IS NULL
-                      AND path ~ %s
+                      AND convert_from(path, 'LATIN1') ~ %s
                     LIMIT 20
                 """, (postgres_regex,))
 
@@ -100,7 +106,7 @@ def mark_excluded_paths(dry_run: bool = False):
                     UPDATE path
                     SET exclude_reason = 'pattern_match'
                     WHERE exclude_reason IS NULL
-                      AND path ~ %s
+                      AND convert_from(path, 'LATIN1') ~ %s
                 """, (postgres_regex,))
 
                 conn.commit()
