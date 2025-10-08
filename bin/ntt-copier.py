@@ -50,6 +50,9 @@ import magic
 # Import strategy functions
 import ntt_copier_strategies as strategies
 
+# Import diagnostic service
+from ntt_copier_diagnostics import DiagnosticService
+
 app = typer.Typer()
 
 
@@ -61,6 +64,20 @@ class AnalysisError(Exception):
 class ExecutionError(Exception):
     """Raised when execution phase fails."""
     pass
+
+
+# SHA-256 hash validation
+HEX_CHARS = set('0123456789abcdef')
+
+def is_sha256_hash_lowercase(s):
+    """Validate SHA-256 hash string (64 lowercase hex chars)"""
+    try:
+        is_valid = len(s) == 64 and all(c in HEX_CHARS for c in s)
+        if not is_valid and isinstance(s, str):
+            logger.error(f"MALFORMED BLOB_ID: {s[:40]}...")
+        return is_valid
+    except (TypeError, AttributeError):
+        return False
 
 
 def validate_destination_filesystem():
@@ -221,6 +238,13 @@ class CopyWorker:
 
         # Track which media we've already ensured are mounted (cache to avoid repeated checks)
         self._mounted_media = set()
+
+        # Setup diagnostic service for intelligent retry/error handling
+        self.diagnostics = DiagnosticService(
+            db_conn=self.conn,
+            medium_hash=self.medium_hash,
+            worker_id=self.worker_id
+        )
 
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals gracefully."""
@@ -611,6 +635,36 @@ class CopyWorker:
                         error_type = type(e).__name__
                         error_msg = str(e)[:200]  # Truncate long messages
                         logger.error(f"Error processing inode {key}: {error_type}: {error_msg}")
+
+                        # DIAGNOSTIC SERVICE: Track failure and run diagnostics
+                        retry_count = self.diagnostics.track_failure(
+                            inode_row['medium_hash'],
+                            inode_row['ino']
+                        )
+
+                        # At checkpoint (retry #10), run full diagnostic analysis
+                        if retry_count == 10:
+                            findings = self.diagnostics.diagnose_at_checkpoint(
+                                inode_row['medium_hash'],
+                                inode_row['ino'],
+                                e
+                            )
+                            logger.warning(
+                                f"🔍 DIAGNOSTIC CHECKPOINT "
+                                f"ino={inode_row['ino']} "
+                                f"retry={retry_count} "
+                                f"findings={findings}"
+                            )
+
+                        # Log when max retries approached (Phase 2 will skip here)
+                        if retry_count >= 50:
+                            logger.error(
+                                f"⚠️  MAX RETRIES REACHED "
+                                f"ino={inode_row['ino']} "
+                                f"retry={retry_count} "
+                                f"(WOULD SKIP IN FUTURE PHASE)"
+                            )
+
                         results_by_inode[key] = {
                             'error_type': error_type,
                             'error_msg': error_msg
@@ -623,11 +677,11 @@ class CopyWorker:
                 t_build_start = time.time()
                 # For paths table
                 medium_hashes, inos_for_paths, blob_ids = [], [], []
-                for (mh, ino), blob_id in results_by_inode.items():
-                    if blob_id:  # Only update if we have a blob_id
+                for (mh, ino), result in results_by_inode.items():
+                    if is_sha256_hash_lowercase(result):
                         medium_hashes.append(mh)
                         inos_for_paths.append(ino)
-                        blob_ids.append(blob_id)
+                        blob_ids.append(result)
 
                 # For inode table - separate success and failures
                 success_ids, success_blob_ids = [], []
