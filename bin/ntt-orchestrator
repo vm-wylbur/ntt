@@ -8,8 +8,33 @@
 #
 # NTT ingest dispatcher – supports both device and directory modes
 # Note: Must be run with sudo/root privileges for device operations
-set -euo pipefail
+set -eo pipefail
 PATH="/home/pball/projects/ntt/bin:$PATH"
+
+# Global variables for cleanup tracking
+CLEANUP_NEEDED=false
+MOUNT_POINT=""
+LOOP_DEVICE=""
+
+# Cleanup trap for error handling
+cleanup() {
+  local exit_code=$?
+  if [[ "$CLEANUP_NEEDED" == "true" ]]; then
+    if [[ -n "$MOUNT_POINT" ]] && mount | grep -q "$MOUNT_POINT"; then
+      echo "[$(date -Iseconds)] Cleaning up mount: $MOUNT_POINT" >&2
+      umount "$MOUNT_POINT" 2>/dev/null || true
+    fi
+    if [[ -n "$LOOP_DEVICE" ]] && losetup -l | grep -q "$LOOP_DEVICE"; then
+      echo "[$(date -Iseconds)] Cleaning up loop device: $LOOP_DEVICE" >&2
+      losetup -d "$LOOP_DEVICE" 2>/dev/null || true
+    fi
+    if [[ -n "$MOUNT_POINT" ]] && [[ -d "$MOUNT_POINT" ]]; then
+      rmdir "$MOUNT_POINT" 2>/dev/null || true
+    fi
+  fi
+  exit $exit_code
+}
+trap cleanup EXIT INT TERM
 
 # Check if running as root
 if [[ $EUID -ne 0 ]]; then
@@ -419,6 +444,237 @@ update_health_from_mapfile() {
   psql_as_user "$DB_URL" -c "UPDATE medium SET health = '$health' WHERE medium_hash = '$medium_hash';" 2>/dev/null || true
 }
 
+# ---------- pipeline state functions ----------
+check_pipeline_state() {
+  local medium_hash="$1"
+
+  # Check if image exists
+  local image_path=$(psql_as_user "$DB_URL" -tAc "SELECT image_path FROM medium WHERE medium_hash = '$medium_hash'" 2>/dev/null)
+  local has_image=false
+  if [[ -n "$image_path" ]] && [[ -f "$image_path" ]]; then
+    has_image=true
+  fi
+
+  # Check if currently mounted
+  local is_mounted=false
+  if mount | grep -q "/mnt/ntt/${medium_hash}"; then
+    is_mounted=true
+  fi
+
+  # Check if inodes enumerated
+  local inode_count=$(psql_as_user "$DB_URL" -tAc "SELECT COUNT(*) FROM inode WHERE medium_hash = '$medium_hash'" 2>/dev/null || echo "0")
+  local has_inodes=false
+  if [[ $inode_count -gt 0 ]]; then
+    has_inodes=true
+  fi
+
+  # Check if paths loaded
+  local path_count=$(psql_as_user "$DB_URL" -tAc "SELECT COUNT(*) FROM path WHERE medium_hash = '$medium_hash'" 2>/dev/null || echo "0")
+  local has_paths=false
+  if [[ $path_count -gt 0 ]]; then
+    has_paths=true
+  fi
+
+  # Check if copying is complete
+  local is_copying_done=false
+  if [[ $inode_count -gt 0 ]]; then
+    local pending_count=$(psql_as_user "$DB_URL" -tAc "SELECT COUNT(*) FROM inode WHERE medium_hash = '$medium_hash' AND copied = false AND claimed_by IS NULL" 2>/dev/null || echo "0")
+    if [[ $pending_count -eq 0 ]]; then
+      is_copying_done=true
+    fi
+  fi
+
+  # Return state as colon-separated values
+  # Format: has_image:is_mounted:has_inodes:has_paths:is_copying_done:inode_count:path_count
+  echo "$has_image:$is_mounted:$has_inodes:$has_paths:$is_copying_done:$inode_count:$path_count"
+}
+
+# ---------- pipeline stage functions ----------
+# Stage functions return: 0=success, 1=skip/already done, 2=fatal error
+
+stage_mount() {
+  local medium_hash="$1"
+
+  echo "[$(date -Iseconds)] STAGE: Mount" >&2
+
+  # Check if already mounted
+  if ntt-mount-helper status "$medium_hash" >/dev/null 2>&1; then
+    echo "[$(date -Iseconds)] Already mounted, skipping" >&2
+    return 1
+  fi
+
+  # Get image path from database
+  local image_path=$(psql_as_user "$DB_URL" -tAc "SELECT image_path FROM medium WHERE medium_hash = '$medium_hash'" 2>/dev/null)
+  if [[ -z "$image_path" ]]; then
+    echo "[$(date -Iseconds)] ERROR: No image_path in database for $medium_hash" >&2
+    log mount_error "{\"medium_hash\": \"$medium_hash\", \"error\": \"no_image_path\"}"
+    return 2
+  fi
+
+  if [[ ! -f "$image_path" ]]; then
+    echo "[$(date -Iseconds)] ERROR: Image file not found: $image_path" >&2
+    log mount_error "{\"medium_hash\": \"$medium_hash\", \"error\": \"image_not_found\", \"path\": \"$image_path\"}"
+    return 2
+  fi
+
+  # Check health before mounting
+  local health=$(psql_as_user "$DB_URL" -tAc "SELECT health FROM medium WHERE medium_hash = '$medium_hash'" 2>/dev/null)
+  if [[ -n "$health" ]] && [[ "$health" != "ok" ]] && [[ "$health" != "" ]]; then
+    echo "[$(date -Iseconds)] ERROR: Refusing to mount - health=$health (expected 'ok')" >&2
+    log mount_error "{\"medium_hash\": \"$medium_hash\", \"error\": \"bad_health\", \"health\": \"$health\"}"
+
+    # Mark all inodes as EXCLUDED
+    psql_as_user "$DB_URL" <<SQL
+UPDATE inode
+SET copied = true, claimed_by = 'EXCLUDED: bad_health', claimed_at = NOW()
+WHERE medium_hash = '$medium_hash' AND copied = false;
+SQL
+    return 2
+  fi
+
+  # Use ntt-mount-helper for mounting
+  echo "[$(date -Iseconds)] Mounting $image_path" >&2
+  if sudo ntt-mount-helper mount "$medium_hash" "$image_path"; then
+    log mount_success "{\"medium_hash\": \"$medium_hash\", \"image_path\": \"$image_path\"}"
+    return 0
+  else
+    echo "[$(date -Iseconds)] ERROR: Mount failed" >&2
+    log mount_error "{\"medium_hash\": \"$medium_hash\", \"error\": \"mount_failed\"}"
+    return 2
+  fi
+}
+
+stage_enum() {
+  local medium_hash="$1"
+
+  echo "[$(date -Iseconds)] STAGE: Enumeration" >&2
+
+  # Check if already enumerated
+  local inode_count=$(psql_as_user "$DB_URL" -tAc "SELECT COUNT(*) FROM inode WHERE medium_hash = '$medium_hash'" 2>/dev/null || echo "0")
+  if [[ $inode_count -gt 0 ]]; then
+    echo "[$(date -Iseconds)] Already enumerated ($inode_count inodes), skipping" >&2
+    return 1
+  fi
+
+  # Get mount point
+  local mount_point="/mnt/ntt/${medium_hash}"
+  if [[ ! -d "$mount_point" ]]; then
+    echo "[$(date -Iseconds)] ERROR: Mount point not found: $mount_point" >&2
+    log enum_error "{\"medium_hash\": \"$medium_hash\", \"error\": \"mount_point_missing\"}"
+    return 2
+  fi
+
+  # Run enumeration
+  local raw_file="$RAW_ROOT/${medium_hash}.raw"
+  echo "[$(date -Iseconds)] Running ntt-enum: $mount_point -> $raw_file" >&2
+  log enum_start "{\"medium_hash\": \"$medium_hash\", \"mount\": \"$mount_point\", \"raw\": \"$raw_file\"}"
+
+  if ntt-enum "$mount_point" "$medium_hash" "$raw_file"; then
+    chmod 644 "$raw_file" 2>/dev/null || true
+    log enum_success "{\"medium_hash\": \"$medium_hash\", \"raw\": \"$raw_file\"}"
+    return 0
+  else
+    echo "[$(date -Iseconds)] ERROR: Enumeration failed" >&2
+    log enum_error "{\"medium_hash\": \"$medium_hash\", \"error\": \"enum_failed\"}"
+    return 2
+  fi
+}
+
+stage_load() {
+  local medium_hash="$1"
+
+  echo "[$(date -Iseconds)] STAGE: Loader" >&2
+
+  # Check if already loaded
+  local path_count=$(psql_as_user "$DB_URL" -tAc "SELECT COUNT(*) FROM path WHERE medium_hash = '$medium_hash'" 2>/dev/null || echo "0")
+  if [[ $path_count -gt 0 ]]; then
+    echo "[$(date -Iseconds)] Already loaded ($path_count paths), skipping" >&2
+    return 1
+  fi
+
+  # Check if raw file exists
+  local raw_file="$RAW_ROOT/${medium_hash}.raw"
+  if [[ ! -f "$raw_file" ]]; then
+    echo "[$(date -Iseconds)] ERROR: Raw file not found: $raw_file" >&2
+    log load_error "{\"medium_hash\": \"$medium_hash\", \"error\": \"raw_file_missing\"}"
+    return 2
+  fi
+
+  # Run loader
+  echo "[$(date -Iseconds)] Running ntt-loader: $raw_file" >&2
+  log load_start "{\"medium_hash\": \"$medium_hash\", \"raw\": \"$raw_file\"}"
+
+  if /home/pball/projects/ntt/bin/ntt-loader "$raw_file" "$medium_hash"; then
+    # Get final inode count after loading
+    local inode_count=$(psql_as_user "$DB_URL" -tAc "SELECT COUNT(*) FROM inode WHERE medium_hash = '$medium_hash'" 2>/dev/null || echo "0")
+    log load_success "{\"medium_hash\": \"$medium_hash\", \"inode_count\": $inode_count}"
+    echo "$inode_count"  # Return inode count for smart scheduling
+    return 0
+  else
+    echo "[$(date -Iseconds)] ERROR: Loader failed" >&2
+    log load_error "{\"medium_hash\": \"$medium_hash\", \"error\": \"loader_failed\"}"
+    return 2
+  fi
+}
+
+stage_copy() {
+  local medium_hash="$1"
+  local inode_count="${2:-0}"
+
+  echo "[$(date -Iseconds)] STAGE: Copy ($inode_count files)" >&2
+
+  # Check if already complete
+  local pending_count=$(psql_as_user "$DB_URL" -tAc "SELECT COUNT(*) FROM inode WHERE medium_hash = '$medium_hash' AND copied = false AND claimed_by IS NULL" 2>/dev/null || echo "0")
+  if [[ $pending_count -eq 0 ]]; then
+    echo "[$(date -Iseconds)] No pending files, skipping" >&2
+    return 1
+  fi
+
+  # Smart scheduling based on inode count
+  if [[ $inode_count -lt 100 ]]; then
+    # Small batch: run inline with single worker
+    echo "[$(date -Iseconds)] Small batch (<100 files), running inline with 1 worker" >&2
+    log copy_start "{\"medium_hash\": \"$medium_hash\", \"mode\": \"inline\", \"workers\": 1, \"pending\": $pending_count}"
+
+    if /home/pball/projects/ntt/bin/ntt-copier.py --workers 1 --medium "$medium_hash"; then
+      log copy_success "{\"medium_hash\": \"$medium_hash\"}"
+      return 0
+    else
+      echo "[$(date -Iseconds)] ERROR: Copy worker failed" >&2
+      log copy_error "{\"medium_hash\": \"$medium_hash\", \"error\": \"worker_failed\"}"
+      return 2
+    fi
+
+  elif [[ $inode_count -lt 10000 ]]; then
+    # Medium batch: run parallel workers (2-4 workers)
+    local workers=4
+    echo "[$(date -Iseconds)] Medium batch (<10K files), running parallel with $workers workers" >&2
+    log copy_start "{\"medium_hash\": \"$medium_hash\", \"mode\": \"parallel\", \"workers\": $workers, \"pending\": $pending_count}"
+
+    if /home/pball/projects/ntt/bin/ntt-copier.py --workers "$workers" --medium "$medium_hash"; then
+      log copy_success "{\"medium_hash\": \"$medium_hash\"}"
+      return 0
+    else
+      echo "[$(date -Iseconds)] ERROR: Copy workers failed" >&2
+      log copy_error "{\"medium_hash\": \"$medium_hash\", \"error\": \"workers_failed\"}"
+      return 2
+    fi
+
+  else
+    # Large batch: defer to systemd/background
+    echo "[$(date -Iseconds)] Large batch (>10K files), deferring to background workers" >&2
+    log copy_defer "{\"medium_hash\": \"$medium_hash\", \"mode\": \"deferred\", \"pending\": $pending_count, \"msg\": \"Run: ntt-copier.py --workers 8 --medium $medium_hash\"}"
+    echo ""
+    echo "========================================" >&2
+    echo "LARGE BATCH - Manual intervention required" >&2
+    echo "Run this command to start copy workers:" >&2
+    echo "  ntt-copier.py --workers 8 --medium $medium_hash" >&2
+    echo "========================================" >&2
+    echo ""
+    return 1  # Not an error, just deferred
+  fi
+}
+
 # ---------- database functions ----------
 check_duplicate() {
   local medium_hash="$1"
@@ -596,7 +852,7 @@ handle_device_mode() {
   # This captures all hardware diagnostics while device is still attached
   local IMG="$IMAGE_ROOT/${medium_hash}.img"
   echo "[$(date -Iseconds)] Inserting medium record to database..." >&2
-  insert_medium "$medium_hash" "$medium_human" "true" "$message" "$DIAGNOSTICS"
+  insert_medium "$medium_hash" "$medium_human" "NULL" "$message" "$DIAGNOSTICS"
   psql_as_user "$DB_URL" -c "UPDATE medium SET image_path = '$IMG' WHERE medium_hash = '$medium_hash';" 2>/dev/null || true
 
   log medium_inserted "{\"medium_hash\":\"$medium_hash\",\"medium_human\":\"$medium_human\",\"timing\":\"before_imaging\"}"
@@ -620,24 +876,85 @@ handle_device_mode() {
   # Update health based on ddrescue results
   update_health_from_mapfile "$medium_hash" "$MAP"
 
-  # Mount the image as loop device
-  LOOP=$(losetup -f --show -r "$IMG")
-  MNT="/mnt/ntt/${medium_hash}"
-  mkdir -p "$MNT"
-  mount -o ro,nodev,nosuid,noatime "$LOOP" "$MNT"
+  # Run state-based pipeline stages
+  echo "[$(date -Iseconds)] === STATE-BASED PIPELINE START ===" >&2
+  log pipeline_start "{\"medium_hash\": \"$medium_hash\"}"
 
-  # Run enumeration
-  RAW=$(run_enum "$MNT" "$medium_hash")
-
-  # Run full pipeline unless --enum-only
-  if ! "$enum_only"; then
-    run_loader "$medium_hash" "$RAW"
-    run_copy_workers "$medium_hash"
+  # STAGE 1: Mount
+  if stage_mount "$medium_hash"; then
+    echo "[$(date -Iseconds)] Mount stage: SUCCESS" >&2
+  else
+    local mount_rc=$?
+    if [[ $mount_rc -eq 1 ]]; then
+      echo "[$(date -Iseconds)] Mount stage: SKIPPED (already mounted)" >&2
+    else
+      echo "[$(date -Iseconds)] Mount stage: FAILED (cannot continue)" >&2
+      log pipeline_abort "{\"medium_hash\": \"$medium_hash\", \"failed_stage\": \"mount\"}"
+      return 1
+    fi
   fi
 
-  # Leave image mounted for copy workers
+  # STAGE 2: Enumeration
+  if stage_enum "$medium_hash"; then
+    echo "[$(date -Iseconds)] Enum stage: SUCCESS" >&2
+  else
+    local enum_rc=$?
+    if [[ $enum_rc -eq 1 ]]; then
+      echo "[$(date -Iseconds)] Enum stage: SKIPPED (already enumerated)" >&2
+    else
+      echo "[$(date -Iseconds)] Enum stage: FAILED" >&2
+      log pipeline_error "{\"medium_hash\": \"$medium_hash\", \"failed_stage\": \"enum\"}"
+      # Don't abort - medium is mounted, user can debug
+    fi
+  fi
+
+  # Stop here if --enum-only
+  if "$enum_only"; then
+    echo "[$(date -Iseconds)] === PIPELINE STOPPED (--enum-only) ===" >&2
+    log pipeline_stopped "{\"medium_hash\": \"$medium_hash\", \"reason\": \"enum_only_flag\"}"
+    return 0
+  fi
+
+  # STAGE 3: Loader
+  local inode_count=0
+  if stage_load "$medium_hash"; then
+    inode_count=$(psql_as_user "$DB_URL" -tAc "SELECT COUNT(*) FROM inode WHERE medium_hash = '$medium_hash'" 2>/dev/null || echo "0")
+    echo "[$(date -Iseconds)] Load stage: SUCCESS ($inode_count inodes)" >&2
+  else
+    local load_rc=$?
+    if [[ $load_rc -eq 1 ]]; then
+      inode_count=$(psql_as_user "$DB_URL" -tAc "SELECT COUNT(*) FROM inode WHERE medium_hash = '$medium_hash'" 2>/dev/null || echo "0")
+      echo "[$(date -Iseconds)] Load stage: SKIPPED (already loaded, $inode_count inodes)" >&2
+    else
+      echo "[$(date -Iseconds)] Load stage: FAILED" >&2
+      log pipeline_error "{\"medium_hash\": \"$medium_hash\", \"failed_stage\": \"load\"}"
+      # Don't abort - medium is mounted, user can debug
+    fi
+  fi
+
+  # STAGE 4: Copy (with smart scheduling)
+  if [[ $inode_count -gt 0 ]]; then
+    if stage_copy "$medium_hash" "$inode_count"; then
+      echo "[$(date -Iseconds)] Copy stage: SUCCESS" >&2
+    else
+      local copy_rc=$?
+      if [[ $copy_rc -eq 1 ]]; then
+        echo "[$(date -Iseconds)] Copy stage: SKIPPED or DEFERRED" >&2
+      else
+        echo "[$(date -Iseconds)] Copy stage: FAILED" >&2
+        log pipeline_error "{\"medium_hash\": \"$medium_hash\", \"failed_stage\": \"copy\"}"
+      fi
+    fi
+  else
+    echo "[$(date -Iseconds)] Copy stage: SKIPPED (no inodes to copy)" >&2
+  fi
+
+  echo "[$(date -Iseconds)] === PIPELINE COMPLETE ===" >&2
+  log pipeline_done "{\"medium_hash\": \"$medium_hash\"}"
+
+  # Leave image mounted for copy workers / manual inspection
   # Cleanup will be handled by ntt-cleanup-mounts periodic job
-  log mount_persisted "{\"mnt\": \"$MNT\", \"loop\": \"$LOOP\", \"note\": \"left mounted for workers\"}"
+  log mount_persisted "{\"medium_hash\": \"$medium_hash\", \"note\": \"left mounted for workers or inspection\"}"
 }
 
 handle_directory_mode() {
