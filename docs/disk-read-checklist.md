@@ -65,6 +65,35 @@ sudo mount -t vfat -o ro /dev/loop38 /mnt/ntt/${HASH}
 sudo mount -t ufs -o ro /dev/loop38 /mnt/ntt/${HASH}
 ```
 
+**Partitioned disk handling:**
+```bash
+# Check if disk has partition table
+sudo fdisk -l /dev/loop38
+sudo parted /dev/loop38 print
+
+# If partitioned, try partition-aware loop setup
+sudo losetup -d /dev/loop38  # Detach existing
+sudo losetup -f --show -P /data/fast/img/${HASH}.img  # Creates /dev/loopXpY partitions
+
+# Try mounting partition 1
+sudo mount -o ro,nosuid,nodev,noatime /dev/loop38p1 /mnt/ntt/${HASH}
+
+# If partition mount fails with "bogus number of reserved sectors":
+# The filesystem may start at an offset within the partition.
+# Check hexdump to find where filesystem boot sector actually is:
+sudo hexdump -C /dev/loop38p1 | less
+# Look for filesystem signatures (e.g., "FAT16", "SYSLINUX" at 0xfe000)
+
+# Mount with offset (example: FAT16 at 1MB offset)
+sudo mount -t vfat -o ro,nosuid,nodev,noatime,offset=1048576 /dev/loop38 /mnt/ntt/${HASH}
+```
+
+**Common partition scenarios:**
+- **Bootable USB/CD images**: Small FAT16 boot partition + rest unallocated
+- **Mac disks**: DOS partition table showing only small partition, HFS+/APFS not visible
+- **Hybrid layouts**: Partition table at start, filesystem at offset within partition
+- **SYSLINUX disks**: Bootloader padding before FAT filesystem (often at 1MB offset)
+
 ---
 
 ## 3. Post-Mount Validation
@@ -323,6 +352,111 @@ The copier now includes intelligent retry logic via `DiagnosticService`:
 **Files:**
 - `ntt/bin/ntt_copier_diagnostics.py` - DiagnosticService class
 - `ntt/docs/copier-diagnostic-ideas.md` - Full vision and design rationale
+
+---
+
+## 12. How to Check Img File Status
+
+When you have img files in `/data/fast/img/` and need to determine their readiness for processing:
+
+### Check ddrescue recovery status
+
+```bash
+# View ddrescue map file
+sudo cat /data/fast/img/${HASH}.map
+
+# Key indicators:
+# - "Finished" in header = recovery complete
+# - "Scraping failed blocks" = still running
+# - Lines with '-' status = bad sectors
+# - Lines with '/' status = currently being scraped
+# - Lines with '+' status = successfully recovered
+
+# Calculate recovery percentage
+grep "^0x" /data/fast/img/${HASH}.map | awk '
+  BEGIN {total=0; good=0}
+  {size=strtonum($2); total+=size; if($3=="+") good+=size}
+  END {printf "%.1f%% recovered (%d / %d bytes)\n", (good/total)*100, good, total}'
+```
+
+### Check if ddrescue is still running
+
+```bash
+# Check for active ddrescue processes
+ps aux | grep ddrescue | grep -v grep
+
+# If running, you'll see:
+# root  289381 ... ddrescue --force ... /data/fast/img/${HASH}.img
+
+# Wait for ddrescue to finish before processing
+```
+
+### Check database processing status
+
+```bash
+# Check enum/copy status and problems
+psql -d copyjob -c "
+  SELECT
+    medium_hash,
+    enum_done IS NOT NULL as enumerated,
+    copy_done IS NOT NULL as copied,
+    problems
+  FROM medium
+  WHERE medium_hash = '${HASH}'
+"
+
+# Results indicate:
+# - enumerated=f, copied=f, problems=null → Not yet processed, ready to start
+# - enumerated=t, copied=f → Enumeration done, ready for copier
+# - enumerated=t, copied=t → Fully processed, ready to archive
+# - problems IS NOT NULL → Has recorded issues, may not be processable
+```
+
+### Check mount status
+
+```bash
+# Check if filesystem is currently mounted
+mount | grep ${HASH}
+
+# Or use ntt-mount-helper status
+sudo /path/to/ntt-mount-helper status ${HASH}
+
+# If mounted, list contents
+ls -la /mnt/ntt/${HASH}/
+```
+
+### Decision tree for img files
+
+1. **Is ddrescue still running?** → Wait for completion
+2. **Recovery < 90%?** → Likely unmountable, archive with problem marker
+3. **Boot sector in bad sectors (offset 0x0)?** → Cannot mount, archive with problem marker
+4. **enum_done=null?** → Ready for enum → load → copy → archive pipeline
+5. **copy_done=null but enum_done set?** → Ready for copier
+6. **copy_done set?** → Ready to archive
+
+### Example: Quick status check
+
+```bash
+HASH="73965b01df2aeec71a0f0c32121542cb"
+
+# 1. Recovery status
+grep "Finished\|Scraping" /data/fast/img/${HASH}.map | head -1
+
+# 2. Bad sectors?
+grep "^0x.*-$" /data/fast/img/${HASH}.map | wc -l
+
+# 3. Processing status
+psql -d copyjob -tc "SELECT
+  CASE
+    WHEN enum_done IS NULL THEN 'not_started'
+    WHEN copy_done IS NULL THEN 'enum_done'
+    ELSE 'completed'
+  END
+FROM medium WHERE medium_hash = '${HASH}'"
+
+# 4. Is ddrescue running?
+pgrep -f "ddrescue.*${HASH}" && echo "STILL RUNNING" || echo "ready"
+```
 
 ---
 

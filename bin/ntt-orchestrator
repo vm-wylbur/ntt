@@ -71,6 +71,51 @@ fail() {
 }
 
 # ---------- identification functions ----------
+get_real_hardware_info() {
+  # Get actual drive hardware info, bypassing USB bridges
+  # Sets global variables: MODEL, SERIAL
+  #
+  # Args: $1 = device path (e.g., /dev/sdd)
+  #
+  # Strategy:
+  #   1. Try smartctl (most reliable, bypasses USB/SATA bridges)
+  #   2. Fallback to hdparm (also bypasses bridges)
+  #   3. Final fallback to lsblk (may show bridge info)
+
+  local dev="$1"
+  MODEL=""
+  SERIAL=""
+
+  # Try smartctl first
+  if command -v smartctl &>/dev/null; then
+    local smart_model=$(smartctl -i "$dev" 2>/dev/null | grep "Device Model:" | awk '{$1=$2=""; print $0}' | xargs)
+    local smart_serial=$(smartctl -i "$dev" 2>/dev/null | grep "Serial Number:" | awk '{$1=$2=""; print $0}' | xargs)
+
+    # Check if we got real drive info (not USB bridge/adapter)
+    if [[ -n "$smart_model" ]] && [[ ! "$smart_model" =~ (Dual|USB|Bridge|Adapter) ]]; then
+      MODEL=$(echo "$smart_model" | tr -s ' ' '_')
+      SERIAL=$(echo "$smart_serial" | tr -s ' ' '_')
+      return 0
+    fi
+  fi
+
+  # Fallback to hdparm
+  if command -v hdparm &>/dev/null; then
+    local hdparm_model=$(sudo hdparm -I "$dev" 2>/dev/null | grep "Model Number:" | awk -F: '{print $2}' | xargs)
+    local hdparm_serial=$(sudo hdparm -I "$dev" 2>/dev/null | grep "Serial Number:" | awk -F: '{print $2}' | xargs)
+
+    if [[ -n "$hdparm_model" ]]; then
+      MODEL=$(echo "$hdparm_model" | tr -s ' ' '_')
+      SERIAL=$(echo "$hdparm_serial" | tr -s ' ' '_')
+      return 0
+    fi
+  fi
+
+  # Final fallback to lsblk (may show USB bridge for USB-attached drives)
+  MODEL=$(lsblk -no MODEL "$dev" 2>/dev/null | tr -s ' ' '_')
+  SERIAL=$(lsblk -no SERIAL "$dev" 2>/dev/null | tr -s ' ' '_')
+}
+
 identify_device() {
   local dev="$1"
   local user_message="$2"
@@ -222,9 +267,23 @@ identify_device() {
     local hash_prefix="${medium_hash:0:8}"
     local medium_human="floppy_${timestamp}_${hash_prefix}"
   else
-    # Fixed disk - use hardware info
-    MODEL=$(lsblk -no MODEL "$dev" | tr -s ' ' '_')
-    SERIAL=$(lsblk -no SERIAL "$dev" | tr -s ' ' '_')
+    # Fixed disk - detect device type and get hardware info
+    local dev_type=$(lsblk -no TYPE "$dev" 2>/dev/null)
+    local dev_tran=$(lsblk -no TRAN "$dev" 2>/dev/null)
+
+    if [[ "$dev_type" == "rom" ]]; then
+      # CD-ROM/DVD: use lsblk (smartctl may not work on optical drives)
+      MODEL=$(lsblk -no MODEL "$dev" | tr -s ' ' '_')
+      SERIAL=$(lsblk -no SERIAL "$dev" | tr -s ' ' '_')
+    elif [[ "$dev_tran" == "usb" ]] || [[ "$dev_tran" == "sata" ]] || [[ "$dev_tran" == "ata" ]]; then
+      # USB/SATA/ATA disk: use smartctl/hdparm (bypasses USB bridges)
+      get_real_hardware_info "$dev"
+    else
+      # Unknown transport: fallback to lsblk
+      MODEL=$(lsblk -no MODEL "$dev" | tr -s ' ' '_')
+      SERIAL=$(lsblk -no SERIAL "$dev" | tr -s ' ' '_')
+    fi
+
     local medium_human="${MODEL:-unknown}_${SERIAL:-unknown}"
   fi
 
