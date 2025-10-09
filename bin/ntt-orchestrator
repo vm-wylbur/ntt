@@ -377,6 +377,48 @@ check_device_health() {
   echo "$IMAGE_FIRST"
 }
 
+update_health_from_mapfile() {
+  local medium_hash="$1"
+  local mapfile="$2"
+
+  if [[ ! -f "$mapfile" ]]; then
+    echo "[$(date -Iseconds)] WARNING: Mapfile not found: $mapfile, setting health=ok by default" >&2
+    psql_as_user "$DB_URL" -c "UPDATE medium SET health = 'ok' WHERE medium_hash = '$medium_hash';" 2>/dev/null || true
+    return
+  fi
+
+  # Parse rescue percentage from mapfile (same logic as ntt-imager)
+  # Mapfile format: pos(hex) size(hex) status
+  # Status: + (rescued), - (bad), ? (non-tried), * (non-trimmed), / (non-scraped)
+  local rescued=$(grep -v '^#' "$mapfile" 2>/dev/null | awk 'NF==3 && $2 ~ /^0x/ && $3=="+" {sum+=strtonum($2)} END {print sum+0}')
+  local total=$(grep -v '^#' "$mapfile" 2>/dev/null | awk 'NF==3 && $2 ~ /^0x/ {sum+=strtonum($2)} END {print sum+0}')
+
+  local rescued_pct="0.00"
+  if [[ $total -eq 0 ]]; then
+    rescued_pct="0.00"
+  else
+    rescued_pct=$(echo "scale=2; $rescued * 100 / $total" | bc)
+  fi
+
+  # Determine health based on rescue percentage
+  local health="failed"
+  if (( $(echo "$rescued_pct == 100" | bc -l) )); then
+    health="ok"
+  elif (( $(echo "$rescued_pct >= 95" | bc -l) )); then
+    health="incomplete"
+  elif (( $(echo "$rescued_pct >= 50" | bc -l) )); then
+    health="corrupt"
+  else
+    health="failed"
+  fi
+
+  echo "[$(date -Iseconds)] Updating health: ${rescued_pct}% rescued → health=$health" >&2
+  log health_update "{\"medium_hash\": \"$medium_hash\", \"rescued_pct\": \"$rescued_pct\", \"health\": \"$health\"}"
+
+  # Update database
+  psql_as_user "$DB_URL" -c "UPDATE medium SET health = '$health' WHERE medium_hash = '$medium_hash';" 2>/dev/null || true
+}
+
 # ---------- database functions ----------
 check_duplicate() {
   local medium_hash="$1"
@@ -574,6 +616,9 @@ handle_device_mode() {
   else
     log imager_success "{\"medium_hash\":\"$medium_hash\",\"msg\":\"100% rescued\"}"
   fi
+
+  # Update health based on ddrescue results
+  update_health_from_mapfile "$medium_hash" "$MAP"
 
   # Mount the image as loop device
   LOOP=$(losetup -f --show -r "$IMG")

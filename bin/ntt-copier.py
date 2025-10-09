@@ -308,6 +308,17 @@ class CopyWorker:
             result = cur.fetchone()
             return result['image_path'] if result else None
 
+    def get_medium_health(self, medium_hash: str) -> Optional[str]:
+        """Get health status for a medium from database."""
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                SELECT health
+                FROM medium
+                WHERE medium_hash = %s
+            """, (medium_hash,))
+            result = cur.fetchone()
+            return result['health'] if result else None
+
     def ensure_medium_mounted(self, medium_hash: str) -> str:
         """Ensure medium is mounted, mount if needed.
 
@@ -345,6 +356,26 @@ class CopyWorker:
 
         # Not mounted - need to mount it
         logger.info(f"Medium {medium_hash} not mounted, attempting to mount...")
+
+        # Check health before mounting (refuse to mount if imaging was bad)
+        health = self.get_medium_health(medium_hash)
+        if health and health != 'ok':
+            logger.error(f"Refusing to mount medium {medium_hash}: health={health} (not 'ok')")
+            logger.error(f"Marking all inodes as EXCLUDED due to bad health")
+
+            # Mark all inodes for this medium as EXCLUDED
+            with self.conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE inode
+                    SET copied = true, claimed_by = 'EXCLUDED: bad_health', claimed_at = NOW()
+                    WHERE medium_hash = %s
+                      AND copied = false
+                """, (medium_hash,))
+                excluded_count = cur.rowcount
+            self.conn.commit()
+
+            raise Exception(f"Cannot mount medium {medium_hash}: health={health} (expected 'ok'). "
+                          f"Marked {excluded_count} inodes as EXCLUDED.")
 
         # Get image path from database
         image_path = self.get_image_path(medium_hash)
@@ -690,12 +721,13 @@ class CopyWorker:
                             ))
 
                         # Log when max retries approached (safety net)
+                        # This is Layer 2 - catches ANY error type that escapes Layer 1 (diagnostic auto-skip)
                         if retry_count >= 50:
                             logger.error(
                                 f"⚠️  MAX RETRIES REACHED "
                                 f"ino={inode_row['ino']} "
                                 f"retry={retry_count} "
-                                f"(marking as failed)"
+                                f"(permanently marking as failed)"
                             )
 
                             # PHASE 4: Queue max retries event
@@ -711,6 +743,13 @@ class CopyWorker:
                                 findings,
                                 'max_retries'
                             ))
+
+                            # CRITICAL: Actually mark as failed and skip to next inode
+                            # This prevents infinite retry loop
+                            results_by_inode[key] = None  # Mark as skipped (copied=true will be set)
+                            action_counts['max_retries_exceeded'] = action_counts.get('max_retries_exceeded', 0) + 1
+
+                            continue  # Skip to next inode - DON'T release claim for retry
 
                         results_by_inode[key] = {
                             'error_type': error_type,

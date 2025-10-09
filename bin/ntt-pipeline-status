@@ -1,0 +1,93 @@
+#!/bin/bash
+# Author: PB and Claude
+# Date: 2025-10-09
+# License: (c) HRDAG, 2025, GPL-2 or newer
+#
+# ------
+# ntt/bin/ntt-pipeline-status
+#
+# Check complete pipeline status for a medium before proceeding
+
+HASH=$1
+if [ -z "$HASH" ]; then
+    echo "Usage: $0 <medium_hash>"
+    exit 1
+fi
+
+echo "=== Pipeline Status Check: $HASH ==="
+echo ""
+
+# 1. Check ddrescue
+echo "1️⃣ DDRESCUE:"
+if sudo grep "Finished" /data/fast/img/${HASH}.map 2>/dev/null; then
+    echo "   ✅ Complete"
+else
+    echo "   ❌ Not finished or no .map file"
+fi
+
+# 2. Check mount
+echo ""
+echo "2️⃣ MOUNT:"
+if mount | grep -q $HASH; then
+    MOUNT_POINT=$(mount | grep $HASH | awk '{print $3}')
+    echo "   ✅ Mounted at $MOUNT_POINT"
+else
+    echo "   ❌ Not mounted"
+fi
+
+# 3. Check enum (database has inodes)
+echo ""
+echo "3️⃣ ENUM:"
+INODE_COUNT=$(sudo -u postgres psql -d copyjob -tAc "SELECT COUNT(*) FROM inode WHERE medium_hash = '$HASH'")
+if [ "$INODE_COUNT" -gt 0 ]; then
+    echo "   ✅ Complete ($INODE_COUNT inodes)"
+else
+    echo "   ❌ Not enumerated (0 inodes)"
+fi
+
+# 4. Check load (database has paths)
+echo ""
+echo "4️⃣ LOAD:"
+PATH_COUNT=$(sudo -u postgres psql -d copyjob -tAc "SELECT COUNT(*) FROM path WHERE medium_hash = '$HASH'")
+if [ "$PATH_COUNT" -gt 0 ]; then
+    echo "   ✅ Complete ($PATH_COUNT paths)"
+else
+    echo "   ❌ Not loaded (0 paths)"
+fi
+
+# 5. Check copy status
+echo ""
+echo "5️⃣ COPY:"
+sudo -u postgres psql -d copyjob -c "
+SELECT
+    COUNT(*) FILTER (WHERE copied = true) as copied,
+    COUNT(*) FILTER (WHERE copied = false AND claimed_by IS NULL) as pending,
+    COUNT(*) FILTER (WHERE copied = false AND claimed_by IS NOT NULL) as excluded_or_failed,
+    COUNT(*) as total
+FROM inode
+WHERE medium_hash = '$HASH'"
+
+# 6. Check archive
+echo ""
+echo "6️⃣ ARCHIVE:"
+if [ -f "/data/cold/img-read/${HASH}.tar.zst" ]; then
+    SIZE=$(ls -lh /data/cold/img-read/${HASH}.tar.zst | awk '{print $5}')
+    echo "   ✅ Archived ($SIZE)"
+else
+    echo "   ❌ Not archived"
+fi
+
+echo ""
+echo "=== Next Action Recommendation ==="
+if [ "$INODE_COUNT" -eq 0 ]; then
+    echo "▶️  Run: ntt-enum"
+elif [ "$PATH_COUNT" -eq 0 ]; then
+    echo "▶️  Run: ntt-loader"
+else
+    PENDING=$(sudo -u postgres psql -d copyjob -tAc "SELECT COUNT(*) FROM inode WHERE medium_hash = '$HASH' AND copied = false AND claimed_by IS NULL")
+    if [ "$PENDING" -gt 0 ]; then
+        echo "▶️  Run: ntt-copier ($PENDING files pending)"
+    else
+        echo "▶️  Run: archive and cleanup"
+    fi
+fi

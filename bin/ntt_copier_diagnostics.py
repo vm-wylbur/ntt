@@ -161,11 +161,12 @@ class DiagnosticService:
         """
         Decide if we should permanently skip this inode.
 
-        Phase 2: Auto-skip BEYOND_EOF errors (fundamentally unrecoverable)
-
-        Only skips when we're CERTAIN the error is unrecoverable:
+        Phase 2: Auto-skip unrecoverable errors
         - BEYOND_EOF: FAT points to sector beyond image boundary
-        - Confirmed by both exception message AND dmesg kernel log
+        - IO_ERROR: Stalled ddrescue, bad sectors, unreadable media
+
+        Only skips when we're CERTAIN the error is unrecoverable.
+        Requires both exception message AND dmesg kernel confirmation.
 
         Args:
             findings: dict from diagnose_at_checkpoint()
@@ -175,9 +176,15 @@ class DiagnosticService:
         """
         checks = findings['checks_performed']
 
-        # Only skip if we have strong evidence of unrecoverable error
+        # BEYOND_EOF - confirmed unrecoverable
         if 'detected_beyond_eof' in checks or 'dmesg:beyond_eof' in checks:
-            logger.info(f"BEYOND_EOF detected - this inode is unrecoverable")
+            logger.info(f"BEYOND_EOF detected - unrecoverable")
+            return True
+
+        # I/O ERROR - only skip if confirmed by kernel (dmesg)
+        # Requires both exception message AND kernel confirmation to avoid false positives
+        if 'detected_io_error' in checks and 'dmesg:io_error' in checks:
+            logger.info(f"I/O ERROR detected (confirmed by dmesg) - unrecoverable")
             return True
 
         return False
