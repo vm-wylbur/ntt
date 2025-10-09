@@ -246,6 +246,10 @@ class CopyWorker:
             worker_id=self.worker_id
         )
 
+        # Track diagnostic events to record after batch commit
+        # This avoids breaking FOR UPDATE SKIP LOCKED by committing mid-batch
+        self._pending_diagnostic_events = []  # List of (medium_hash, ino, findings, action)
+
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals gracefully."""
         logger.info(f"Received signal {signum}, shutting down...")
@@ -656,14 +660,57 @@ class CopyWorker:
                                 f"findings={findings}"
                             )
 
-                        # Log when max retries approached (Phase 2 will skip here)
+                            # PHASE 2: Auto-skip if unrecoverable error detected
+                            if self.diagnostics.should_skip_permanently(findings):
+                                action_taken = 'skipped'
+                                logger.warning(
+                                    f"⏭️  SKIPPED ino={inode_row['ino']} "
+                                    f"reason=DIAGNOSTIC_SKIP:BEYOND_EOF (unrecoverable)"
+                                )
+                                # Mark as skipped (similar to NON_FILE success pattern)
+                                results_by_inode[key] = None
+                                action_counts['diagnostic_skip'] = action_counts.get('diagnostic_skip', 0) + 1
+
+                                # PHASE 4: Queue diagnostic event (no commit - locks held)
+                                self._pending_diagnostic_events.append((
+                                    inode_row['medium_hash'],
+                                    inode_row['ino'],
+                                    findings,
+                                    action_taken
+                                ))
+
+                                continue  # Skip to next inode
+
+                            # If not skipped, queue event for continuing despite errors
+                            self._pending_diagnostic_events.append((
+                                inode_row['medium_hash'],
+                                inode_row['ino'],
+                                findings,
+                                'continuing'
+                            ))
+
+                        # Log when max retries approached (safety net)
                         if retry_count >= 50:
                             logger.error(
                                 f"⚠️  MAX RETRIES REACHED "
                                 f"ino={inode_row['ino']} "
                                 f"retry={retry_count} "
-                                f"(WOULD SKIP IN FUTURE PHASE)"
+                                f"(marking as failed)"
                             )
+
+                            # PHASE 4: Queue max retries event
+                            findings = {
+                                'retry_count': retry_count,
+                                'exception_type': error_type,
+                                'exception_msg': error_msg,
+                                'checks_performed': ['max_retries_exceeded']
+                            }
+                            self._pending_diagnostic_events.append((
+                                inode_row['medium_hash'],
+                                inode_row['ino'],
+                                findings,
+                                'max_retries'
+                            ))
 
                         results_by_inode[key] = {
                             'error_type': error_type,
@@ -776,6 +823,50 @@ class CopyWorker:
                 t_db_total = t7 - t_db_start
                 logger.info(f"TIMING: commit: {t7-t6:.3f}s, total_db_ops: {t_db_total:.3f}s")
 
+                # NEW: Write diagnostic events (separate transaction, locks released)
+                if self._pending_diagnostic_events:
+                    t_diag_start = time.time()
+                    events_written = 0
+
+                    for medium_hash, ino, findings, action in self._pending_diagnostic_events:
+                        try:
+                            self.diagnostics.record_diagnostic_event_no_commit(
+                                medium_hash, ino, findings, action
+                            )
+                            events_written += 1
+                        except Exception as e:
+                            logger.error(f"Failed to record diagnostic event for ino={ino}: {e}")
+
+                    # Commit diagnostic events (best-effort - won't break batch)
+                    try:
+                        self.conn.commit()
+                        t_diag_end = time.time()
+                        logger.info(f"TIMING: diagnostic_events: {t_diag_end-t_diag_start:.3f}s for {events_written} events")
+                    except Exception as e:
+                        logger.error(f"Failed to commit diagnostic events: {e}")
+                        self.conn.rollback()
+
+                    # Clear for next batch
+                    self._pending_diagnostic_events = []
+
+                # PHASE 2: Record medium-level summaries (separate transaction after diagnostic events)
+                skip_count = action_counts.get('diagnostic_skip', 0)
+                if skip_count > 0 or self.processed_count >= 100:
+                    try:
+                        # Check for BEYOND_EOF (if any inodes were skipped)
+                        self.check_and_record_beyond_eof(skip_count)
+
+                        # Check for high error rate (if enough data)
+                        self.check_and_record_high_error_rate()
+
+                        # Commit medium-level problems (best-effort)
+                        self.conn.commit()
+                        logger.debug("Medium-level problem recording complete")
+
+                    except Exception as e:
+                        logger.error(f"Failed to record medium-level problems: {e}")
+                        self.conn.rollback()
+
                 t_batch_end = time.time()
                 t_batch_total = t_batch_end - t_batch_start
 
@@ -810,6 +901,110 @@ class CopyWorker:
             logger.error(f"Batch processing error: {e}")
             self.conn.rollback()
             return False
+
+    # ========================================
+    # MEDIUM-LEVEL PROBLEM RECORDING (Phase 2.1)
+    # ========================================
+
+    def record_medium_problem(self, problem_type: str, details: dict):
+        """
+        Record medium-level problem in database WITHOUT committing.
+
+        Caller is responsible for commit. This is critical to avoid breaking
+        the FOR UPDATE SKIP LOCKED pattern in batch processing.
+
+        Args:
+            problem_type: 'beyond_eof_detected', 'high_error_rate', 'mount_unstable'
+            details: dict with problem-specific metadata
+        """
+        import json
+        from datetime import datetime
+
+        try:
+            with self.conn.cursor() as cur:
+                problem_entry = {
+                    problem_type: True,
+                    **details,
+                    'detected_at': datetime.now().isoformat(),
+                    'worker_id': self.worker_id
+                }
+
+                cur.execute("""
+                    UPDATE medium
+                    SET problems = COALESCE(problems, '{}'::jsonb) || %s::jsonb
+                    WHERE medium_hash = %s
+                """, (json.dumps(problem_entry), self.medium_hash))
+
+            logger.info(f"Recorded medium problem: {problem_type}")
+
+        except Exception as e:
+            logger.error(f"Failed to record medium problem: {e}")
+            raise
+
+    def check_and_record_beyond_eof(self, skip_count: int):
+        """
+        Check if this is the first BEYOND_EOF detection and record if so.
+
+        Args:
+            skip_count: Number of inodes skipped in this batch due to BEYOND_EOF
+        """
+        if skip_count == 0:
+            return  # No BEYOND_EOF errors in this batch
+
+        try:
+            # Check if this is first occurrence
+            with self.conn.cursor() as cur:
+                cur.execute("""
+                    SELECT problems->'beyond_eof_detected' IS NOT NULL as already_recorded
+                    FROM medium WHERE medium_hash = %s
+                """, (self.medium_hash,))
+                result = cur.fetchone()
+
+                if not result or not result['already_recorded']:
+                    self.record_medium_problem('beyond_eof_detected', {
+                        'skip_count': skip_count,
+                        'message': 'FAT filesystem points to sectors beyond image boundary'
+                    })
+                    logger.info(f"First BEYOND_EOF detection for medium {self.medium_hash}")
+
+        except Exception as e:
+            logger.error(f"Failed to check/record BEYOND_EOF: {e}")
+            # Don't raise - best effort recording
+
+    def check_and_record_high_error_rate(self):
+        """
+        Check if error rate > 10% and record if so.
+
+        Only records once per worker run (not on every batch).
+        Requires at least 100 inodes processed to avoid false positives.
+        """
+        if self.processed_count < 100:
+            return  # Not enough data yet
+
+        error_rate = self.stats['errors'] / max(self.processed_count, 1)
+
+        if error_rate <= 0.10:
+            return  # Error rate acceptable
+
+        try:
+            # Check if we've already recorded high error rate (this session)
+            if hasattr(self, '_high_error_rate_recorded'):
+                return  # Already recorded this session
+
+            self.record_medium_problem('high_error_rate', {
+                'error_rate': round(error_rate, 3),
+                'errors': self.stats['errors'],
+                'processed': self.processed_count,
+                'threshold': 0.10
+            })
+
+            # Mark as recorded for this session
+            self._high_error_rate_recorded = True
+            logger.warning(f"High error rate detected: {error_rate:.1%} ({self.stats['errors']}/{self.processed_count})")
+
+        except Exception as e:
+            logger.error(f"Failed to record high error rate: {e}")
+            # Don't raise - best effort recording
 
     def release_claim(self, inode_row: dict, error_msg: str = None):
         """Release claim on an inode after error.

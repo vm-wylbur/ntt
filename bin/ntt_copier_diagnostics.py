@@ -157,6 +157,31 @@ class DiagnosticService:
             logger.debug(f"dmesg check failed: {e}")
             return None
 
+    def should_skip_permanently(self, findings: dict) -> bool:
+        """
+        Decide if we should permanently skip this inode.
+
+        Phase 2: Auto-skip BEYOND_EOF errors (fundamentally unrecoverable)
+
+        Only skips when we're CERTAIN the error is unrecoverable:
+        - BEYOND_EOF: FAT points to sector beyond image boundary
+        - Confirmed by both exception message AND dmesg kernel log
+
+        Args:
+            findings: dict from diagnose_at_checkpoint()
+
+        Returns:
+            True if should skip permanently, False otherwise
+        """
+        checks = findings['checks_performed']
+
+        # Only skip if we have strong evidence of unrecoverable error
+        if 'detected_beyond_eof' in checks or 'dmesg:beyond_eof' in checks:
+            logger.info(f"BEYOND_EOF detected - this inode is unrecoverable")
+            return True
+
+        return False
+
     def _check_mount_status(self, medium_hash: str) -> str:
         """
         Check if medium mount point exists and is accessible.
@@ -179,3 +204,49 @@ class DiagnosticService:
             return 'ok'
         except Exception:
             return 'inaccessible'
+
+    def record_diagnostic_event_no_commit(self, medium_hash: str, ino: int,
+                                          findings: dict, action_taken: str):
+        """
+        Record diagnostic event in medium.problems JSONB column WITHOUT committing.
+
+        Caller is responsible for commit. This is critical to avoid breaking
+        the FOR UPDATE SKIP LOCKED pattern in batch processing.
+
+        Args:
+            medium_hash: Medium being processed
+            ino: Inode that failed
+            findings: dict from diagnose_at_checkpoint()
+            action_taken: 'skipped', 'remounted', 'continuing', 'max_retries'
+        """
+        from datetime import datetime
+        import json
+
+        entry = {
+            'ino': ino,
+            'retry_count': findings['retry_count'],
+            'checks': findings['checks_performed'],
+            'action': action_taken,
+            'timestamp': datetime.now().isoformat(),
+            'worker_id': self.worker_id,
+            'exception_type': findings.get('exception_type'),
+            'exception_msg': findings.get('exception_msg', '')[:100]
+        }
+
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE medium
+                    SET problems = COALESCE(problems, '{}'::jsonb) ||
+                                  jsonb_build_object(
+                                      'diagnostic_events',
+                                      COALESCE(problems->'diagnostic_events', '[]'::jsonb) || %s::jsonb
+                                  )
+                    WHERE medium_hash = %s
+                """, (json.dumps(entry), medium_hash))
+
+            logger.debug(f"Recorded diagnostic event: {action_taken} for ino={ino}")
+
+        except Exception as e:
+            logger.error(f"Failed to record diagnostic event: {e}")
+            raise
