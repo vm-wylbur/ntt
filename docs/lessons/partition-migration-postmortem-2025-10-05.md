@@ -7,6 +7,8 @@ License: (c) HRDAG, 2025, GPL-2 or newer
 ntt/docs/partition-migration-postmortem-2025-10-05.md
 -->
 
+<!-- lesson: DETACH/ATTACH fails with parent-level FK; TRUNCATE CASCADE is dangerous with parent FK -->
+
 # Partition Migration Postmortem - 2025-10-05
 
 ## What We Accomplished

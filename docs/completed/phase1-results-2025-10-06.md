@@ -7,6 +7,8 @@ License: (c) HRDAG, 2025, GPL-2 or newer
 ntt/docs/phase1-results-2025-10-06.md
 -->
 
+<!-- completed: FK indexes + trigger optimization; completed in commit 1a3bf0c -->
+
 # Phase 1 Results: FK Indexes + Optimized Triggers - 2025-10-06
 
 ## Summary

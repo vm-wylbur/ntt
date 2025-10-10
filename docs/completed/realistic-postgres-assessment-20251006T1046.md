@@ -7,6 +7,8 @@ License: (c) HRDAG, 2025, GPL-2 or newer
 ntt/docs/realistic-postgres-assessment-20251006T1046.md
 -->
 
+<!-- completed: Capacity planning; informed FK migration decisions -->
+
 # Realistic PostgreSQL Performance Assessment
 
 ## The Problem with AI Guessing

@@ -7,6 +7,8 @@ License: (c) HRDAG, 2025, GPL-2 or newer
 ntt/docs/mount-arch-cleanups.md
 -->
 
+<!-- completed: Stale loop cleanup documented and resolved in commit 0a20b9a -->
+
 # Mount Architecture Cleanup Plan
 
 ## Problem Statement

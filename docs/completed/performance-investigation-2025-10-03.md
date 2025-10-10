@@ -7,6 +7,8 @@ License: (c) HRDAG, 2025, GPL-2 or newer
 ntt/docs/performance-investigation-2025-10-03.md
 -->
 
+<!-- completed: Early performance work; various optimizations implemented -->
+
 # NTT Performance Investigation - Query Optimization
 
 **Date**: 2025-10-03

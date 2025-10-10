@@ -7,6 +7,8 @@ License: (c) HRDAG, 2025, GPL-2 or newer
 ntt/docs/ai-recommendations-comparison-2025-10-06.md
 -->
 
+<!-- completed: All 3 AIs recommended P2P FK; implemented in commit 30153f1 -->
+
 # AI Recommendations Comparison - PostgreSQL Partition Performance
 
 ## Problem Summary

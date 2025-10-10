@@ -1,3 +1,5 @@
+<!-- completed: Claim-Analyze-Execute architecture implemented in commit c63e2bf -->
+
 # NTT Copier Refactor: Implementation Design
 
 ## Overview

@@ -7,6 +7,8 @@ License: (c) HRDAG, 2025, GPL-2 or newer
 ntt/docs/loader-optimization-investigation-2025-10-05.md
 -->
 
+<!-- completed: Early loader optimization; DETACH/ATTACH and P2P FK completed in commits 5528562, 30153f1 -->
+
 # NTT Loader Performance Investigation - 2025-10-05
 
 ## Problem Statement

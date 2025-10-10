@@ -7,6 +7,8 @@ License: (c) HRDAG, 2025, GPL-2 or newer
 ntt/docs/partition-migration-status-2025-10-05.md
 -->
 
+<!-- completed: Progress tracking; migration complete in commit 30153f1 -->
+
 # Partition Migration Status - 2025-10-05
 
 ## Completed Steps

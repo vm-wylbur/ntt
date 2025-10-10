@@ -16,7 +16,54 @@ dotfiles/ai/docs/meta-CLAUDE.md
 
 ---
 
-## COMMUNICATION REQUIREMENTS - MANDATORY
+## NTT PROJECT DOCUMENTATION
+
+### Before Starting Any Work
+
+THINK and REFLECT and DISCUSS. Action comes after thinking. DO NOT JUMP STRAIGHT INTO CHANGES. 
+
+**CRITICAL: Read these lessons first** - Never repeat these mistakes:
+- `docs/lessons/lessons-learned-verifying-byhash-integrity-2025-10-04.md` - Don't assume, verify exhaustively
+- `docs/lessons/partition-migration-postmortem-2025-10-05.md` - DETACH/ATTACH fails with parent-level FK, TRUNCATE CASCADE is dangerous
+
+### Project Overview
+
+NTT is a disk image deduplication and archival system. Pipeline stages:
+1. **Imaging** (`ntt-orchestrator`) - ddrescue disk images from physical media
+2. **Enumeration** (`ntt-enum`) - Walk mounted filesystem, extract inode metadata
+3. **Loading** (`ntt-loader`) - Import enumeration data into PostgreSQL partitions
+4. **Copying** (`ntt-copier.py`) - Deduplicate files to by-hash storage with hardlinks
+5. **Archiving** (`ntt-archiver`) - Compress and move to cold storage
+
+### Key Reference Documents
+
+Consult these when relevant to your work:
+
+**Operational:**
+- `docs/disk-read-checklist.md` - Diagnostic procedures for problematic disks (living doc)
+- `docs/diagnostic-queries.md` - SQL queries for analyzing copier diagnostic data
+- `docs/ignore-patterns-guide.md` - Path exclusion patterns (45 patterns, e5727c34 case study)
+
+**Specifications:**
+- `docs/hash-format.md` - BLAKE3 v2 hybrid format (SIZE|MODEL|SERIAL| + content)
+- `docs/medium-columns-guide.md` - Database columns: health/problems/diagnostics/message
+- `docs/sanity-checks.md` - Database integrity checks
+
+**Architecture:**
+- Partitioning: Partition-to-partition FK architecture (commit 30153f1)
+- Diagnostics: DiagnosticService Phase 4 complete (commit 6c963c7)
+- Copier: Claim-Analyze-Execute pattern (commit c63e2bf)
+
+### Documentation Organization
+
+- `docs/` - Active reference documentation
+- `docs/lessons/` - Critical mistakes to avoid
+- `docs/completed/` - Archived planning docs (implemented)
+- `docs/partial/` - Incomplete work and ongoing planning
+
+---
+
+## COMMUNICATION REQUIREMENTS - MANDATORY 
 
 ### Professional Communication Style
 - Act as professional peer, not assistant seeking approval
@@ -33,6 +80,7 @@ dotfiles/ai/docs/meta-CLAUDE.md
 - **NEVER commit without explicit approval from PB**
 - Always ask: "Should we commit this?" before `git commit`
 - PB must explicitly say "let's commit" or similar
+- don't use bash `mv` use `git mv` so we preserve version history
 - Exploratory git commands (status, diff, log) allowed without approval
 
 ### Commit Message Format

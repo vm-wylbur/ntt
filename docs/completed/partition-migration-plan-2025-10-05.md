@@ -7,6 +7,8 @@ License: (c) HRDAG, 2025, GPL-2 or newer
 ntt/docs/partition-migration-plan-2025-10-05.md
 -->
 
+<!-- completed: Original P2P FK plan; completed in commit 30153f1 -->
+
 # NTT Partition Migration Plan - 2025-10-05
 
 ## Executive Summary

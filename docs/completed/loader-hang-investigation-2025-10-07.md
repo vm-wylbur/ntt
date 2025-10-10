@@ -7,6 +7,8 @@ License: (c) HRDAG, 2025, GPL-2 or newer
 ntt/docs/loader-hang-investigation-2025-10-07.md
 -->
 
+<!-- completed: Deduplication hang analysis; safeguards added in commit 853bd40 -->
+
 # Loader Hang Investigation - 2025-10-07
 
 ## Problem Statement

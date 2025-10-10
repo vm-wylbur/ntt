@@ -1,3 +1,5 @@
+<!-- completed: bb226d2a unmount verification; 99.66% coverage confirmed, safe to unmount -->
+
 # /mnt/sdc1-test Unmount Readiness Report
 
 **Date**: 2025-10-08

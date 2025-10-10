@@ -7,6 +7,8 @@ License: (c) HRDAG, 2025, GPL-2 or newer
 ntt/docs/integrated-analysis-and-plan-2025-10-06.md
 -->
 
+<!-- completed: Comprehensive migration plan; Phases 1, 2A (failed), 2B (succeeded) executed; commit 30153f1 -->
+
 # Integrated Analysis: PostgreSQL Partition Performance Solution
 
 ## Executive Summary

@@ -1,3 +1,5 @@
+<!-- completed: Performance investigation on bb226d2a; 40x variance from file size distribution (0.4% of files = 73% of data) -->
+
 # NTT Copy Worker Performance Analysis
 
 **Date:** 2025-10-07

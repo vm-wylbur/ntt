@@ -1,3 +1,5 @@
+<!-- lesson: Don't assume, verify exhaustively; 100% integrity confirmed after proper verification -->
+
 # Lessons Learned: Verifying Content-Addressable Store Integrity
 
 **Date:** 2025-10-04

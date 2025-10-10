@@ -1,3 +1,5 @@
+<!-- completed: Re-hardlink design superseded by Claim-Analyze-Execute refactor (commit c63e2bf); functionality integrated -->
+
 # Changes Required for ntt-copier --re-hardlink Mode
 
 ## Summary
