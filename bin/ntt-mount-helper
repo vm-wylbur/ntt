@@ -196,6 +196,16 @@ do_mount() {
       exit 0
     fi
 
+    # Zip disk special case: filesystem may start at offset 16384 bytes (sector 32)
+    # Zip disks (100MB/250MB/750MB Iomega removable media) often have FAT16/FAT32
+    # filesystems starting at 0x4000 instead of sector 0
+    echo "Standard mount failed, trying Zip disk offset (16384 bytes)..." >&2
+    if mount -t vfat -o ro,noatime,nodev,nosuid,offset=16384 "$loop_device" "$mount_point" 2>/dev/null; then
+      echo "Mounted $loop_device at $mount_point (Zip disk with offset=16384)" >&2
+      echo '{"layout":"single","device":"'"$loop_device"'","mount":"'"$mount_point"'","fstype":"vfat","offset":16384}'
+      exit 0
+    fi
+
     # Mount failed - cleanup
     losetup -d "$loop_device" 2>/dev/null || true
     rmdir "$mount_point" 2>/dev/null || true

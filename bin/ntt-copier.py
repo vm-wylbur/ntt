@@ -294,7 +294,12 @@ class CopyWorker:
                 logger.info(f"Limit reached: {self.limit}")
                 break
 
-        logger.info(f"Worker {self.worker_id} finished", stats=self.stats)
+        # Human-readable final summary
+        total_processed = self.stats['copied'] + self.stats['deduped']
+        bytes_mb = self.stats['bytes'] / 1024 / 1024
+        logger.info(f"Worker {self.worker_id} finished: "
+                   f"processed={total_processed} (new={self.stats['copied']}, deduped={self.stats['deduped']}) "
+                   f"bytes={bytes_mb:.1f}MB errors={self.stats['errors']}")
         self.conn.close()
 
     def get_image_path(self, medium_hash: str) -> Optional[str]:
@@ -613,7 +618,7 @@ class CopyWorker:
                     '>10MB': sum(1 for r in claimed_inodes if r['size'] >= 10485760),
                 }
                 total_size_mb = sum(r['size'] for r in claimed_inodes) / 1024 / 1024
-                logger.info(f"BATCH SIZE_DIST: {size_dist} total_mb={total_size_mb:.1f}")
+                logger.debug(f"BATCH SIZE_DIST: {size_dist} total_mb={total_size_mb:.1f}")
 
                 # 2. Get paths for all inodes in batch
                 t_fetch_start = time.time()
@@ -669,7 +674,27 @@ class CopyWorker:
                         size_by_action[action] = size_by_action.get(action, 0) + inode_row.get('size', 0)
 
                         blob_id = self.process_inode_for_batch(work_unit)
-                        results_by_inode[key] = blob_id
+
+                        # Determine mime_type based on action type
+                        if action in ['copy_new_file', 'link_existing_file', 'handle_empty_file']:
+                            mime_type = plan.get('mime_type')  # From file analysis
+                        elif action == 'create_directory':
+                            mime_type = 'inode/directory'
+                        elif action == 'create_symlink':
+                            mime_type = 'inode/symlink'
+                        elif action == 'record_special':
+                            fs_type = plan.get('fs_type')
+                            mime_type = {
+                                'b': 'inode/blockdevice',
+                                'c': 'inode/chardevice',
+                                'p': 'inode/fifo',
+                                's': 'inode/socket'
+                            }.get(fs_type, 'inode/special')
+                        else:
+                            mime_type = None
+
+                        # Store both blob_id and mime_type
+                        results_by_inode[key] = {'blob_id': blob_id, 'mime_type': mime_type}
                     except Exception as e:
                         error_type = type(e).__name__
                         error_msg = str(e)[:200]  # Truncate long messages
@@ -703,7 +728,7 @@ class CopyWorker:
                                     f"reason=DIAGNOSTIC_SKIP:BEYOND_EOF (unrecoverable)"
                                 )
                                 # Mark as skipped (similar to NON_FILE success pattern)
-                                results_by_inode[key] = None
+                                results_by_inode[key] = {'blob_id': None, 'mime_type': None}
                                 action_counts['diagnostic_skip'] = action_counts.get('diagnostic_skip', 0) + 1
 
                                 # PHASE 4: Queue diagnostic event (no commit - locks held)
@@ -750,7 +775,7 @@ class CopyWorker:
 
                             # CRITICAL: Actually mark as failed and skip to next inode
                             # This prevents infinite retry loop
-                            results_by_inode[key] = None  # Mark as skipped (copied=true will be set)
+                            results_by_inode[key] = {'blob_id': None, 'mime_type': None}
                             action_counts['max_retries_exceeded'] = action_counts.get('max_retries_exceeded', 0) + 1
 
                             continue  # Skip to next inode - DON'T release claim for retry
@@ -768,28 +793,20 @@ class CopyWorker:
                 # For paths table
                 medium_hashes, inos_for_paths, blob_ids = [], [], []
                 for (mh, ino), result in results_by_inode.items():
-                    if is_sha256_hash_lowercase(result):
+                    if isinstance(result, dict) and is_sha256_hash_lowercase(result.get('blob_id')):
                         medium_hashes.append(mh)
                         inos_for_paths.append(ino)
-                        blob_ids.append(result)
+                        blob_ids.append(result['blob_id'])
 
                 # For inode table - separate success and failures
-                success_ids, success_blob_ids = [], []
+                success_ids, success_blob_ids, success_mime_types = [], [], []
                 failed_inodes = []  # List of {id, ino, error_type, error_msg}
 
                 for inode_row in claimed_inodes:
                     key = (inode_row['medium_hash'], inode_row['ino'])
                     result = results_by_inode.get(key)
 
-                    if result and isinstance(result, str):
-                        # Success: result is blob_id string (regular files)
-                        success_ids.append(inode_row['id'])
-                        success_blob_ids.append(result)
-                    elif result is None:
-                        # Success: no blob_id needed (directories, symlinks, special files)
-                        success_ids.append(inode_row['id'])
-                        success_blob_ids.append(None)
-                    elif result and isinstance(result, dict):
+                    if isinstance(result, dict) and 'error_type' in result:
                         # Failure: result is error info dict
                         failed_inodes.append({
                             'id': inode_row['id'],
@@ -798,6 +815,11 @@ class CopyWorker:
                             'error_type': result['error_type'],
                             'error_msg': result['error_msg']
                         })
+                    elif isinstance(result, dict):
+                        # Success: result is dict with blob_id and mime_type
+                        success_ids.append(inode_row['id'])
+                        success_blob_ids.append(result.get('blob_id'))
+                        success_mime_types.append(result.get('mime_type'))
                     else:
                         # Truly unknown result type (shouldn't happen)
                         failed_inodes.append({
@@ -824,18 +846,19 @@ class CopyWorker:
                           AND path.exclude_reason IS NULL
                     """, (inos_for_paths, blob_ids, self.medium_hash))
                     t1 = time.time()
-                    logger.info(f"TIMING: UPDATE path: {t1-t0:.3f}s for {len(medium_hashes)} paths")
+                    logger.debug(f"TIMING: UPDATE path: {t1-t0:.3f}s for {len(medium_hashes)} paths")
 
                 if success_ids:
                     t2 = time.time()
                     cur.execute("""
-                        UPDATE inode SET copied = true, blobid = updates.blob_id
-                        FROM unnest(%s::bigint[], %s::text[]) AS updates(id, blob_id)
+                        UPDATE inode SET copied = true, blobid = updates.blob_id,
+                                         mime_type = COALESCE(updates.mime_type, inode.mime_type)
+                        FROM unnest(%s::bigint[], %s::text[], %s::text[]) AS updates(id, blob_id, mime_type)
                         WHERE inode.id = updates.id
                           AND inode.medium_hash = %s
-                    """, (success_ids, success_blob_ids, self.medium_hash))
+                    """, (success_ids, success_blob_ids, success_mime_types, self.medium_hash))
                     t3 = time.time()
-                    logger.info(f"TIMING: UPDATE inode (success): {t3-t2:.3f}s for {len(success_ids)} inodes")
+                    logger.debug(f"TIMING: UPDATE inode (success): {t3-t2:.3f}s for {len(success_ids)} inodes")
 
                 if failed_inodes:
                     t4 = time.time()
@@ -856,14 +879,14 @@ class CopyWorker:
                         logger.warning(f"Failed inode id={f['id']} ino={f['ino']}: {f['error_type']}: {f['error_msg']}")
 
                     t5 = time.time()
-                    logger.info(f"TIMING: UPDATE inode (failed): {t5-t4:.3f}s for {len(failed_inodes)} inodes")
+                    logger.debug(f"TIMING: UPDATE inode (failed): {t5-t4:.3f}s for {len(failed_inodes)} inodes")
 
                 # 6. Commit
                 t6 = time.time()
                 self.conn.commit()
                 t7 = time.time()
                 t_db_total = t7 - t_db_start
-                logger.info(f"TIMING: commit: {t7-t6:.3f}s, total_db_ops: {t_db_total:.3f}s")
+                logger.debug(f"TIMING: commit: {t7-t6:.3f}s, total_db_ops: {t_db_total:.3f}s")
 
                 # NEW: Write diagnostic events (separate transaction, locks released)
                 if self._pending_diagnostic_events:
@@ -913,18 +936,18 @@ class CopyWorker:
                 t_batch_total = t_batch_end - t_batch_start
 
                 # Comprehensive batch summary
-                logger.info(f"TIMING_BATCH: "
+                logger.debug(f"TIMING_BATCH: "
                            f"total={t_batch_total:.3f}s "
                            f"fetch_paths={t_fetch_end-t_fetch_start:.3f}s "
                            f"process_files={t_process_end-t_process_start:.3f}s "
                            f"build_arrays={t_build_end-t_build_start:.3f}s "
                            f"db_ops={t_db_total:.3f}s")
 
-                logger.info(f"BATCH_ACTIONS: {action_counts}")
+                logger.debug(f"BATCH_ACTIONS: {action_counts}")
 
                 # Log size per action in MB
                 size_by_action_mb = {k: v/1024/1024 for k, v in size_by_action.items()}
-                logger.info(f"BATCH_SIZE_BY_ACTION_MB: {size_by_action_mb}")
+                logger.debug(f"BATCH_SIZE_BY_ACTION_MB: {size_by_action_mb}")
 
                 logger.info(f"Completed batch: {len(success_ids)} copied, {len(failed_inodes)} failed")
 
@@ -1271,7 +1294,7 @@ class CopyWorker:
             t2 = time.time()
             hash_value = strategies.hash_file(temp_path)
             t3 = time.time()
-            logger.info(f"TIMING: copy={t2-t1:.3f}s hash={t3-t2:.3f}s size={size}")
+            logger.debug(f"TIMING: copy={t2-t1:.3f}s hash={t3-t2:.3f}s size={size}")
         except Exception as e:
             if temp_path.exists():
                 temp_path.unlink()
@@ -1281,13 +1304,13 @@ class CopyWorker:
         t4 = time.time()
         mime_type = strategies.detect_mime_type(self.mime_detector, source_path)
         t5 = time.time()
-        logger.info(f"TIMING: mime={t5-t4:.3f}s")
+        logger.debug(f"TIMING: mime={t5-t4:.3f}s")
 
         # Check if blob already exists (deduplication)
         t6 = time.time()
         blob_exists = self.check_blob_exists(hash_value)
         t7 = time.time()
-        logger.info(f"TIMING: blob_check={t7-t6:.3f}s total={t7-t0:.3f}s")
+        logger.debug(f"TIMING: blob_check={t7-t6:.3f}s total={t7-t0:.3f}s")
 
         if blob_exists:
             temp_path.unlink()  # No longer needed
@@ -1485,7 +1508,7 @@ class CopyWorker:
         )
 
         t1 = time.time()
-        logger.info(f"TIMING: create_hardlinks n_paths={len(plan['paths_to_link'])} time={t1-t0:.3f}s")
+        logger.debug(f"TIMING: create_hardlinks n_paths={len(plan['paths_to_link'])} time={t1-t0:.3f}s")
 
     def execute_empty_file_fs(self, plan: dict):
         """Filesystem operations for empty file."""
