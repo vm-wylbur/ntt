@@ -25,16 +25,16 @@ The `medium` table tracks metadata for disk images throughout the NTT pipeline. 
 
 **Valid Values:**
 - `'ok'` - 100% rescued, fully mountable (DEFAULT)
-- `'incomplete'` - 95-99% rescued, mountable but may have data gaps
-- `'corrupt'` - 50-95% rescued, mountable but significant data loss expected
-- `'failed'` - <50% rescued, unmountable or unusable
+- `'incomplete'` - 90-99% rescued, mountable but may have data gaps
+- `'corrupt'` - 20-89% rescued, mountable but significant data loss expected
+- `'failed'` - <20% rescued, refused to mount (too degraded)
 
 **Set By:**
 - Orchestrator after ddrescue completes (parses mapfile for rescue percentage)
 - ntt-copy-workers script (sets to 'ok' for compatibility)
 
 **Read By:**
-- Copier before mounting (refuses to mount if != 'ok')
+- Copier before mounting (refuses to mount only if == 'failed', allows 'ok'/'incomplete'/'corrupt')
 - Dashboard for filtering (`WHERE health = 'ok'`)
 - Reports for imaging success metrics
 
@@ -49,7 +49,8 @@ WHERE medium_hash = 'abc123';
 SELECT health
 FROM medium
 WHERE medium_hash = 'abc123';
--- If health != 'ok' → refuse to mount, mark all inodes as EXCLUDED
+-- If health == 'failed' → refuse to mount, mark all inodes as EXCLUDED
+-- If health == 'incomplete' or 'corrupt' → allow mount with warning
 ```
 
 **Design Decision:**
@@ -375,12 +376,13 @@ This speeds up queries looking for problematic media (only indexes non-ok values
 
 ### Default Value
 
-The `health` column defaults to NULL initially. The orchestrator sets it to 'ok' after successful imaging. The copier uses `health IS NULL OR health = 'ok'` to be safe.
+The `health` column defaults to NULL initially. The orchestrator sets it to 'ok', 'incomplete', 'corrupt', or 'failed' after imaging based on rescue percentage. The copier only refuses mounting if `health == 'failed'` (<20% rescued).
 
 ---
 
 ## Migration History
 
+- **2025-10-09:** Adjusted health thresholds (incomplete: 90-99%, corrupt: 20-89%, failed: <20%)
 - **2025-10-09:** Fixed health format (converted "true" to "ok", added constraint)
 - **2025-10-08:** Added `problems` column for Phase 4 diagnostic recording
 - **Earlier:** Added `diagnostics` column for image metadata

@@ -183,7 +183,7 @@ if [[ "$FORCE" == "false" ]]; then
       COUNT(*) as total
     FROM inode
     WHERE medium_hash = '$MEDIUM_HASH'
-  " 2>/dev/null)
+  " 2>/dev/null | grep -v "^Pager" | grep "|")
 
   COPIED=$(echo "$COPY_STATUS" | cut -d'|' -f1)
   PENDING=$(echo "$COPY_STATUS" | cut -d'|' -f2)

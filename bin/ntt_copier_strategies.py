@@ -48,6 +48,55 @@ def sanitize_path(path: str | bytes) -> Path:
     return Path(sanitized)
 
 
+def parse_partition_path(path: str | bytes, medium_hash: str) -> Path:
+    """
+    Parse partition-prefixed path and construct correct source path.
+
+    Multi-partition disks have paths stored as: p{N}:/path
+    Single-partition disks have paths stored as: /path
+
+    Args:
+        path: Path from database (may have p{N}: prefix)
+        medium_hash: Medium hash for constructing mount path
+
+    Returns:
+        Full source path for filesystem access
+
+    Examples:
+        parse_partition_path("p1:/etc/passwd", "abc123")
+        -> Path("/mnt/ntt/abc123/p1/etc/passwd")
+
+        parse_partition_path("/etc/passwd", "abc123")
+        -> Path("/mnt/ntt/abc123/etc/passwd")
+    """
+    # Handle bytea from PostgreSQL
+    if isinstance(path, bytes):
+        path_str = path.decode('utf-8', errors='surrogateescape')
+    else:
+        path_str = path
+
+    # Check for partition prefix (format: p{N}:)
+    # Partition number is 1-15, so check first 4 chars for pattern
+    if path_str.startswith('p') and ':' in path_str[:4]:
+        # Extract partition prefix and relative path
+        partition_prefix, relative_path = path_str.split(':', 1)
+
+        # Construct mount path with partition subdirectory
+        mount_base = f"/mnt/ntt/{medium_hash}/{partition_prefix}"
+    else:
+        # No partition prefix - single-partition disk (backward compatibility)
+        relative_path = path_str
+        mount_base = f"/mnt/ntt/{medium_hash}"
+
+    # Sanitize the relative path (handle escape sequences)
+    relative_path = relative_path.replace('\\r', '\r').replace('\\n', '\n')
+
+    # Construct full source path
+    source_path = Path(mount_base) / relative_path.lstrip('/')
+
+    return source_path
+
+
 def detect_fs_type(source_path: Path) -> Optional[str]:
     """
     Detect filesystem type for a path.

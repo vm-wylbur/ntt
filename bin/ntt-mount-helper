@@ -43,28 +43,33 @@ cleanup_stale_loops() {
 
   # Find all loop devices for this image (including deleted inodes)
   # Format: /dev/loop29  0  0  0  1  /data/fast/img/HASH.img (deleted)  0  512
-  losetup -l | grep "$(basename "$image_path")" | while read -r line; do
-    local loop_dev=$(echo "$line" | awk '{print $1}')
-    local status=$(echo "$line" | grep -o "(deleted)" || echo "")
+  local matching_loops
+  matching_loops=$(losetup -l | grep "$(basename "$image_path")" || true)
 
-    # Only cleanup deleted inodes (active image is fine)
-    if [[ -n "$status" ]]; then
-      echo "Cleaning up stale loop device: $loop_dev (deleted inode)" >&2
+  if [[ -n "$matching_loops" ]]; then
+    echo "$matching_loops" | while read -r line; do
+      local loop_dev=$(echo "$line" | awk '{print $1}')
+      local status=$(echo "$line" | grep -o "(deleted)" || echo "")
 
-      # Try to unmount if it's mounted at our mount point
-      if findmnt -S "$loop_dev" "$mount_point" >/dev/null 2>&1; then
-        echo "  Unmounting $loop_dev from $mount_point" >&2
-        umount "$mount_point" 2>/dev/null || echo "  Warning: umount failed" >&2
+      # Only cleanup deleted inodes (active image is fine)
+      if [[ -n "$status" ]]; then
+        echo "Cleaning up stale loop device: $loop_dev (deleted inode)" >&2
+
+        # Try to unmount if it's mounted at our mount point
+        if findmnt -S "$loop_dev" "$mount_point" >/dev/null 2>&1; then
+          echo "  Unmounting $loop_dev from $mount_point" >&2
+          umount "$mount_point" 2>/dev/null || echo "  Warning: umount failed" >&2
+        fi
+
+        # Detach loop device
+        if losetup -d "$loop_dev" 2>/dev/null; then
+          echo "  Detached $loop_dev" >&2
+        else
+          echo "  Warning: Could not detach $loop_dev (may be in use)" >&2
+        fi
       fi
-
-      # Detach loop device
-      if losetup -d "$loop_dev" 2>/dev/null; then
-        echo "  Detached $loop_dev" >&2
-      else
-        echo "  Warning: Could not detach $loop_dev (may be in use)" >&2
-      fi
-    fi
-  done
+    done
+  fi
 }
 
 # Mount command
@@ -93,38 +98,110 @@ do_mount() {
   # Create mount point
   mkdir -p "$mount_point"
 
-  # Create loop device (read-only)
+  # Create loop device (read-only, with partition scanning)
   local loop_device
-  loop_device=$(losetup -f --show -r "$image_path")
+  loop_device=$(losetup -f --show -r -P "$image_path")
   if [[ -z "$loop_device" ]]; then
     rmdir "$mount_point" 2>/dev/null || true
     echo "Error: Failed to create loop device for $image_path" >&2
     exit 1
   fi
 
-  # Detect filesystem type
-  local fs_type
-  fs_type=$(blkid -o value -s TYPE "$loop_device" 2>/dev/null || echo "")
+  # Wait briefly for kernel to create partition devices
+  sleep 0.2
 
-  # Mount with detected filesystem type (or auto-detect)
-  if [[ -n "$fs_type" ]]; then
-    if mount -t "$fs_type" -o ro,noatime,nodev,nosuid "$loop_device" "$mount_point" 2>/dev/null; then
-      echo "Mounted $loop_device at $mount_point (fs_type: $fs_type)"
+  # Check for partition devices (multi-partition disk)
+  local partition_devices=()
+  local has_partitions=false
+
+  # Explicitly find partition devices
+  while IFS= read -r part_dev; do
+    partition_devices+=("$part_dev")
+    has_partitions=true
+  done < <(ls "${loop_device}"p* 2>/dev/null || true)
+
+  if [[ "$has_partitions" == "true" ]]; then
+    # Multi-partition disk - mount each partition to subdirectory
+    echo "Multi-partition disk detected" >&2
+    local partition_count=0
+    local mounted_partitions=()
+
+    for part_dev in "${partition_devices[@]}"; do
+      # Extract partition number (e.g., /dev/loop0p1 → 1)
+      local part_num="${part_dev##*p}"
+
+      # Skip extended partition containers (blkid returns PTTYPE instead of TYPE)
+      local part_type
+      part_type=$(blkid -o value -s TYPE "$part_dev" 2>/dev/null || echo "")
+      if [[ -z "$part_type" ]]; then
+        echo "  Skipping $part_dev (extended partition container)" >&2
+        continue
+      fi
+
+      # Create partition mount point
+      local part_mount="$mount_point/p$part_num"
+      mkdir -p "$part_mount"
+
+      # Try to mount this partition
+      if mount -t "$part_type" -o ro,noatime,nodev,nosuid "$part_dev" "$part_mount" 2>/dev/null; then
+        echo "  Mounted $part_dev at $part_mount (fs_type: $part_type)" >&2
+        mounted_partitions+=("$part_num:$part_dev:$part_mount:$part_type:ok")
+        partition_count=$((partition_count + 1))
+      else
+        echo "  Failed to mount $part_dev" >&2
+        rmdir "$part_mount" 2>/dev/null || true
+        mounted_partitions+=("$part_num:$part_dev::$part_type:failed")
+      fi
+    done
+
+    if [[ $partition_count -eq 0 ]]; then
+      # No partitions mounted successfully
+      losetup -d "$loop_device" 2>/dev/null || true
+      rmdir "$mount_point" 2>/dev/null || true
+      echo "Error: No partitions could be mounted" >&2
+      exit 1
+    fi
+
+    # Output JSON for orchestrator
+    echo '{"layout":"multi","partitions":['
+    local first=true
+    for part_info in "${mounted_partitions[@]}"; do
+      IFS=':' read -r num dev mnt fstype status <<< "$part_info"
+      [[ "$first" == "true" ]] || echo ','
+      first=false
+      echo -n "{\"num\":$num,\"device\":\"$dev\",\"mount\":\"$mnt\",\"fstype\":\"$fstype\",\"status\":\"$status\"}"
+    done
+    echo ']}'
+
+    exit 0
+  else
+    # Single-partition or whole-disk filesystem
+    echo "Single-partition disk detected" >&2
+    local fs_type
+    fs_type=$(blkid -o value -s TYPE "$loop_device" 2>/dev/null || echo "")
+
+    # Mount with detected filesystem type (or auto-detect)
+    if [[ -n "$fs_type" ]]; then
+      if mount -t "$fs_type" -o ro,noatime,nodev,nosuid "$loop_device" "$mount_point" 2>/dev/null; then
+        echo "Mounted $loop_device at $mount_point (fs_type: $fs_type)" >&2
+        echo '{"layout":"single","device":"'"$loop_device"'","mount":"'"$mount_point"'","fstype":"'"$fs_type"'"}'
+        exit 0
+      fi
+    fi
+
+    # Fallback: try auto-detect
+    if mount -o ro,noatime,nodev,nosuid "$loop_device" "$mount_point" 2>/dev/null; then
+      echo "Mounted $loop_device at $mount_point (auto-detected fs_type)" >&2
+      echo '{"layout":"single","device":"'"$loop_device"'","mount":"'"$mount_point"'","fstype":"auto"}'
       exit 0
     fi
-  fi
 
-  # Fallback: try auto-detect
-  if mount -o ro,noatime,nodev,nosuid "$loop_device" "$mount_point" 2>/dev/null; then
-    echo "Mounted $loop_device at $mount_point (auto-detected fs_type)"
-    exit 0
+    # Mount failed - cleanup
+    losetup -d "$loop_device" 2>/dev/null || true
+    rmdir "$mount_point" 2>/dev/null || true
+    echo "Error: Failed to mount $loop_device" >&2
+    exit 1
   fi
-
-  # Mount failed - cleanup
-  losetup -d "$loop_device" 2>/dev/null || true
-  rmdir "$mount_point" 2>/dev/null || true
-  echo "Error: Failed to mount $loop_device" >&2
-  exit 1
 }
 
 # Unmount command
@@ -135,23 +212,59 @@ do_unmount() {
 
   local mount_point="/mnt/ntt/$medium_hash"
 
-  # Check if mounted
-  if ! findmnt "$mount_point" >/dev/null 2>&1; then
-    echo "Not mounted: $mount_point"
-    # Still try to cleanup mount point if it exists
-    rmdir "$mount_point" 2>/dev/null || true
+  # Check if base mount point exists
+  if [[ ! -d "$mount_point" ]]; then
+    echo "Not mounted: $mount_point (directory does not exist)"
     exit 0
   fi
 
-  # Get loop device before unmounting
-  local loop_device
-  loop_device=$(findmnt -n -o SOURCE "$mount_point" || echo "")
+  # Detect if this is a multi-partition mount (has p{N} subdirectories)
+  local partition_mounts=("$mount_point"/p*)
+  local has_partition_mounts=false
+  local loop_device=""
 
-  # Unmount
-  if umount "$mount_point" 2>/dev/null; then
-    echo "Unmounted $mount_point"
+  if [[ -d "${partition_mounts[0]}" ]]; then
+    has_partition_mounts=true
+  fi
+
+  if [[ "$has_partition_mounts" == "true" ]]; then
+    # Multi-partition disk - unmount each partition
+    echo "Multi-partition disk detected, unmounting all partitions" >&2
+
+    for part_mount in "${partition_mounts[@]}"; do
+      if findmnt "$part_mount" >/dev/null 2>&1; then
+        # Get loop device from first partition (all share same loop device)
+        if [[ -z "$loop_device" ]]; then
+          loop_device=$(findmnt -n -o SOURCE "$part_mount" || echo "")
+          # Extract base loop device (e.g., /dev/loop0p1 → /dev/loop0)
+          loop_device="${loop_device%p*}"
+        fi
+
+        if umount "$part_mount" 2>/dev/null; then
+          echo "  Unmounted $part_mount" >&2
+        else
+          echo "  Warning: Failed to unmount $part_mount" >&2
+        fi
+      fi
+
+      # Remove partition mount point
+      rmdir "$part_mount" 2>/dev/null || true
+    done
   else
-    echo "Warning: Failed to unmount $mount_point" >&2
+    # Single-partition mount
+    if findmnt "$mount_point" >/dev/null 2>&1; then
+      # Get loop device before unmounting
+      loop_device=$(findmnt -n -o SOURCE "$mount_point" || echo "")
+
+      # Unmount
+      if umount "$mount_point" 2>/dev/null; then
+        echo "Unmounted $mount_point"
+      else
+        echo "Warning: Failed to unmount $mount_point" >&2
+      fi
+    else
+      echo "Not mounted: $mount_point"
+    fi
   fi
 
   # Detach loop device if found
@@ -163,7 +276,7 @@ do_unmount() {
     fi
   fi
 
-  # Remove mount point
+  # Remove base mount point
   rmdir "$mount_point" 2>/dev/null || true
 
   exit 0

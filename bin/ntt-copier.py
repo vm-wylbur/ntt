@@ -357,10 +357,10 @@ class CopyWorker:
         # Not mounted - need to mount it
         logger.info(f"Medium {medium_hash} not mounted, attempting to mount...")
 
-        # Check health before mounting (refuse to mount if imaging was bad)
+        # Check health before mounting (only refuse 'failed' - allow ok/incomplete/corrupt)
         health = self.get_medium_health(medium_hash)
-        if health and health != 'ok':
-            logger.error(f"Refusing to mount medium {medium_hash}: health={health} (not 'ok')")
+        if health == 'failed':
+            logger.error(f"Refusing to mount medium {medium_hash}: health=failed (<20% rescued)")
             logger.error(f"Marking all inodes as EXCLUDED due to bad health")
 
             # Mark all inodes for this medium as EXCLUDED
@@ -374,8 +374,12 @@ class CopyWorker:
                 excluded_count = cur.rowcount
             self.conn.commit()
 
-            raise Exception(f"Cannot mount medium {medium_hash}: health={health} (expected 'ok'). "
+            raise Exception(f"Cannot mount medium {medium_hash}: health=failed (<20% rescued). "
                           f"Marked {excluded_count} inodes as EXCLUDED.")
+
+        # Log health status if not perfect (but allow mounting)
+        if health and health != 'ok':
+            logger.warning(f"Mounting degraded media: health={health} (expect errors during copy)")
 
         # Get image path from database
         image_path = self.get_image_path(medium_hash)
@@ -787,19 +791,19 @@ class CopyWorker:
                         success_blob_ids.append(None)
                     elif result and isinstance(result, dict):
                         # Failure: result is error info dict
-                        # FIXME: Missing medium_hash in dict - causes all-partition scan in UPDATE below (line ~750)
                         failed_inodes.append({
                             'id': inode_row['id'],
                             'ino': inode_row['ino'],
+                            'medium_hash': inode_row['medium_hash'],
                             'error_type': result['error_type'],
                             'error_msg': result['error_msg']
                         })
                     else:
                         # Truly unknown result type (shouldn't happen)
-                        # FIXME: Missing medium_hash in dict - causes all-partition scan in UPDATE below (line ~750)
                         failed_inodes.append({
                             'id': inode_row['id'],
                             'ino': inode_row['ino'],
+                            'medium_hash': inode_row['medium_hash'],
                             'error_type': 'UnknownError',
                             'error_msg': f'Unexpected result type: {type(result)}'
                         })
@@ -838,16 +842,15 @@ class CopyWorker:
                     # Update each failed inode with error tracking
                     for f in failed_inodes:
                         error_entry = f"{f['error_type']}: {f['error_msg']}"
-                        # FIXME: WHERE clause missing medium_hash (partition key)
-                        # This causes PostgreSQL to scan all 36 partitions, acquiring 482 locks
-                        # Can hang for 1+ hours. Need: WHERE id = %s AND medium_hash = %s
+                        # CRITICAL: WHERE clause includes medium_hash (partition key) for partition pruning
+                        # Without medium_hash, PostgreSQL scans all 47 partitions (81ms → 0.4ms speedup)
                         cur.execute("""
                             UPDATE inode
                             SET claimed_by = NULL,
                                 claimed_at = NULL,
                                 errors = array_append(errors, %s::text)
-                            WHERE id = %s
-                        """, (error_entry, f['id']))
+                            WHERE id = %s AND medium_hash = %s
+                        """, (error_entry, f['id'], f['medium_hash']))
 
                         # Log each error clearly
                         logger.warning(f"Failed inode id={f['id']} ino={f['ino']}: {f['error_type']}: {f['error_msg']}")
@@ -1219,7 +1222,10 @@ class CopyWorker:
         """Analyze an inode and create execution plan."""
         inode_row = work_unit['inode_row']
         paths = work_unit['paths']
-        source_path = strategies.sanitize_path(paths[0])  # Use first path for analysis
+        medium_hash = inode_row['medium_hash']
+
+        # Parse partition-prefixed path and construct correct source path
+        source_path = strategies.parse_partition_path(paths[0], medium_hash)
 
         fs_type = inode_row.get('fs_type')
         if not fs_type:
