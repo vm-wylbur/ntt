@@ -53,10 +53,10 @@ def parse_partition_path(path: str | bytes, medium_hash: str) -> Path:
     Parse partition-prefixed path and construct correct source path.
 
     Multi-partition disks have paths stored as: p{N}:/path
-    Single-partition disks have paths stored as: /path
+    Single-partition disks have paths stored as: /path OR /mnt/ntt/{hash}/path (legacy)
 
     Args:
-        path: Path from database (may have p{N}: prefix)
+        path: Path from database (may have p{N}: prefix or full mount path)
         medium_hash: Medium hash for constructing mount path
 
     Returns:
@@ -68,6 +68,9 @@ def parse_partition_path(path: str | bytes, medium_hash: str) -> Path:
 
         parse_partition_path("/etc/passwd", "abc123")
         -> Path("/mnt/ntt/abc123/etc/passwd")
+
+        parse_partition_path("/mnt/ntt/abc123/etc/passwd", "abc123")
+        -> Path("/mnt/ntt/abc123/etc/passwd")  (already full path)
     """
     # Handle bytea from PostgreSQL
     if isinstance(path, bytes):
@@ -83,16 +86,24 @@ def parse_partition_path(path: str | bytes, medium_hash: str) -> Path:
 
         # Construct mount path with partition subdirectory
         mount_base = f"/mnt/ntt/{medium_hash}/{partition_prefix}"
+
+        # Sanitize the relative path (handle escape sequences)
+        relative_path = relative_path.replace('\\r', '\r').replace('\\n', '\n')
+
+        # Construct full source path
+        source_path = Path(mount_base) / relative_path.lstrip('/')
     else:
-        # No partition prefix - single-partition disk (backward compatibility)
-        relative_path = path_str
-        mount_base = f"/mnt/ntt/{medium_hash}"
+        # No partition prefix - check if path is already full mount path (legacy)
+        expected_mount_prefix = f"/mnt/ntt/{medium_hash}"
 
-    # Sanitize the relative path (handle escape sequences)
-    relative_path = relative_path.replace('\\r', '\r').replace('\\n', '\n')
-
-    # Construct full source path
-    source_path = Path(mount_base) / relative_path.lstrip('/')
+        if path_str.startswith(expected_mount_prefix):
+            # Path already contains full mount point - use directly (legacy format)
+            sanitized_path = path_str.replace('\\r', '\r').replace('\\n', '\n')
+            source_path = Path(sanitized_path)
+        else:
+            # Relative path - construct with mount base
+            relative_path = path_str.replace('\\r', '\r').replace('\\n', '\n')
+            source_path = Path(expected_mount_prefix) / relative_path.lstrip('/')
 
     return source_path
 

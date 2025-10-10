@@ -785,12 +785,12 @@ stage_copy() {
   fi
 
   # Smart scheduling based on inode count
-  if [[ $inode_count -lt 100 ]]; then
-    # Small batch: run inline with single worker
-    echo "[$(date -Iseconds)] Small batch (<100 files), running inline with 1 worker" >&2
-    log copy_start "{\"medium_hash\": \"$medium_hash\", \"mode\": \"inline\", \"workers\": 1, \"pending\": $pending_count}"
+  if [[ $inode_count -lt 10000 ]]; then
+    # Small/medium batch: run inline with single worker
+    echo "[$(date -Iseconds)] Batch (<10K files), running inline worker" >&2
+    log copy_start "{\"medium_hash\": \"$medium_hash\", \"mode\": \"inline\", \"pending\": $pending_count}"
 
-    if /home/pball/projects/ntt/bin/ntt-copier.py --workers 1 --medium "$medium_hash"; then
+    if /home/pball/projects/ntt/bin/ntt-copier.py --medium-hash "$medium_hash"; then
       log copy_success "{\"medium_hash\": \"$medium_hash\"}"
       return 0
     else
@@ -799,30 +799,15 @@ stage_copy() {
       return 2
     fi
 
-  elif [[ $inode_count -lt 10000 ]]; then
-    # Medium batch: run parallel workers (2-4 workers)
-    local workers=4
-    echo "[$(date -Iseconds)] Medium batch (<10K files), running parallel with $workers workers" >&2
-    log copy_start "{\"medium_hash\": \"$medium_hash\", \"mode\": \"parallel\", \"workers\": $workers, \"pending\": $pending_count}"
-
-    if /home/pball/projects/ntt/bin/ntt-copier.py --workers "$workers" --medium "$medium_hash"; then
-      log copy_success "{\"medium_hash\": \"$medium_hash\"}"
-      return 0
-    else
-      echo "[$(date -Iseconds)] ERROR: Copy workers failed" >&2
-      log copy_error "{\"medium_hash\": \"$medium_hash\", \"error\": \"workers_failed\"}"
-      return 2
-    fi
-
   else
     # Large batch: defer to systemd/background
     echo "[$(date -Iseconds)] Large batch (>10K files), deferring to background workers" >&2
-    log copy_defer "{\"medium_hash\": \"$medium_hash\", \"mode\": \"deferred\", \"pending\": $pending_count, \"msg\": \"Run: ntt-copier.py --workers 8 --medium $medium_hash\"}"
+    log copy_defer "{\"medium_hash\": \"$medium_hash\", \"mode\": \"deferred\", \"pending\": $pending_count, \"msg\": \"Run: sudo -E ntt-copier.py --medium-hash $medium_hash\"}"
     echo ""
     echo "========================================" >&2
     echo "LARGE BATCH - Manual intervention required" >&2
-    echo "Run this command to start copy workers:" >&2
-    echo "  ntt-copier.py --workers 8 --medium $medium_hash" >&2
+    echo "Run this command to start copy worker:" >&2
+    echo "  sudo -E /home/pball/projects/ntt/bin/ntt-copier.py --medium-hash $medium_hash" >&2
     echo "========================================" >&2
     echo ""
     return 1  # Not an error, just deferred
