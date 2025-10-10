@@ -28,6 +28,7 @@ LIMIT=""
 DRY_RUN=""
 MEDIUM_HASH=""
 VERBOSE=false
+WAIT=false
 PIDS=()
 WORKER_IDS=()
 
@@ -43,6 +44,7 @@ Options:
     -w, --workers K         Number of parallel workers (default: 4)
     -l, --limit N           Process limit per worker
     -d, --dry-run N         Dry-run mode with N items per worker
+    --wait                  Wait for all workers to complete before exiting
     -v, --verbose           Show detailed output
     -h, --help              Show this help
 
@@ -97,6 +99,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         -v|--verbose)
             VERBOSE=true
+            shift
+            ;;
+        --wait)
+            WAIT=true
             shift
             ;;
         -h|--help)
@@ -243,13 +249,54 @@ printf "%s\n" "${PIDS[@]}" > "$PID_FILE"
 
 echo "[$(date '+%H:%M:%S')] Workers launched successfully"
 echo "[$(date '+%H:%M:%S')] PIDs saved to: $PID_FILE"
-echo "[$(date '+%H:%M:%S')] Monitor progress: ntt-dashboard"
-echo "[$(date '+%H:%M:%S')] Stop workers: ntt-stop-workers"
-echo ""
-echo "Note: Workers are running in background. Tmpfs cleanup happens via:"
-echo "  - Signal handler on ^C or kill"
-echo "  - Auto-cleanup on tmpfs unmount (files deleted automatically)"
-echo "  - Manual cleanup: ntt-stop-workers"
 
-# Remove EXIT trap now that workers are launched - cleanup is manual or via signals
-trap - EXIT
+if $WAIT; then
+    echo "[$(date '+%H:%M:%S')] Waiting for workers to complete..."
+    echo ""
+
+    # Poll until all workers finish
+    last_pending=-1
+    while true; do
+        all_done=true
+        for pid in "${PIDS[@]}"; do
+            if ps -p "$pid" > /dev/null 2>&1; then
+                all_done=false
+                break
+            fi
+        done
+
+        if $all_done; then
+            echo "[$(date '+%H:%M:%S')] All workers completed"
+            break
+        fi
+
+        # Show progress every 30 seconds
+        if [[ -n "${SUDO_USER:-}" ]]; then
+            pending=$(sudo -u "$SUDO_USER" psql "${NTT_DB_URL}" -tAc "SELECT COUNT(*) FROM inode WHERE medium_hash = '$MEDIUM_HASH' AND copied = false AND claimed_by IS NULL" 2>/dev/null || echo "?")
+        else
+            pending=$(psql "${NTT_DB_URL}" -tAc "SELECT COUNT(*) FROM inode WHERE medium_hash = '$MEDIUM_HASH' AND copied = false AND claimed_by IS NULL" 2>/dev/null || echo "?")
+        fi
+
+        # Only show progress if count changed
+        if [[ "$pending" != "$last_pending" ]]; then
+            echo "[$(date '+%H:%M:%S')] Progress: $pending files remaining"
+            last_pending=$pending
+        fi
+
+        sleep 30
+    done
+
+    # Cleanup happens via EXIT trap
+else
+    # Original behavior: exit immediately without waiting
+    echo "[$(date '+%H:%M:%S')] Monitor progress: ntt-dashboard"
+    echo "[$(date '+%H:%M:%S')] Stop workers: ntt-stop-workers"
+    echo ""
+    echo "Note: Workers are running in background. Tmpfs cleanup happens via:"
+    echo "  - Signal handler on ^C or kill"
+    echo "  - Auto-cleanup on tmpfs unmount (files deleted automatically)"
+    echo "  - Manual cleanup: ntt-stop-workers"
+
+    # Remove EXIT trap now that workers are launched - cleanup is manual or via signals
+    trap - EXIT
+fi
