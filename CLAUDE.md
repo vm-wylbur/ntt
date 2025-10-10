@@ -40,6 +40,8 @@ NTT is a disk image deduplication and archival system. Pipeline stages:
 Consult these when relevant to your work:
 
 **Operational:**
+- `ROLES.md` - **Multi-Claude workflow** (prox/dev/metrics roles, communication protocols)
+- `media-processing-plan-2025-10-10.md` - Current processing plan with multi-Claude sections
 - `docs/disk-read-checklist.md` - Diagnostic procedures for problematic disks (living doc)
 - `docs/diagnostic-queries.md` - SQL queries for analyzing copier diagnostic data
 - `docs/ignore-patterns-guide.md` - Path exclusion patterns (45 patterns, e5727c34 case study)

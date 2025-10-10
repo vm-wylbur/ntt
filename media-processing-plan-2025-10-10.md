@@ -529,6 +529,160 @@ psql -d copyjob -c "
 
 ---
 
+## Multi-Claude Workflow
+
+**Three Claudes work together on this plan:**
+
+- **prox-claude:** Runs all commands, monitors execution, files bugs, verifies fixes
+- **dev-claude:** Fixes bugs filed by prox-claude, improves code
+- **metrics-claude:** Collects per-medium and aggregate metrics, identifies patterns
+
+**Key infrastructure:**
+- `ROLES.md` - Role definitions and communication protocols (READ THIS FIRST)
+- `processing-queue.md` - Processing log (not a plan, prox-claude re-evaluates from DB)
+- `bugs/` - Bug reports and fixes
+- `metrics/` - Per-medium and aggregate metrics
+
+**Workflow:** prox-claude runs this plan → files bugs when issues occur → dev-claude fixes → prox-claude verifies → metrics-claude analyzes → all iterate
+
+---
+
+## Bug Filing Criteria
+
+prox-claude should file a bug report (`bugs/TEMPLATE.md`) when:
+
+### 1. Command Failure
+- Expected: command succeeds
+- Observed: command exits with error or hangs >5min
+
+**Example:** Loader runs for 8 minutes with no output (expected: <10s completion)
+
+### 2. Success Criteria Violation
+- Expected: "Deduplication completed in <10s" (from this plan)
+- Observed: Takes 5 minutes
+
+**Example:** Dedup query takes 4min 23s instead of <10s
+
+### 3. Data Integrity Issues
+- Duplicate paths in enumeration (loader will fail)
+- Missing partitions after load
+- FK indexes not created
+
+**Example:** Query shows 0 rows for `pg_tables` where `tablename = 'inode_p_<hash>'`
+
+### 4. Unexpected Behavior
+- DiagnosticService not triggering at retry #10 (expected per Phase 3)
+- Mount succeeds but ls fails
+- Files copied but not in by-hash/
+
+**Example:** 500 files show copied=true but `/data/cold/by-hash/` has only 50 files
+
+### 5. New Error Patterns
+- Error message not in `docs/disk-read-checklist.md`
+- Behavior not covered by rollback procedures
+
+**Example:** New dmesg error: "ext3: journal commit failed" not in checklist
+
+### Filing Process
+
+1. **Copy `bugs/TEMPLATE.md`** to `bugs/BUG-NNN-<type>-<hash>.md`
+   - NNN: Next sequential number (check existing bugs/)
+   - type: loader-timeout | mount-fail | dedup-slow | etc.
+   - hash: Short hash (first 8 chars)
+
+2. **Fill all sections** with observable evidence:
+   - Commands run (exact bash)
+   - Output/errors (actual stdout/stderr)
+   - Database state (query + results)
+   - Filesystem state (ls/mount/df output)
+   - NO CODE READING - only what you observe from running commands
+
+3. **Define success conditions** (must be testable):
+   - ✅ "Command completes in <10s"
+   - ✅ "Query returns 1 row"
+   - ❌ "It works better" (not testable)
+
+4. **Update `processing-queue.md`:**
+   - Move medium to "Blocked" section
+   - Reference bug number
+
+5. **Continue with other media** if possible
+
+### When NOT to File Bugs
+
+- **Expected failures:** Media with boot sector corruption (archive with problems, don't file bug)
+- **Already documented:** Error pattern in `docs/disk-read-checklist.md` with known handling
+- **Transient issues:** One-time network blip, immediately retrying succeeds
+
+---
+
+## Bug Verification Process
+
+After dev-claude marks bug as "ready for testing" (in "Dev Notes" section):
+
+### 1. Re-run Original Failure Case
+
+Use exact commands from bug report:
+```bash
+# Example from BUG-001
+time sudo bin/ntt-loader /tmp/579d3c3a.raw 579d3c3a476185f524b77b286c5319f5
+```
+
+Compare output to expected behavior from success conditions.
+
+### 2. Check All Success Conditions
+
+Run each test from "Success Condition" section:
+- [ ] Test 1: Command completes in <10s
+- [ ] Test 2: Query returns expected result
+- [ ] Test 3: File exists with correct properties
+
+ALL must pass.
+
+### 3. Test Edge Cases (if applicable)
+
+- Try with different media if bug affects multiple
+- Verify no regressions in related functionality
+
+**Example:** If bug fixed loader for large disks, test on medium 579d3c3a (56G) AND small floppy (1M) to ensure both work.
+
+### 4. Document Results
+
+Append "Fix Verification" section to bug report:
+```markdown
+## Fix Verification
+
+**Tested:** YYYY-MM-DD HH:MM
+**Medium:** <hash>
+
+**Results:**
+- [x] Success condition 1: PASS - completed in 3.2s
+- [x] Success condition 2: PASS - query returned 1 row
+- [ ] Success condition 3: FAIL - file missing
+
+**Outcome:** REOPENED - file creation still failing
+```
+
+### 5. Take Action
+
+**If all pass:**
+- Status: fixed
+- Move to `bugs/fixed/BUG-NNN-*.md`
+- Update `processing-queue.md`: remove from "Blocked", medium back to fresh evaluation
+
+**If any fail:**
+- Status: reopened
+- Append detailed findings to bug report
+- dev-claude re-investigates
+
+### 6. Resume Processing
+
+- Update processing-queue.md to unblock medium
+- Fresh DB query will include unblocked media in candidates
+- Continue from failed phase
+
+---
+
 ## Timeline
 
 ### Phase 1: Test Batch (Week 1)
