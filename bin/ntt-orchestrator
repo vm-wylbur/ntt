@@ -73,9 +73,9 @@ chmod 755 "$(dirname "$LOG_JSON")" 2>/dev/null || true
 # Wrapper for psql that handles running as root
 psql_as_user() {
   if [[ $EUID -eq 0 ]] && [[ -n "$DB_USER" ]] && [[ "$DB_USER" != "root" ]]; then
-    sudo -u "$DB_USER" psql "$@"
+    sudo -u "$DB_USER" psql -q "$@" 2>/dev/null
   else
-    psql "$@"
+    psql -q "$@" 2>/dev/null
   fi
 }
 
@@ -103,7 +103,7 @@ get_real_hardware_info() {
   # Args: $1 = device path (e.g., /dev/sdd)
   #
   # Strategy:
-  #   1. Try smartctl (most reliable, bypasses USB/SATA bridges)
+  #   1. Try smartctl with USB-SAT protocols (bypasses USB/SATA bridges)
   #   2. Fallback to hdparm (also bypasses bridges)
   #   3. Final fallback to lsblk (may show bridge info)
 
@@ -111,17 +111,33 @@ get_real_hardware_info() {
   MODEL=""
   SERIAL=""
 
-  # Try smartctl first
+  # Try smartctl first - attempt multiple USB bridge protocols
   if command -v smartctl &>/dev/null; then
+    # Try direct access first (works for native SATA)
     local smart_model=$(smartctl -i "$dev" 2>/dev/null | grep "Device Model:" | awk '{$1=$2=""; print $0}' | xargs)
     local smart_serial=$(smartctl -i "$dev" 2>/dev/null | grep "Serial Number:" | awk '{$1=$2=""; print $0}' | xargs)
 
     # Check if we got real drive info (not USB bridge/adapter)
     if [[ -n "$smart_model" ]] && [[ ! "$smart_model" =~ (Dual|USB|Bridge|Adapter) ]]; then
-      MODEL=$(echo "$smart_model" | tr -s ' ' '_')
-      SERIAL=$(echo "$smart_serial" | tr -s ' ' '_')
+      MODEL=$(echo "$smart_model" | tr -s ' ' '_' | tr -cd '[:alnum:]_-' | cut -c1-64)
+      SERIAL=$(echo "$smart_serial" | tr -s ' ' '_' | tr -cd '[:alnum:]_-' | cut -c1-64)
+      echo "[$(date -Iseconds)] Hardware info: smartctl direct → MODEL=$MODEL SERIAL=$SERIAL" >&2
       return 0
     fi
+
+    # Try USB-SAT protocols (for USB-attached drives)
+    for protocol in "sat" "sat,12" "sat,16" "usbsunplus" "usbcypress" "usbjmicron"; do
+      smart_model=$(smartctl -d "$protocol" -i "$dev" 2>/dev/null | grep "Device Model:" | awk '{$1=$2=""; print $0}' | xargs)
+      smart_serial=$(smartctl -d "$protocol" -i "$dev" 2>/dev/null | grep "Serial Number:" | awk '{$1=$2=""; print $0}' | xargs)
+
+      # Check if we got real drive info
+      if [[ -n "$smart_model" ]] && [[ ! "$smart_model" =~ (Dual|USB|Bridge|Adapter) ]]; then
+        MODEL=$(echo "$smart_model" | tr -s ' ' '_' | tr -cd '[:alnum:]_-' | cut -c1-64)
+        SERIAL=$(echo "$smart_serial" | tr -s ' ' '_' | tr -cd '[:alnum:]_-' | cut -c1-64)
+        echo "[$(date -Iseconds)] Hardware info: smartctl -d $protocol → MODEL=$MODEL SERIAL=$SERIAL" >&2
+        return 0
+      fi
+    done
   fi
 
   # Fallback to hdparm
@@ -130,15 +146,17 @@ get_real_hardware_info() {
     local hdparm_serial=$(sudo hdparm -I "$dev" 2>/dev/null | grep "Serial Number:" | awk -F: '{print $2}' | xargs)
 
     if [[ -n "$hdparm_model" ]]; then
-      MODEL=$(echo "$hdparm_model" | tr -s ' ' '_')
-      SERIAL=$(echo "$hdparm_serial" | tr -s ' ' '_')
+      MODEL=$(echo "$hdparm_model" | tr -s ' ' '_' | tr -cd '[:alnum:]_-' | cut -c1-64)
+      SERIAL=$(echo "$hdparm_serial" | tr -s ' ' '_' | tr -cd '[:alnum:]_-' | cut -c1-64)
+      echo "[$(date -Iseconds)] Hardware info: hdparm → MODEL=$MODEL SERIAL=$SERIAL" >&2
       return 0
     fi
   fi
 
   # Final fallback to lsblk (may show USB bridge for USB-attached drives)
-  MODEL=$(lsblk -no MODEL "$dev" 2>/dev/null | tr -s ' ' '_')
-  SERIAL=$(lsblk -no SERIAL "$dev" 2>/dev/null | tr -s ' ' '_')
+  MODEL=$(lsblk -no MODEL "$dev" 2>/dev/null | tr -s ' ' '_' | tr -cd '[:alnum:]_-' | cut -c1-64)
+  SERIAL=$(lsblk -no SERIAL "$dev" 2>/dev/null | tr -s ' ' '_' | tr -cd '[:alnum:]_-' | cut -c1-64)
+  echo "[$(date -Iseconds)] Hardware info: lsblk fallback → MODEL=$MODEL SERIAL=$SERIAL" >&2
 }
 
 identify_device() {
@@ -261,27 +279,66 @@ identify_device() {
   DIAGNOSTICS=$(cat "$DIAG_FILE")
   rm -f "$DIAG_FILE"
 
-  echo "[$(date -Iseconds)] Generating content hash..." >&2
+  # Get hardware info BEFORE hash generation (needed for metadata)
+  MODEL=""
+  SERIAL=""
 
-  # Content hash from first 1MB + last 1MB (for deduplication)
-  # Use dd with conv=noerror to handle damaged media gracefully
+  if [[ "$is_small_or_removable" != "true" ]]; then
+    # Fixed disk - detect device type and get hardware info
+    local dev_type=$(lsblk -no TYPE "$dev" 2>/dev/null)
+    local dev_tran=$(lsblk -no TRAN "$dev" 2>/dev/null)
+
+    if [[ "$dev_type" == "rom" ]]; then
+      # CD-ROM/DVD: use lsblk (smartctl may not work on optical drives)
+      MODEL=$(lsblk -no MODEL "$dev" | tr -s ' ' '_' | tr -cd '[:alnum:]_-' | cut -c1-64)
+      SERIAL=$(lsblk -no SERIAL "$dev" | tr -s ' ' '_' | tr -cd '[:alnum:]_-' | cut -c1-64)
+    elif [[ "$dev_tran" == "usb" ]] || [[ "$dev_tran" == "sata" ]] || [[ "$dev_tran" == "ata" ]]; then
+      # USB/SATA/ATA disk: use smartctl/hdparm (bypasses USB bridges)
+      get_real_hardware_info "$dev"
+    else
+      # Unknown transport: fallback to lsblk
+      MODEL=$(lsblk -no MODEL "$dev" | tr -s ' ' '_' | tr -cd '[:alnum:]_-' | cut -c1-64)
+      SERIAL=$(lsblk -no SERIAL "$dev" | tr -s ' ' '_' | tr -cd '[:alnum:]_-' | cut -c1-64)
+    fi
+  fi
+
+  echo "[$(date -Iseconds)] Generating content hash with metadata..." >&2
+
+  # Get exact device size in bytes
+  local dev_size_bytes=$(blockdev --getsize64 "$dev" 2>/dev/null || echo "0")
+
+  # Build metadata string for hash (ensures unique hashes per physical device)
+  local hash_metadata="SIZE:${dev_size_bytes}|MODEL:${MODEL:-unknown}|SERIAL:${SERIAL:-unknown}|"
+  echo "[$(date -Iseconds)] Hash metadata: $hash_metadata" >&2
+
+  # Create signature file with metadata prepended to content
   SIG_FILE="/tmp/ntt-sig-$$"
 
-  # Try to read first 1MB (up to 2048 sectors of 512 bytes)
-  # conv=noerror,sync continues on read errors and pads with zeros
-  dd if="$dev" of="$SIG_FILE" bs=512 count=2048 conv=noerror,sync status=none 2>/dev/null || true
+  # Write metadata header first
+  echo -n "$hash_metadata" > "$SIG_FILE"
 
-  # Try to read last 1MB (skip to end - 1MB, or start if device < 1MB)
+  # Append first 1MB (up to 2048 sectors of 512 bytes)
+  # conv=noerror,sync continues on read errors and pads with zeros
+  # Use >> redirection instead of oflag=append (which doesn't work with conv=noerror,sync)
+  dd if="$dev" bs=512 count=2048 conv=noerror,sync status=none 2>/dev/null >> "$SIG_FILE" || true
+
+  # Append last 1MB (skip to end - 1MB, or start if device < 1MB)
   # dev_sectors already calculated above
   local skip_sectors=$((dev_sectors - 2048))
   if [[ $skip_sectors -lt 0 ]]; then
     skip_sectors=0
   fi
-  dd if="$dev" of="$SIG_FILE" bs=512 skip=$skip_sectors count=2048 conv=noerror,sync oflag=append status=none 2>/dev/null || true
+  dd if="$dev" bs=512 skip=$skip_sectors count=2048 conv=noerror,sync status=none 2>/dev/null >> "$SIG_FILE" || true
 
-  # Generate hash from whatever we could read (may include zero-padded bad sectors)
+  # Generate hash from metadata + content
   local medium_hash=$(b3sum < "$SIG_FILE" | cut -d' ' -f1 | cut -c1-32)
   rm -f "$SIG_FILE"
+
+  # Store hash metadata in diagnostics for forensic analysis
+  DIAGNOSTICS="${DIAGNOSTICS}
+
+=== HASH METADATA ===
+$hash_metadata"
 
   # Human name - use different strategy for removable media vs fixed disks
   # (removable and dev_size_mb already calculated above)
@@ -292,23 +349,7 @@ identify_device() {
     local hash_prefix="${medium_hash:0:8}"
     local medium_human="floppy_${timestamp}_${hash_prefix}"
   else
-    # Fixed disk - detect device type and get hardware info
-    local dev_type=$(lsblk -no TYPE "$dev" 2>/dev/null)
-    local dev_tran=$(lsblk -no TRAN "$dev" 2>/dev/null)
-
-    if [[ "$dev_type" == "rom" ]]; then
-      # CD-ROM/DVD: use lsblk (smartctl may not work on optical drives)
-      MODEL=$(lsblk -no MODEL "$dev" | tr -s ' ' '_')
-      SERIAL=$(lsblk -no SERIAL "$dev" | tr -s ' ' '_')
-    elif [[ "$dev_tran" == "usb" ]] || [[ "$dev_tran" == "sata" ]] || [[ "$dev_tran" == "ata" ]]; then
-      # USB/SATA/ATA disk: use smartctl/hdparm (bypasses USB bridges)
-      get_real_hardware_info "$dev"
-    else
-      # Unknown transport: fallback to lsblk
-      MODEL=$(lsblk -no MODEL "$dev" | tr -s ' ' '_')
-      SERIAL=$(lsblk -no SERIAL "$dev" | tr -s ' ' '_')
-    fi
-
+    # Fixed disk - use hardware info already retrieved above
     local medium_human="${MODEL:-unknown}_${SERIAL:-unknown}"
   fi
 
@@ -429,9 +470,9 @@ update_health_from_mapfile() {
   local health="failed"
   if (( $(echo "$rescued_pct == 100" | bc -l) )); then
     health="ok"
-  elif (( $(echo "$rescued_pct >= 95" | bc -l) )); then
+  elif (( $(echo "$rescued_pct >= 90" | bc -l) )); then
     health="incomplete"
-  elif (( $(echo "$rescued_pct >= 50" | bc -l) )); then
+  elif (( $(echo "$rescued_pct >= 20" | bc -l) )); then
     health="corrupt"
   else
     health="failed"
@@ -498,7 +539,7 @@ stage_mount() {
   echo "[$(date -Iseconds)] STAGE: Mount" >&2
 
   # Check if already mounted
-  if ntt-mount-helper status "$medium_hash" >/dev/null 2>&1; then
+  if /home/pball/projects/ntt/bin/ntt-mount-helper status "$medium_hash" >/dev/null 2>&1; then
     echo "[$(date -Iseconds)] Already mounted, skipping" >&2
     return 1
   fi
@@ -517,10 +558,10 @@ stage_mount() {
     return 2
   fi
 
-  # Check health before mounting
+  # Check health before mounting (only refuse 'failed' - allow ok/incomplete/corrupt)
   local health=$(psql_as_user "$DB_URL" -tAc "SELECT health FROM medium WHERE medium_hash = '$medium_hash'" 2>/dev/null)
-  if [[ -n "$health" ]] && [[ "$health" != "ok" ]] && [[ "$health" != "" ]]; then
-    echo "[$(date -Iseconds)] ERROR: Refusing to mount - health=$health (expected 'ok')" >&2
+  if [[ "$health" == "failed" ]]; then
+    echo "[$(date -Iseconds)] ERROR: Refusing to mount - health=failed (<20% rescued)" >&2
     log mount_error "{\"medium_hash\": \"$medium_hash\", \"error\": \"bad_health\", \"health\": \"$health\"}"
 
     # Mark all inodes as EXCLUDED
@@ -532,10 +573,35 @@ SQL
     return 2
   fi
 
-  # Use ntt-mount-helper for mounting
+  # Log health status if not perfect
+  if [[ -n "$health" ]] && [[ "$health" != "ok" ]]; then
+    echo "[$(date -Iseconds)] WARNING: Mounting with health=$health (degraded media, expect errors)" >&2
+    log mount_warning "{\"medium_hash\": \"$medium_hash\", \"health\": \"$health\", \"msg\": \"mounting_degraded_media\"}"
+  fi
+
+  # Use ntt-mount-helper for mounting (captures JSON output)
   echo "[$(date -Iseconds)] Mounting $image_path" >&2
-  if sudo ntt-mount-helper mount "$medium_hash" "$image_path"; then
-    log mount_success "{\"medium_hash\": \"$medium_hash\", \"image_path\": \"$image_path\"}"
+  local mount_output
+  mount_output=$(/home/pball/projects/ntt/bin/ntt-mount-helper mount "$medium_hash" "$image_path" 2>&1)
+  local mount_rc=$?
+
+  if [[ $mount_rc -eq 0 ]]; then
+    # Parse JSON output to detect layout
+    # Extract complete JSON (from first { to end of output)
+    local json_line=$(echo "$mount_output" | sed -n '/^{/,$ p' | tr -d '\n')
+
+    if [[ -n "$json_line" ]]; then
+      # Store mount metadata in temp file for stage_enum
+      echo "$json_line" > "/tmp/ntt-mount-meta-${medium_hash}"
+
+      local layout=$(echo "$json_line" | jq -r '.layout')
+      echo "[$(date -Iseconds)] Mount successful: layout=$layout" >&2
+      log mount_success "{\"medium_hash\": \"$medium_hash\", \"image_path\": \"$image_path\", \"layout\": \"$layout\"}"
+    else
+      # No JSON output (backward compatibility)
+      echo "[$(date -Iseconds)] Mount successful (no layout metadata)" >&2
+      log mount_success "{\"medium_hash\": \"$medium_hash\", \"image_path\": \"$image_path\"}"
+    fi
     return 0
   else
     echo "[$(date -Iseconds)] ERROR: Mount failed" >&2
@@ -564,8 +630,96 @@ stage_enum() {
     return 2
   fi
 
-  # Run enumeration
+  # Check for mount metadata (from stage_mount)
+  local mount_meta_file="/tmp/ntt-mount-meta-${medium_hash}"
   local raw_file="$RAW_ROOT/${medium_hash}.raw"
+
+  if [[ -f "$mount_meta_file" ]]; then
+    # Parse mount metadata to detect multi-partition layout
+    local layout=$(jq -r '.layout' < "$mount_meta_file")
+
+    if [[ "$layout" == "multi" ]]; then
+      # Multi-partition enumeration
+      echo "[$(date -Iseconds)] Multi-partition disk detected" >&2
+      log enum_start "{\"medium_hash\": \"$medium_hash\", \"layout\": \"multi\"}"
+
+      # Get partition list
+      local partition_count=$(jq '.partitions | length' < "$mount_meta_file")
+      echo "[$(date -Iseconds)] Enumerating $partition_count partitions" >&2
+
+      # Enumerate each partition separately
+      local temp_raws=()
+      local enum_failed=false
+
+      for ((i=0; i<partition_count; i++)); do
+        local part_num=$(jq -r ".partitions[$i].num" < "$mount_meta_file")
+        local part_mount=$(jq -r ".partitions[$i].mount" < "$mount_meta_file")
+        local part_status=$(jq -r ".partitions[$i].status" < "$mount_meta_file")
+
+        # Skip failed partitions
+        if [[ "$part_status" != "ok" ]]; then
+          echo "[$(date -Iseconds)] Skipping partition p$part_num (status: $part_status)" >&2
+          continue
+        fi
+
+        # Enumerate this partition
+        local part_raw="$RAW_ROOT/${medium_hash}.p${part_num}.raw"
+        echo "[$(date -Iseconds)] Enumerating p$part_num: $part_mount -> $part_raw" >&2
+
+        if ntt-enum "$part_mount" "$medium_hash" "$part_raw"; then
+          temp_raws+=("$part_num:$part_raw")
+          echo "[$(date -Iseconds)] Enumerated p$part_num successfully" >&2
+        else
+          echo "[$(date -Iseconds)] ERROR: Failed to enumerate p$part_num" >&2
+          enum_failed=true
+        fi
+      done
+
+      if [[ "$enum_failed" == "true" ]]; then
+        echo "[$(date -Iseconds)] ERROR: Some partitions failed enumeration" >&2
+        log enum_error "{\"medium_hash\": \"$medium_hash\", \"error\": \"partition_enum_failed\"}"
+        # Cleanup temp files
+        for part_info in "${temp_raws[@]}"; do
+          part_raw="${part_info#*:}"
+          rm -f "$part_raw"
+        done
+        return 2
+      fi
+
+      # Merge partition .raw files with prefixes
+      echo "[$(date -Iseconds)] Merging partition enumerations to $raw_file" >&2
+      > "$raw_file"  # Create empty file
+
+      for part_info in "${temp_raws[@]}"; do
+        part_num="${part_info%%:*}"
+        part_raw="${part_info#*:}"
+
+        echo "[$(date -Iseconds)] Merging p$part_num..." >&2
+
+        # Add partition prefix to path field only (field 7, after 6 \034 separators)
+        # Format: fs_type\034dev\034ino\034nlink\034size\034mtime\034path\0
+        # We need to add p{N}: prefix to the path field
+        awk -v prefix="p${part_num}:" 'BEGIN{FS=OFS="\034"; RS=ORS="\0"} {$7=prefix$7; print}' "$part_raw" >> "$raw_file"
+
+        # Remove temp file
+        rm -f "$part_raw"
+      done
+
+      chmod 644 "$raw_file" 2>/dev/null || true
+      rm -f "$mount_meta_file"  # Cleanup metadata file
+
+      echo "[$(date -Iseconds)] Multi-partition enumeration complete" >&2
+      log enum_success "{\"medium_hash\": \"$medium_hash\", \"raw\": \"$raw_file\", \"layout\": \"multi\", \"partitions\": $partition_count}"
+      return 0
+
+    else
+      # Single-partition disk (layout == "single")
+      echo "[$(date -Iseconds)] Single-partition disk detected" >&2
+      rm -f "$mount_meta_file"  # Cleanup metadata file
+    fi
+  fi
+
+  # Single-partition enumeration (default behavior)
   echo "[$(date -Iseconds)] Running ntt-enum: $mount_point -> $raw_file" >&2
   log enum_start "{\"medium_hash\": \"$medium_hash\", \"mount\": \"$mount_point\", \"raw\": \"$raw_file\"}"
 
@@ -994,16 +1148,6 @@ handle_image_mode() {
   local enum_only="$3"
   local user_message="${4:-}"
 
-  # Setup cleanup trap for errors
-  local loop_device=""
-  local mnt=""
-  cleanup_on_error() {
-    if [[ -n "$mnt" && -n "$loop_device" ]]; then
-      unmount_image "$mnt" "$loop_device"
-    fi
-  }
-  trap cleanup_on_error EXIT SIGINT SIGTERM
-
   # Identify image (content-based hash) with message
   local identify_result=$(identify_image "$image_path" "$user_message")
   local medium_hash="${identify_result%%:*}"
@@ -1025,35 +1169,92 @@ handle_image_mode() {
 
   check_duplicate "$medium_hash" "$force"
 
-  # Mount image (writes blkid to temp file)
-  local mount_result=$(mount_image "$image_path" "$medium_hash")
-  mnt="${mount_result%%:*}"
-  loop_device="${mount_result#*:}"
-
-  # Append blkid from temp file to diagnostics
-  if [[ -f "/tmp/ntt-blkid-$$" ]]; then
-    DIAGNOSTICS="${DIAGNOSTICS}
-$(cat /tmp/ntt-blkid-$$)"
-    rm -f "/tmp/ntt-blkid-$$"
-  fi
-
-  # Insert into database with image_path, message, and diagnostics
+  # Insert medium record NOW with image_path (so stage_mount can find it)
+  echo "[$(date -Iseconds)] Inserting medium record to database..." >&2
   insert_medium "$medium_hash" "$medium_human" "ok" "$message" "$DIAGNOSTICS"
   psql_as_user "$DB_URL" -c "UPDATE medium SET image_path = '$image_path' WHERE medium_hash = '$medium_hash';" 2>/dev/null || true
 
-  # Run enum on mounted image
-  RAW=$(run_enum "$mnt" "$medium_hash")
+  log medium_inserted "{\"medium_hash\":\"$medium_hash\",\"medium_human\":\"$medium_human\",\"mode\":\"image\"}"
 
-  # Run full pipeline unless --enum-only
-  if ! "$enum_only"; then
-    run_loader "$medium_hash" "$RAW"
-    run_copy_workers "$medium_hash"
+  # Run state-based pipeline stages
+  echo "[$(date -Iseconds)] === STATE-BASED PIPELINE START ===" >&2
+  log pipeline_start "{\"medium_hash\": \"$medium_hash\", \"mode\": \"image\"}"
+
+  # STAGE 1: Mount (uses ntt-mount-helper with partition support)
+  if stage_mount "$medium_hash"; then
+    echo "[$(date -Iseconds)] Mount stage: SUCCESS" >&2
+  else
+    local mount_rc=$?
+    if [[ $mount_rc -eq 1 ]]; then
+      echo "[$(date -Iseconds)] Mount stage: SKIPPED (already mounted)" >&2
+    else
+      echo "[$(date -Iseconds)] Mount stage: FAILED (cannot continue)" >&2
+      log pipeline_abort "{\"medium_hash\": \"$medium_hash\", \"failed_stage\": \"mount\"}"
+      return 1
+    fi
   fi
 
-  # Leave image mounted for copy workers
+  # STAGE 2: Enumeration (handles multi-partition)
+  if stage_enum "$medium_hash"; then
+    echo "[$(date -Iseconds)] Enum stage: SUCCESS" >&2
+  else
+    local enum_rc=$?
+    if [[ $enum_rc -eq 1 ]]; then
+      echo "[$(date -Iseconds)] Enum stage: SKIPPED (already enumerated)" >&2
+    else
+      echo "[$(date -Iseconds)] Enum stage: FAILED" >&2
+      log pipeline_error "{\"medium_hash\": \"$medium_hash\", \"failed_stage\": \"enum\"}"
+      # Don't abort - medium is mounted, user can debug
+    fi
+  fi
+
+  # Stop here if --enum-only
+  if "$enum_only"; then
+    echo "[$(date -Iseconds)] === PIPELINE STOPPED (--enum-only) ===" >&2
+    log pipeline_stopped "{\"medium_hash\": \"$medium_hash\", \"reason\": \"enum_only_flag\"}"
+    return 0
+  fi
+
+  # STAGE 3: Loader
+  local inode_count=0
+  if stage_load "$medium_hash"; then
+    inode_count=$(psql_as_user "$DB_URL" -tAc "SELECT COUNT(*) FROM inode WHERE medium_hash = '$medium_hash'" 2>/dev/null || echo "0")
+    echo "[$(date -Iseconds)] Load stage: SUCCESS ($inode_count inodes)" >&2
+  else
+    local load_rc=$?
+    if [[ $load_rc -eq 1 ]]; then
+      inode_count=$(psql_as_user "$DB_URL" -tAc "SELECT COUNT(*) FROM inode WHERE medium_hash = '$medium_hash'" 2>/dev/null || echo "0")
+      echo "[$(date -Iseconds)] Load stage: SKIPPED (already loaded, $inode_count inodes)" >&2
+    else
+      echo "[$(date -Iseconds)] Load stage: FAILED" >&2
+      log pipeline_error "{\"medium_hash\": \"$medium_hash\", \"failed_stage\": \"load\"}"
+      # Don't abort - medium is mounted, user can debug
+    fi
+  fi
+
+  # STAGE 4: Copy (with smart scheduling)
+  if [[ $inode_count -gt 0 ]]; then
+    if stage_copy "$medium_hash" "$inode_count"; then
+      echo "[$(date -Iseconds)] Copy stage: SUCCESS" >&2
+    else
+      local copy_rc=$?
+      if [[ $copy_rc -eq 1 ]]; then
+        echo "[$(date -Iseconds)] Copy stage: SKIPPED or DEFERRED" >&2
+      else
+        echo "[$(date -Iseconds)] Copy stage: FAILED" >&2
+        log pipeline_error "{\"medium_hash\": \"$medium_hash\", \"failed_stage\": \"copy\"}"
+      fi
+    fi
+  else
+    echo "[$(date -Iseconds)] Copy stage: SKIPPED (no inodes to copy)" >&2
+  fi
+
+  echo "[$(date -Iseconds)] === PIPELINE COMPLETE ===" >&2
+  log pipeline_done "{\"medium_hash\": \"$medium_hash\", \"mode\": \"image\"}"
+
+  # Leave image mounted for copy workers / manual inspection
   # Cleanup will be handled by ntt-cleanup-mounts periodic job
-  log mount_persisted "{\"mnt\": \"$mnt\", \"loop\": \"$loop_device\", \"note\": \"left mounted for workers\"}"
-  trap - EXIT SIGINT SIGTERM  # Clear trap - we're keeping the mount
+  log mount_persisted "{\"medium_hash\": \"$medium_hash\", \"note\": \"left mounted for workers or inspection\"}"
 }
 
 # ---------- load-only mode handler ----------
