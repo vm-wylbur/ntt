@@ -1,3 +1,5 @@
+<!-- superseded: Workflow designed but never executed; need refreshed processing plan for current media state -->
+
 <!--
 Author: PB and Claude
 Date: Tue 08 Oct 2025

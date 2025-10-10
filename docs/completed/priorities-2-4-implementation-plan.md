@@ -1,3 +1,5 @@
+<!-- completed: Priority 3.1 implemented with alternative schema (commit 6c963c7); actual implementation uses error_files array not diagnostic_events as proposed -->
+
 <!--
 Author: PB and Claude
 Date: Tue 08 Oct 2025

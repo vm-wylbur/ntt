@@ -1,3 +1,5 @@
+<!-- superseded: Processing plan for 488de202; need refreshed approach for current media -->
+
 <!--
 Author: PB and Claude
 Date: Wed 09 Oct 2025
