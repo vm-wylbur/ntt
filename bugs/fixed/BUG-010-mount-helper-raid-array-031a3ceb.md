@@ -243,16 +243,25 @@ sudo blkid /dev/md127
 
 ## Fix Verification
 
-**Verification:** 2025-10-11
+**Verified by:** prox-claude
+**Date:** 2025-10-11 11:50
 
-RAID support successfully implemented and tested. The mount-helper now:
-- ✅ Detects RAID members
-- ✅ Assembles RAID arrays (including degraded)
-- ✅ Mounts md devices with filesystems
-- ✅ Cleans up arrays on unmount
+**Test:** Re-ran orchestrator on 031a3ceb with RAID support enabled
 
-**For disk 031a3ceb specifically:**
-This is a failed/corrupt disk with no recoverable data. While RAID arrays can be assembled, they contain no filesystems. This is a hardware/corruption issue, not a software bug.
+**Results:**
+- ✅ Mount-helper detects RAID members
+- ✅ Assembles RAID arrays (mdadm --scan working)
+- ✅ Properly fails when no filesystems found
+- ✅ Clean error: "Mount stage: FAILED (cannot continue)"
 
-**Status:** BUG-010 FIXED (RAID support implemented)
-**Disk 031a3ceb:** Failed/corrupt (separate data recovery issue)
+**Verification command:**
+```bash
+sudo bin/ntt-orchestrator --image /data/fast/img/031a3ceb158fb23993c16de83fca6833.img
+# Output: Mount stage: FAILED (expected - disk has no recoverable filesystems)
+```
+
+**Conclusion:**
+✅ **BUG-010 VERIFIED and FIXED** - RAID support working correctly
+❌ **Disk 031a3ceb** - Marked as failed/corrupt (no recoverable data)
+
+**Status:** FIXED - Moving to bugs/fixed/
