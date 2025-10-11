@@ -18,11 +18,14 @@ class DiagnosticService:
     Handles error diagnosis and retry logic for NTT copy worker.
 
     Phase 1: Detection only - logs findings, no behavior change
-    Future phases: auto-skip, auto-remount, problem recording
+    Phase 2: Auto-skip unrecoverable errors (BEYOND_EOF, confirmed IO_ERROR)
+    Phase 3: Error classification and status tracking (BUG-007 fix)
+    Phase 4: Diagnostic event recording in medium.problems
 
     Design rationale:
     - In-memory retry tracking (acceptable to reset on worker restart)
     - Diagnostic checkpoint at retry #10 (balances transient vs persistent)
+    - Error classification enables targeted recovery after root cause fixes
     - Separated from Worker class for testability and maintainability
     """
 
@@ -157,6 +160,63 @@ class DiagnosticService:
             logger.debug(f"dmesg check failed: {e}")
             return None
 
+    def classify_error(self, exception: Exception) -> str:
+        """
+        Classify error type for targeted recovery logic.
+
+        Distinguishes fixable errors (path issues, permissions) from permanent
+        failures (bad media, IO errors).
+
+        Args:
+            exception: Exception that was raised
+
+        Returns:
+            Error type string: 'path_error', 'io_error', 'hash_error',
+                              'permission_error', or 'unknown'
+        """
+        error_msg = str(exception).lower()
+
+        # Path-related errors (potentially fixable)
+        if 'no such file or directory' in error_msg:
+            # Check if it's due to path length (common issue)
+            if len(error_msg) > 200:
+                return 'path_error'
+            return 'path_error'
+
+        if 'file name too long' in error_msg or 'path too long' in error_msg:
+            return 'path_error'
+
+        # Permission errors (might be fixable)
+        if 'permission denied' in error_msg or 'errno 13' in error_msg:
+            return 'permission_error'
+
+        # I/O errors from bad media (permanent)
+        if 'input/output error' in error_msg or 'i/o error' in error_msg:
+            return 'io_error'
+
+        if 'beyond end of device' in error_msg or 'beyond eof' in error_msg:
+            return 'io_error'
+
+        # Hash computation errors (transient - might succeed on retry)
+        if 'hash' in error_msg or 'blake3' in error_msg:
+            return 'hash_error'
+
+        # Check exception type as fallback
+        exc_type = type(exception).__name__
+        if exc_type == 'PermissionError':
+            return 'permission_error'
+        elif exc_type in ['IOError', 'OSError']:
+            # OSError without specific message - could be I/O or other
+            if hasattr(exception, 'errno'):
+                if exception.errno == 5:  # EIO - Input/output error
+                    return 'io_error'
+                elif exception.errno == 13:  # EACCES - Permission denied
+                    return 'permission_error'
+                elif exception.errno == 2:  # ENOENT - No such file
+                    return 'path_error'
+
+        return 'unknown'
+
     def should_skip_permanently(self, findings: dict) -> bool:
         """
         Decide if we should permanently skip this inode.
@@ -188,6 +248,35 @@ class DiagnosticService:
             return True
 
         return False
+
+    def determine_failure_status(self, exception: Exception) -> tuple[str, str]:
+        """
+        Determine status and error type for a failed inode at max retries.
+
+        Distinguishes between retryable failures (root cause might be fixable)
+        and permanent failures (unrecoverable).
+
+        Args:
+            exception: Exception that was raised
+
+        Returns:
+            Tuple of (status, error_type) where:
+                status: 'failed_retryable' or 'failed_permanent'
+                error_type: classification string from classify_error()
+        """
+        error_type = self.classify_error(exception)
+
+        # Permanent failures: bad media, confirmed I/O errors
+        if error_type == 'io_error':
+            status = 'failed_permanent'
+            logger.info(f"Classified as PERMANENT: {error_type}")
+        else:
+            # Everything else is potentially retryable after fixing root cause
+            # This includes: path_error, permission_error, hash_error, unknown
+            status = 'failed_retryable'
+            logger.info(f"Classified as RETRYABLE: {error_type}")
+
+        return status, error_type
 
     def _check_mount_status(self, medium_hash: str) -> str:
         """

@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+# Author: PB and Claude
+# Date: 2025-10-11
+# License: (c) HRDAG, 2025, GPL-2 or newer
+#
+# ------
+# ntt/bin/ntt-recover-failed
+#
+# BUG-007 Recovery Tool: Reset failed_retryable inodes for retry
+#
+# Purpose: After fixing root causes (path issues, permissions, etc.),
+#          reset failed inodes back to pending state for retry.
+#
+# Usage:
+#   ntt-recover-failed --medium-hash <hash> --error-type path_error
+#   ntt-recover-failed --medium-hash <hash> --all-retryable
+#   ntt-recover-failed --list-failures <hash>
+
+import os
+import sys
+import psycopg
+from psycopg.rows import dict_row
+import typer
+from typing import Optional
+
+app = typer.Typer()
+
+
+def get_db_connection(db_url: str):
+    """Get database connection with proper user handling."""
+    # Set PostgreSQL user to original user when running under sudo
+    if 'SUDO_USER' in os.environ:
+        os.environ['PGUSER'] = os.environ['SUDO_USER']
+
+    if os.geteuid() == 0 and 'SUDO_USER' in os.environ:
+        if '://' in db_url and '@' not in db_url:
+            db_url = db_url.replace(':///', f"://{os.environ['SUDO_USER']}@localhost/")
+
+    return psycopg.connect(db_url, row_factory=dict_row, autocommit=False)
+
+
+@app.command()
+def list_failures(
+    medium_hash: str = typer.Option(..., "--medium-hash", "-m", help="Medium hash to query"),
+    db_url: str = typer.Option("postgresql:///copyjob", "--db-url", help="Database connection URL")
+):
+    """
+    List all failed inodes for a medium with status breakdown.
+
+    Shows count by status and error_type to help decide what to retry.
+    """
+    conn = get_db_connection(db_url)
+
+    with conn.cursor() as cur:
+        # Status breakdown
+        cur.execute("""
+            SELECT status, error_type, COUNT(*) as count
+            FROM inode
+            WHERE medium_hash = %s
+              AND status IN ('failed_retryable', 'failed_permanent')
+            GROUP BY status, error_type
+            ORDER BY status, count DESC
+        """, (medium_hash,))
+
+        results = cur.fetchall()
+
+        if not results:
+            typer.echo(f"No failures found for medium {medium_hash}")
+            return
+
+        typer.echo(f"\nFailure summary for medium {medium_hash}:")
+        typer.echo("-" * 70)
+
+        for row in results:
+            typer.echo(f"  {row['status']:20s} | {row['error_type']:20s} | {row['count']:6d} inodes")
+
+        # Total counts
+        cur.execute("""
+            SELECT
+                COUNT(*) FILTER (WHERE status = 'failed_retryable') as retryable,
+                COUNT(*) FILTER (WHERE status = 'failed_permanent') as permanent
+            FROM inode
+            WHERE medium_hash = %s
+              AND status IN ('failed_retryable', 'failed_permanent')
+        """, (medium_hash,))
+
+        totals = cur.fetchone()
+        typer.echo("-" * 70)
+        typer.echo(f"  Retryable: {totals['retryable']:6d}")
+        typer.echo(f"  Permanent: {totals['permanent']:6d}")
+        typer.echo()
+
+    conn.close()
+
+
+@app.command()
+def reset_failures(
+    medium_hash: str = typer.Option(..., "--medium-hash", "-m", help="Medium hash to reset"),
+    error_type: Optional[str] = typer.Option(None, "--error-type", "-t",
+                                             help="Reset only this error type (e.g., path_error)"),
+    all_retryable: bool = typer.Option(False, "--all-retryable", "-a",
+                                       help="Reset ALL retryable failures"),
+    dry_run: bool = typer.Option(True, "--dry-run/--execute",
+                                 help="Dry run by default, use --execute to apply"),
+    db_url: str = typer.Option("postgresql:///copyjob", "--db-url", help="Database connection URL")
+):
+    """
+    Reset failed_retryable inodes back to pending state.
+
+    Use this after fixing root causes (path issues, permissions, etc.) to retry files.
+
+    Examples:
+        # List what would be reset
+        ntt-recover-failed reset-failures -m abc123 --error-type path_error
+
+        # Actually reset path errors
+        ntt-recover-failed reset-failures -m abc123 --error-type path_error --execute
+
+        # Reset all retryable failures
+        ntt-recover-failed reset-failures -m abc123 --all-retryable --execute
+    """
+    if not error_type and not all_retryable:
+        typer.echo("ERROR: Must specify either --error-type or --all-retryable")
+        raise typer.Exit(code=1)
+
+    if error_type and all_retryable:
+        typer.echo("ERROR: Cannot specify both --error-type and --all-retryable")
+        raise typer.Exit(code=1)
+
+    conn = get_db_connection(db_url)
+
+    # Build WHERE clause
+    if error_type:
+        where_clause = "status = 'failed_retryable' AND error_type = %s"
+        params = (medium_hash, error_type)
+        description = f"error_type={error_type}"
+    else:
+        where_clause = "status = 'failed_retryable'"
+        params = (medium_hash,)
+        description = "all retryable failures"
+
+    # Count affected rows
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT COUNT(*) as count
+            FROM inode
+            WHERE medium_hash = %s
+              AND {where_clause}
+        """, params)
+
+        count_result = cur.fetchone()
+        affected_count = count_result['count']
+
+    if affected_count == 0:
+        typer.echo(f"No matching failures found for {description}")
+        conn.close()
+        return
+
+    typer.echo(f"\nMedium: {medium_hash}")
+    typer.echo(f"Reset: {description}")
+    typer.echo(f"Affected inodes: {affected_count}")
+    typer.echo()
+
+    if dry_run:
+        typer.echo("DRY RUN - No changes made. Use --execute to apply changes.")
+        conn.close()
+        return
+
+    # Confirm before execution
+    if not typer.confirm("Proceed with reset?"):
+        typer.echo("Aborted.")
+        conn.close()
+        return
+
+    # Execute reset
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            UPDATE inode
+            SET status = 'pending',
+                error_type = NULL,
+                errors = '{{}}',
+                claimed_by = NULL,
+                claimed_at = NULL,
+                copied = false
+            WHERE medium_hash = %s
+              AND {where_clause}
+        """, params)
+
+        updated = cur.rowcount
+
+    conn.commit()
+    conn.close()
+
+    typer.echo(f"✓ Successfully reset {updated} inodes to pending state")
+    typer.echo(f"  Run ntt-copier.py -m {medium_hash} to retry these files")
+
+
+@app.command()
+def show_examples():
+    """Show example usage patterns."""
+    examples = """
+Example Usage:
+
+1. List failures for a medium:
+   ntt-recover-failed list-failures -m abc123def456
+
+2. Check what would be reset (dry run is default):
+   ntt-recover-failed reset-failures -m abc123def456 --error-type path_error
+
+3. Reset path errors (after fixing paths in database):
+   ntt-recover-failed reset-failures -m abc123def456 --error-type path_error --execute
+
+4. Reset permission errors (after fixing permissions):
+   ntt-recover-failed reset-failures -m abc123def456 --error-type permission_error --execute
+
+5. Reset all retryable failures:
+   ntt-recover-failed reset-failures -m abc123def456 --all-retryable --execute
+
+Common Scenarios:
+
+- Path issues fixed (absolute paths corrected to relative):
+  → Reset path_error failures
+
+- Permissions fixed (chmod/chown on archive):
+  → Reset permission_error failures
+
+- General retry after improvements:
+  → Reset all retryable (but check list first)
+
+NEVER reset:
+- failed_permanent (io_error) - these are from bad media, truly unrecoverable
+"""
+    typer.echo(examples)
+
+
+if __name__ == "__main__":
+    app()

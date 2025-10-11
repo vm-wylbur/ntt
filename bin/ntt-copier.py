@@ -412,6 +412,9 @@ class CopyWorker:
         """
         One-time startup check: mark inodes with >= 5 errors as permanently failed.
 
+        BUG-007: Uses new status model to classify failures as retryable or permanent
+        based on the most recent error in the errors array.
+
         This prevents them from being claimed by workers. Runs once at startup,
         not on every batch (that would scan millions of rows constantly).
         """
@@ -419,21 +422,44 @@ class CopyWorker:
 
         with self.conn.cursor() as cur:
             cur.execute("""
-                UPDATE inode
-                SET copied = true, claimed_by = 'MAX_RETRIES_EXCEEDED'
+                SELECT id, ino, errors
+                FROM inode
                 WHERE medium_hash = %s
                   AND copied = false
                   AND claimed_by IS NULL
                   AND array_length(errors, 1) >= 5
-                RETURNING id, ino, errors
             """, (self.medium_hash,))
 
             exceeded = cur.fetchall()
             if exceeded:
                 for row in exceeded:
                     last_error = row['errors'][-1] if row['errors'] else 'unknown'
-                    logger.error(f"PERMANENTLY FAILED ino={row['ino']} after {len(row['errors'])} errors: {last_error}")
-                logger.info(f"Marked {len(exceeded)} inodes as MAX_RETRIES_EXCEEDED")
+
+                    # Classify based on last error message
+                    # Simple heuristic: IO errors are permanent, others retryable
+                    if 'I/O error' in last_error or 'beyond EOF' in last_error:
+                        status = 'failed_permanent'
+                        error_type = 'io_error'
+                    else:
+                        status = 'failed_retryable'
+                        error_type = 'unknown'
+
+                    cur.execute("""
+                        UPDATE inode
+                        SET copied = true,
+                            claimed_by = 'MAX_RETRIES_EXCEEDED',
+                            status = %s,
+                            error_type = %s
+                        WHERE id = %s
+                    """, (status, error_type, row['id']))
+
+                    logger.error(
+                        f"PERMANENTLY FAILED ino={row['ino']} "
+                        f"status={status} error_type={error_type} "
+                        f"after {len(row['errors'])} errors: {last_error}"
+                    )
+
+                logger.info(f"Marked {len(exceeded)} inodes with max retries status")
             else:
                 logger.info(f"No inodes exceeded max retries")
 
@@ -606,7 +632,7 @@ class CopyWorker:
                 if not claimed_inodes:
                     return False  # No work
 
-                logger.info(f"Claimed batch of {len(claimed_inodes)} inodes")
+                logger.debug(f"Claimed batch of {len(claimed_inodes)} inodes")
 
                 # Calculate size distribution for this batch
                 size_dist = {
@@ -756,15 +782,20 @@ class CopyWorker:
                                 f"⚠️  MAX RETRIES REACHED "
                                 f"ino={inode_row['ino']} "
                                 f"retry={retry_count} "
-                                f"(permanently marking as failed)"
+                                f"(marking as failed with classification)"
                             )
+
+                            # PHASE 3 (BUG-007): Classify error to determine if retryable
+                            failure_status, failure_error_type = self.diagnostics.determine_failure_status(e)
 
                             # PHASE 4: Queue max retries event
                             findings = {
                                 'retry_count': retry_count,
                                 'exception_type': error_type,
                                 'exception_msg': error_msg,
-                                'checks_performed': ['max_retries_exceeded']
+                                'checks_performed': ['max_retries_exceeded'],
+                                'failure_status': failure_status,
+                                'failure_error_type': failure_error_type
                             }
                             self._pending_diagnostic_events.append((
                                 inode_row['medium_hash'],
@@ -773,9 +804,12 @@ class CopyWorker:
                                 'max_retries'
                             ))
 
-                            # CRITICAL: Actually mark as failed and skip to next inode
-                            # This prevents infinite retry loop
-                            results_by_inode[key] = {'blob_id': None, 'mime_type': None}
+                            # CRITICAL: Mark with proper status instead of copied=true
+                            # This enables recovery after root cause is fixed (BUG-007)
+                            results_by_inode[key] = {
+                                'failure_status': failure_status,
+                                'failure_error_type': failure_error_type
+                            }
                             action_counts['max_retries_exceeded'] = action_counts.get('max_retries_exceeded', 0) + 1
 
                             continue  # Skip to next inode - DON'T release claim for retry
@@ -798,16 +832,26 @@ class CopyWorker:
                         inos_for_paths.append(ino)
                         blob_ids.append(result['blob_id'])
 
-                # For inode table - separate success and failures
+                # For inode table - separate success, failures, and permanent failures
                 success_ids, success_blob_ids, success_mime_types = [], [], []
                 failed_inodes = []  # List of {id, ino, error_type, error_msg}
+                permanent_failures = []  # List of {id, ino, status, error_type}
 
                 for inode_row in claimed_inodes:
                     key = (inode_row['medium_hash'], inode_row['ino'])
                     result = results_by_inode.get(key)
 
-                    if isinstance(result, dict) and 'error_type' in result:
-                        # Failure: result is error info dict
+                    if isinstance(result, dict) and 'failure_status' in result:
+                        # Max retries reached - mark with status (BUG-007 fix)
+                        permanent_failures.append({
+                            'id': inode_row['id'],
+                            'ino': inode_row['ino'],
+                            'medium_hash': inode_row['medium_hash'],
+                            'status': result['failure_status'],
+                            'error_type': result['failure_error_type']
+                        })
+                    elif isinstance(result, dict) and 'error_type' in result:
+                        # Transient failure: result is error info dict (will retry)
                         failed_inodes.append({
                             'id': inode_row['id'],
                             'ino': inode_row['ino'],
@@ -852,13 +896,36 @@ class CopyWorker:
                     t2 = time.time()
                     cur.execute("""
                         UPDATE inode SET copied = true, blobid = updates.blob_id,
-                                         mime_type = COALESCE(updates.mime_type, inode.mime_type)
+                                         mime_type = COALESCE(updates.mime_type, inode.mime_type),
+                                         status = 'success'
                         FROM unnest(%s::bigint[], %s::text[], %s::text[]) AS updates(id, blob_id, mime_type)
                         WHERE inode.id = updates.id
                           AND inode.medium_hash = %s
                     """, (success_ids, success_blob_ids, success_mime_types, self.medium_hash))
                     t3 = time.time()
                     logger.debug(f"TIMING: UPDATE inode (success): {t3-t2:.3f}s for {len(success_ids)} inodes")
+
+                # BUG-007: Update permanent failures with status and error_type
+                if permanent_failures:
+                    t_perm_start = time.time()
+                    for pf in permanent_failures:
+                        cur.execute("""
+                            UPDATE inode
+                            SET status = %s,
+                                error_type = %s,
+                                copied = true,
+                                claimed_by = NULL,
+                                claimed_at = NULL
+                            WHERE id = %s AND medium_hash = %s
+                        """, (pf['status'], pf['error_type'], pf['id'], pf['medium_hash']))
+
+                        logger.warning(
+                            f"PERMANENTLY FAILED ino={pf['ino']} "
+                            f"status={pf['status']} error_type={pf['error_type']}"
+                        )
+
+                    t_perm_end = time.time()
+                    logger.debug(f"TIMING: UPDATE inode (permanent failures): {t_perm_end-t_perm_start:.3f}s for {len(permanent_failures)} inodes")
 
                 if failed_inodes:
                     t4 = time.time()
@@ -949,7 +1016,7 @@ class CopyWorker:
                 size_by_action_mb = {k: v/1024/1024 for k, v in size_by_action.items()}
                 logger.debug(f"BATCH_SIZE_BY_ACTION_MB: {size_by_action_mb}")
 
-                logger.info(f"Completed batch: {len(success_ids)} copied, {len(failed_inodes)} failed")
+                logger.debug(f"Completed batch: {len(success_ids)} copied, {len(failed_inodes)} failed")
 
                 # Update stats
                 self.stats['copied'] += len(success_ids)
@@ -1473,6 +1540,8 @@ class CopyWorker:
         try:
             # Atomic move
             shutil.move(str(temp_file), str(hash_path))
+            # Make world-readable (overrides root's umask)
+            os.chmod(hash_path, 0o644)
             by_hash_created = True
             logger.info(f"Created by-hash file: {hash_path}")
         except FileExistsError:
@@ -1658,7 +1727,7 @@ def main(
 
     # Setup logging
     logger.remove()  # Remove default handler
-    logger.add(sys.stderr, level="INFO")
+    logger.add(sys.stderr, level="INFO", format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {message}")
 
     # CRITICAL: Must run as root to read all files from mounted images
     if os.geteuid() != 0:
