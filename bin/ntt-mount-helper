@@ -113,6 +113,19 @@ stop_raid_arrays() {
   done
 }
 
+# Get mount options for filesystem type
+# ext4 needs 'noload' to skip journal recovery on readonly mounts
+get_mount_options() {
+  local fs_type="$1"
+  local base_opts="ro,noatime,nodev,nosuid"
+
+  if [[ "$fs_type" == "ext4" || "$fs_type" == "ext3" || "$fs_type" == "ext2" ]]; then
+    echo "${base_opts},noload"
+  else
+    echo "$base_opts"
+  fi
+}
+
 # Cleanup stale loop devices pointing to deleted inodes
 cleanup_stale_loops() {
   local medium_hash="$1"
@@ -241,8 +254,12 @@ do_mount() {
       local part_mount="$mount_point/p$part_num"
       mkdir -p "$part_mount"
 
+      # Get appropriate mount options for this filesystem type
+      local mount_opts
+      mount_opts=$(get_mount_options "$part_type")
+
       # Try to mount this partition
-      if mount -t "$part_type" -o ro,noatime,nodev,nosuid "$part_dev" "$part_mount" 2>/dev/null; then
+      if mount -t "$part_type" -o "$mount_opts" "$part_dev" "$part_mount" 2>/dev/null; then
         echo "  Mounted $part_dev at $part_mount (fs_type: $part_type)" >&2
         mounted_partitions+=("$part_num:$part_dev:$part_mount:$part_type:ok")
         partition_count=$((partition_count + 1))
@@ -297,8 +314,12 @@ do_mount() {
         local md_mount="$mount_point/p$md_part_num"
         mkdir -p "$md_mount"
 
+        # Get appropriate mount options for this filesystem type
+        local md_mount_opts
+        md_mount_opts=$(get_mount_options "$md_fs_type")
+
         # Try to mount
-        if mount -t "$md_fs_type" -o ro,noatime,nodev,nosuid "$md_dev" "$md_mount" 2>/dev/null; then
+        if mount -t "$md_fs_type" -o "$md_mount_opts" "$md_dev" "$md_mount" 2>/dev/null; then
           echo "  Mounted $md_dev at $md_mount (RAID, fs_type: $md_fs_type)" >&2
           mounted_partitions+=("$md_part_num:$md_dev:$md_mount:$md_fs_type:ok")
           partition_count=$((partition_count + 1))
@@ -338,7 +359,9 @@ do_mount() {
 
     # Mount with detected filesystem type (or auto-detect)
     if [[ -n "$fs_type" ]]; then
-      if mount -t "$fs_type" -o ro,noatime,nodev,nosuid "$loop_device" "$mount_point" 2>/dev/null; then
+      local mount_opts
+      mount_opts=$(get_mount_options "$fs_type")
+      if mount -t "$fs_type" -o "$mount_opts" "$loop_device" "$mount_point" 2>/dev/null; then
         echo "Mounted $loop_device at $mount_point (fs_type: $fs_type)" >&2
         echo '{"layout":"single","device":"'"$loop_device"'","mount":"'"$mount_point"'","fstype":"'"$fs_type"'"}'
         exit 0
@@ -356,14 +379,18 @@ do_mount() {
     # Many optical discs report "udf" via blkid but mount as "iso9660" (or vice versa)
     if [[ "$fs_type" == "udf" ]]; then
       echo "UDF mount failed, trying ISO9660 (common for bridge-format optical discs)..." >&2
-      if mount -t iso9660 -o ro,noatime,nodev,nosuid "$loop_device" "$mount_point" 2>/dev/null; then
+      local iso_opts
+      iso_opts=$(get_mount_options "iso9660")
+      if mount -t iso9660 -o "$iso_opts" "$loop_device" "$mount_point" 2>/dev/null; then
         echo "Mounted $loop_device at $mount_point (fs_type: iso9660)" >&2
         echo '{"layout":"single","device":"'"$loop_device"'","mount":"'"$mount_point"'","fstype":"iso9660"}'
         exit 0
       fi
     elif [[ "$fs_type" == "iso9660" ]]; then
       echo "ISO9660 mount failed, trying UDF..." >&2
-      if mount -t udf -o ro,noatime,nodev,nosuid "$loop_device" "$mount_point" 2>/dev/null; then
+      local udf_opts
+      udf_opts=$(get_mount_options "udf")
+      if mount -t udf -o "$udf_opts" "$loop_device" "$mount_point" 2>/dev/null; then
         echo "Mounted $loop_device at $mount_point (fs_type: udf)" >&2
         echo '{"layout":"single","device":"'"$loop_device"'","mount":"'"$mount_point"'","fstype":"udf"}'
         exit 0
@@ -390,7 +417,9 @@ do_mount() {
       # Try mounting with detected type or auto-detect
       local mount_success=false
       if [[ -n "$zip_fs_type" ]]; then
-        if mount -t "$zip_fs_type" -o ro,noatime,nodev,nosuid "$zip_loop_device" "$mount_point" 2>/dev/null; then
+        local zip_mount_opts
+        zip_mount_opts=$(get_mount_options "$zip_fs_type")
+        if mount -t "$zip_fs_type" -o "$zip_mount_opts" "$zip_loop_device" "$mount_point" 2>/dev/null; then
           echo "Mounted $zip_loop_device at $mount_point (Zip disk offset=16384, fs_type=$zip_fs_type)" >&2
           echo '{"layout":"single","device":"'"$zip_loop_device"'","mount":"'"$mount_point"'","fstype":"'"$zip_fs_type"'","offset":16384}'
           mount_success=true
