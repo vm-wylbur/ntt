@@ -35,6 +35,84 @@ validate_hash() {
   fi
 }
 
+# Assemble RAID array from partition device
+# Returns md device path on success, empty string on failure
+assemble_raid_array() {
+  local part_dev="$1"
+  local part_num="$2"
+
+  # Check if mdadm is available
+  if ! command -v mdadm >/dev/null 2>&1; then
+    echo "  Warning: mdadm not found, cannot assemble RAID arrays" >&2
+    return 1
+  fi
+
+  # Examine RAID metadata
+  local raid_info
+  raid_info=$(mdadm --examine "$part_dev" 2>/dev/null)
+  if [[ -z "$raid_info" ]]; then
+    echo "  Warning: No valid RAID metadata on $part_dev" >&2
+    return 1
+  fi
+
+  # Extract UUID for array identification
+  local raid_uuid
+  raid_uuid=$(echo "$raid_info" | grep "Array UUID" | awk '{print $4}')
+
+  # Check if array is already assembled
+  local existing_md
+  existing_md=$(mdadm --detail --scan 2>/dev/null | grep "$raid_uuid" | awk '{print $2}' | head -1)
+  if [[ -n "$existing_md" ]]; then
+    echo "  RAID array already assembled: $existing_md" >&2
+    echo "$existing_md"
+    return 0
+  fi
+
+  # Assemble array (read-only, run mode)
+  # --run forces assembly even if degraded (single-device RAID1)
+  local md_device
+  md_device=$(mdadm --assemble --readonly --run --uuid="$raid_uuid" "$part_dev" 2>&1 | grep -o '/dev/md[0-9]*' | head -1)
+
+  if [[ -n "$md_device" ]]; then
+    echo "  Assembled RAID array: $md_device from $part_dev" >&2
+    # Wait for device to be ready
+    sleep 0.2
+    echo "$md_device"
+    return 0
+  else
+    echo "  Failed to assemble RAID from $part_dev" >&2
+    return 1
+  fi
+}
+
+# Stop all RAID arrays associated with a mount point
+stop_raid_arrays() {
+  local mount_point="$1"
+
+  # Find all md devices mounted under this mount point
+  local md_devices=()
+  while IFS= read -r md_dev; do
+    md_devices+=("$md_dev")
+  done < <(findmnt -rn -o SOURCE | grep "^/dev/md" | sort -u)
+
+  # Check each md device to see if it's mounted under our mount point
+  for md_dev in "${md_devices[@]}"; do
+    local md_mount
+    md_mount=$(findmnt -n -o TARGET -S "$md_dev" 2>/dev/null || echo "")
+
+    if [[ "$md_mount" =~ ^$mount_point ]]; then
+      echo "  Stopping RAID array: $md_dev" >&2
+      # mdadm --stop will fail if array is still mounted, which is fine
+      # (we unmount first, then stop the array)
+      if mdadm --stop "$md_dev" 2>/dev/null; then
+        echo "  Stopped $md_dev" >&2
+      else
+        echo "  Warning: Could not stop $md_dev (may still be in use)" >&2
+      fi
+    fi
+  done
+}
+
 # Cleanup stale loop devices pointing to deleted inodes
 cleanup_stale_loops() {
   local medium_hash="$1"
@@ -123,6 +201,20 @@ do_mount() {
   if [[ "$has_partitions" == "true" ]]; then
     # Multi-partition disk - mount each partition to subdirectory
     echo "Multi-partition disk detected" >&2
+
+    # First, scan for and assemble ALL RAID arrays on this disk
+    # This handles RAID partitions that don't show TYPE="linux_raid_member" in blkid
+    if command -v mdadm >/dev/null 2>&1; then
+      # Load RAID1 kernel module if not already loaded
+      modprobe raid1 2>/dev/null || true
+
+      # Scan and assemble all RAID arrays found on these partitions
+      echo "Scanning for RAID arrays..." >&2
+      # Try non-degraded first, then force start with --run (for single-device RAID1)
+      mdadm --assemble --scan --no-degraded 2>/dev/null || true
+      mdadm --assemble --scan --run 2>/dev/null || true
+    fi
+
     local partition_count=0
     local mounted_partitions=()
 
@@ -135,6 +227,13 @@ do_mount() {
       part_type=$(blkid -o value -s TYPE "$part_dev" 2>/dev/null || echo "")
       if [[ -z "$part_type" ]]; then
         echo "  Skipping $part_dev (extended partition container)" >&2
+        continue
+      fi
+
+      # Skip RAID members - they're handled by mdadm --scan above
+      # The resulting md devices will be mounted later
+      if [[ "$part_type" == "linux_raid_member" ]]; then
+        echo "  Skipping $part_dev (RAID member, will mount assembled array)" >&2
         continue
       fi
 
@@ -154,8 +253,65 @@ do_mount() {
       fi
     done
 
+    # After trying partitions, also check for assembled RAID devices
+    # mdadm --scan may have assembled arrays that weren't detected per-partition
+    if command -v mdadm >/dev/null 2>&1; then
+      local seen_md_devices=()
+
+      for md_dev in /dev/md[0-9]* /dev/md/*; do
+        [[ -b "$md_dev" ]] || [[ -L "$md_dev" && -b "$(readlink -f "$md_dev")" ]] || continue
+        # Resolve symlinks
+        md_dev=$(readlink -f "$md_dev")
+
+        # Skip if already processed (dedup /dev/md5 and /dev/md/5)
+        local already_seen=false
+        for seen in "${seen_md_devices[@]}"; do
+          if [[ "$seen" == "$md_dev" ]]; then
+            already_seen=true
+            break
+          fi
+        done
+        [[ "$already_seen" == "true" ]] && continue
+        seen_md_devices+=("$md_dev")
+
+        # Skip if already mounted (might have been mounted in partition loop)
+        local already_mounted=false
+        for part_info in "${mounted_partitions[@]}"; do
+          IFS=':' read -r num dev mnt fstype status <<< "$part_info"
+          if [[ "$dev" == "$md_dev" ]]; then
+            already_mounted=true
+            break
+          fi
+        done
+        [[ "$already_mounted" == "true" ]] && continue
+
+        # Get filesystem type
+        local md_fs_type
+        md_fs_type=$(blkid -o value -s TYPE "$md_dev" 2>/dev/null || echo "")
+        [[ -n "$md_fs_type" ]] || continue
+
+        # Find a partition number to use (use next available)
+        local md_part_num=$((partition_count + 1))
+
+        # Create mount point
+        local md_mount="$mount_point/p$md_part_num"
+        mkdir -p "$md_mount"
+
+        # Try to mount
+        if mount -t "$md_fs_type" -o ro,noatime,nodev,nosuid "$md_dev" "$md_mount" 2>/dev/null; then
+          echo "  Mounted $md_dev at $md_mount (RAID, fs_type: $md_fs_type)" >&2
+          mounted_partitions+=("$md_part_num:$md_dev:$md_mount:$md_fs_type:ok")
+          partition_count=$((partition_count + 1))
+        else
+          echo "  Failed to mount $md_dev" >&2
+          rmdir "$md_mount" 2>/dev/null || true
+        fi
+      done
+    fi
+
     if [[ $partition_count -eq 0 ]]; then
-      # No partitions mounted successfully
+      # No partitions mounted successfully - cleanup any assembled RAID arrays
+      stop_raid_arrays "$mount_point"
       losetup -d "$loop_device" 2>/dev/null || true
       rmdir "$mount_point" 2>/dev/null || true
       echo "Error: No partitions could be mounted" >&2
@@ -331,6 +487,9 @@ do_unmount() {
       echo "Not mounted: $mount_point"
     fi
   fi
+
+  # Stop any RAID arrays that were mounted under this mount point
+  stop_raid_arrays "$mount_point"
 
   # Detach loop device if found
   if [[ -n "$loop_device" ]] && [[ "$loop_device" =~ ^/dev/loop ]]; then
