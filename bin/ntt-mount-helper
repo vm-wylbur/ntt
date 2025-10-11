@@ -196,14 +196,69 @@ do_mount() {
       exit 0
     fi
 
+    # Optical media fallback: ISO9660/UDF bridge format
+    # Many optical discs report "udf" via blkid but mount as "iso9660" (or vice versa)
+    if [[ "$fs_type" == "udf" ]]; then
+      echo "UDF mount failed, trying ISO9660 (common for bridge-format optical discs)..." >&2
+      if mount -t iso9660 -o ro,noatime,nodev,nosuid "$loop_device" "$mount_point" 2>/dev/null; then
+        echo "Mounted $loop_device at $mount_point (fs_type: iso9660)" >&2
+        echo '{"layout":"single","device":"'"$loop_device"'","mount":"'"$mount_point"'","fstype":"iso9660"}'
+        exit 0
+      fi
+    elif [[ "$fs_type" == "iso9660" ]]; then
+      echo "ISO9660 mount failed, trying UDF..." >&2
+      if mount -t udf -o ro,noatime,nodev,nosuid "$loop_device" "$mount_point" 2>/dev/null; then
+        echo "Mounted $loop_device at $mount_point (fs_type: udf)" >&2
+        echo '{"layout":"single","device":"'"$loop_device"'","mount":"'"$mount_point"'","fstype":"udf"}'
+        exit 0
+      fi
+    fi
+
     # Zip disk special case: filesystem may start at offset 16384 bytes (sector 32)
     # Zip disks (100MB/250MB/750MB Iomega removable media) often have FAT16/FAT32
     # filesystems starting at 0x4000 instead of sector 0
     echo "Standard mount failed, trying Zip disk offset (16384 bytes)..." >&2
-    if mount -t vfat -o ro,noatime,nodev,nosuid,offset=16384 "$loop_device" "$mount_point" 2>/dev/null; then
-      echo "Mounted $loop_device at $mount_point (Zip disk with offset=16384)" >&2
-      echo '{"layout":"single","device":"'"$loop_device"'","mount":"'"$mount_point"'","fstype":"vfat","offset":16384}'
-      exit 0
+
+    # Create offset loop device (mount doesn't support offset= for loop devices)
+    local zip_loop_device
+    zip_loop_device=$(losetup -f --show -r -o 16384 "$image_path" 2>/dev/null)
+
+    if [[ -n "$zip_loop_device" ]]; then
+      # Wait for device to be ready
+      sleep 0.1
+
+      # Detect filesystem type at offset
+      local zip_fs_type
+      zip_fs_type=$(blkid -o value -s TYPE "$zip_loop_device" 2>/dev/null || echo "")
+
+      # Try mounting with detected type or auto-detect
+      local mount_success=false
+      if [[ -n "$zip_fs_type" ]]; then
+        if mount -t "$zip_fs_type" -o ro,noatime,nodev,nosuid "$zip_loop_device" "$mount_point" 2>/dev/null; then
+          echo "Mounted $zip_loop_device at $mount_point (Zip disk offset=16384, fs_type=$zip_fs_type)" >&2
+          echo '{"layout":"single","device":"'"$zip_loop_device"'","mount":"'"$mount_point"'","fstype":"'"$zip_fs_type"'","offset":16384}'
+          mount_success=true
+        fi
+      fi
+
+      # Fallback: try auto-detect
+      if [[ "$mount_success" == "false" ]]; then
+        if mount -o ro,noatime,nodev,nosuid "$zip_loop_device" "$mount_point" 2>/dev/null; then
+          echo "Mounted $zip_loop_device at $mount_point (Zip disk offset=16384, auto-detected)" >&2
+          echo '{"layout":"single","device":"'"$zip_loop_device"'","mount":"'"$mount_point"'","fstype":"auto","offset":16384}'
+          mount_success=true
+        fi
+      fi
+
+      if [[ "$mount_success" == "true" ]]; then
+        # Successfully mounted - detach original loop device (offset device is now in use)
+        losetup -d "$loop_device" 2>/dev/null || true
+        exit 0
+      else
+        # Mount failed - cleanup offset device
+        losetup -d "$zip_loop_device" 2>/dev/null || true
+        echo "Failed to mount Zip disk at offset 16384 (fs_type: ${zip_fs_type:-unknown})" >&2
+      fi
     fi
 
     # Mount failed - cleanup
