@@ -114,10 +114,12 @@ echo "[$(date -Iseconds)] Running PostgreSQL COPY command..." >&2
 
 # Use temporary file to capture both output and exit code
 TEMP_OUTPUT="/tmp/ntt-copy-output-$$"
-# Pipeline: escape special chars (backslash, CR, LF) → PostgreSQL COPY
+# Pipeline: field-aware escaping (delimiter 034 only in path field) → PostgreSQL COPY
+# ntt-escape-raw.pl: escapes backslash, delimiter, CR, LF in 7th field (path) only
 # NOTE: Paths are stored as bytea to preserve invalid UTF-8 sequences
 # Use Latin1 encoding to accept all byte values without UTF-8 validation
-if perl -pe 'BEGIN{$/=\1} s/\\/\\\\/g; s/\r/\\r/g; s/\n/\\n/g; s/\0/\n/g' < "$FILE" | \
+NTT_BIN="${NTT_BIN:-$(dirname "$0")}"
+if "$NTT_BIN/ntt-escape-raw.pl" < "$FILE" | \
     sudo -u "${SUDO_USER:-$USER}" psql "$DB_URL" -c "
 SET client_encoding = 'LATIN1';
 
