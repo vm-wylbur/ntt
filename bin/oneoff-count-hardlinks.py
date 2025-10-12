@@ -26,6 +26,9 @@ from psycopg.rows import dict_row
 import typer
 from loguru import logger
 
+# Import database connection utility
+from ntt_db import get_db_connection
+
 app = typer.Typer()
 
 # Configure logging
@@ -47,16 +50,15 @@ class HardlinkStats:
 
 class HardlinkCounter:
     """Count and verify hardlinks for blobs."""
-    
-    def __init__(self, db_url: str, by_hash_root: Path, archive_root: Path):
-        self.db_url = db_url
+
+    def __init__(self, by_hash_root: Path, archive_root: Path):
         self.by_hash_root = by_hash_root
         self.archive_root = archive_root
         self.stats = HardlinkStats()
-        
+
     def connect_db(self) -> psycopg.Connection:
-        """Connect to database."""
-        return psycopg.connect(self.db_url, row_factory=dict_row)
+        """Connect to database via shared utility."""
+        return get_db_connection(row_factory=dict_row)
     
     def process_blob(self, conn: psycopg.Connection, blob: dict) -> int:
         """Count hardlinks for a single blob."""
@@ -193,24 +195,17 @@ def main(
     limit: Optional[int] = typer.Option(None, "--limit", help="Limit number of blobs to process"),
     by_hash_root: Path = typer.Option("/data/cold/by-hash", "--by-hash", help="By-hash root directory"),
     archive_root: Path = typer.Option("/data/cold/archived", "--archive", help="Archive root directory"),
-    database: str = typer.Option("copyjob", "--database", help="Database name"),
-    host: str = typer.Option("localhost", "--host", help="Database host"),
-    user: str = typer.Option("postgres", "--user", help="Database user"),
 ):
     """Count existing hardlinks for all blobs and update n_hardlinks in database."""
-    
-    # Build database URL
-    db_url = f"postgresql://{user}@{host}/{database}"
-    
-    logger.info(f"Database: {database}")
+
     logger.info(f"By-hash root: {by_hash_root}")
     logger.info(f"Archive root: {archive_root}")
-    
+
     if dry_run:
         logger.warning("DRY RUN MODE - no database updates")
-    
+
     # Create counter and run
-    counter = HardlinkCounter(db_url, by_hash_root, archive_root)
+    counter = HardlinkCounter(by_hash_root, archive_root)
     counter.run(dry_run, limit)
 
 

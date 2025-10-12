@@ -36,7 +36,6 @@ from psycopg.rows import dict_row
 from loguru import logger
 
 # Configuration from environment
-DB_URL = os.environ.get('NTT_DB_URL', 'postgresql:///copyjob')
 BY_HASH_ROOT = Path(os.environ.get('NTT_BY_HASH_ROOT', '/data/cold/by-hash'))
 ARCHIVE_ROOT = Path(os.environ.get('NTT_ARCHIVE_ROOT', '/data/cold/archived'))
 LOG_JSON = Path(os.environ.get('NTT_LOG_JSON', '/var/log/ntt/verify.jsonl'))
@@ -46,16 +45,8 @@ IGNORE_PATTERNS_FILE = os.environ.get('NTT_IGNORE_PATTERNS', '')
 DEFAULT_SAMPLE_SIZE = 1000  # For TABLESAMPLE
 BATCH_LOG_SIZE = 100  # Log success batch every N blobs
 
-# Set PostgreSQL user
-if 'SUDO_USER' in os.environ:
-    os.environ['PGUSER'] = os.environ['SUDO_USER']
-elif os.geteuid() == 0 and 'USER' in os.environ:
-    os.environ['PGUSER'] = 'postgres'
-
-# Fix DB_URL for sudo
-if os.geteuid() == 0 and 'SUDO_USER' in os.environ:
-    if '://' in DB_URL and '@' not in DB_URL:
-        DB_URL = DB_URL.replace(':///', f"://{os.environ['SUDO_USER']}@localhost/")
+# Database connection via shared utility
+from ntt_db import get_db_connection
 
 # CLI app
 app = typer.Typer()
@@ -127,9 +118,8 @@ class BlobVerification:
 class BlobVerifier:
     """Verifies blob integrity in content-addressable storage."""
     
-    def __init__(self, db_url: str, by_hash_root: Path, archive_root: Path, 
+    def __init__(self, by_hash_root: Path, archive_root: Path,
                  log_json: Path, dry_run: bool = False, sample_size: int = DEFAULT_SAMPLE_SIZE):
-        self.db_url = db_url
         self.by_hash_root = by_hash_root
         self.archive_root = archive_root
         self.log_json = log_json
@@ -205,7 +195,7 @@ class BlobVerifier:
     
     def connect_db(self) -> psycopg.Connection:
         """Connect to database."""
-        return psycopg.connect(self.db_url, row_factory=dict_row)
+        return get_db_connection(row_factory=dict_row)
     
     def get_blobs_from_file(self, conn: psycopg.Connection, file_path: Path) -> List[Dict]:
         """Load blob IDs from a file and fetch from database."""
@@ -723,7 +713,6 @@ def main(
     
     # Create and run verifier
     verifier = BlobVerifier(
-        db_url=DB_URL,
         by_hash_root=by_hash_root,
         archive_root=archive_root,
         log_json=log_json,

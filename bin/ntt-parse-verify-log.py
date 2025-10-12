@@ -27,6 +27,9 @@ import argparse
 from pathlib import Path
 from collections import defaultdict
 
+# Import database connection utility
+from ntt_db import get_db_connection
+
 def parse_verify_log(log_file):
     """Parse the verify JSONL log and extract relevant information."""
     
@@ -123,22 +126,9 @@ def main():
         # Resolve to full hashes if requested (batch query)
         if args.full_hashes:
             try:
-                import psycopg
                 from psycopg.rows import dict_row
-                
-                DB_URL = os.environ.get('NTT_DB_URL', 'postgresql:///copyjob')
-                
-                # Fix DB URL for sudo (same as other scripts)
-                if 'SUDO_USER' in os.environ:
-                    os.environ['PGUSER'] = os.environ['SUDO_USER']
-                elif os.geteuid() == 0 and 'USER' in os.environ:
-                    os.environ['PGUSER'] = 'postgres'
-                
-                if os.geteuid() == 0 and 'SUDO_USER' in os.environ:
-                    if '://' in DB_URL and '@' not in DB_URL:
-                        DB_URL = DB_URL.replace(':///', f"://{os.environ['SUDO_USER']}@localhost/")
-                
-                db_conn = psycopg.connect(DB_URL, row_factory=dict_row)
+
+                db_conn = get_db_connection(row_factory=dict_row)
                 
                 print(f"# Resolving {len(blobs_with_missing)} short hashes to full hashes...", file=sys.stderr)
                 

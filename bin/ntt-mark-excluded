@@ -11,23 +11,24 @@ We must use convert_from(path, 'LATIN1') to convert back to text for regex match
 LATIN1 encoding is 1-to-1 byte mapping, so no information is lost.
 
 Usage:
+  # As regular user (config loaded from ~/.config/ntt/ntt.env)
   source ~/.config/ntt/ntt.env && ntt-mark-excluded [--dry-run]
+
+  # Under sudo (explicitly load from user's config)
+  sudo -E bash -c "source ~$(logname)/.config/ntt/ntt.env && ntt-mark-excluded [--dry-run]"
 """
 
 import os
 import sys
 import re
 from pathlib import Path
-import psycopg
 from psycopg.rows import dict_row
 
-# Configuration from environment
-DB_URL = os.environ.get('NTT_DB_URL', 'postgresql:///copyjob')
-IGNORE_PATTERNS_FILE = os.environ.get('NTT_IGNORE_PATTERNS', '')
+# Import database connection utility
+from ntt_db import get_db_connection
 
-# Set PostgreSQL user
-if 'SUDO_USER' in os.environ:
-    os.environ['PGUSER'] = os.environ['SUDO_USER']
+# Configuration from environment
+IGNORE_PATTERNS_FILE = os.environ.get('NTT_IGNORE_PATTERNS', '')
 
 def load_patterns(patterns_file: str) -> list[str]:
     """Load ignore patterns from file."""
@@ -62,7 +63,7 @@ def mark_excluded_paths(dry_run: bool = False):
     print(f"\nPostgreSQL regex pattern (first 200 chars):")
     print(f"{postgres_regex[:200]}...")
 
-    with psycopg.connect(DB_URL) as conn:
+    with get_db_connection(row_factory=dict_row) as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             # Count paths that would be excluded
             # Note: convert_from(path, 'LATIN1') reverses the convert_to() used in loader

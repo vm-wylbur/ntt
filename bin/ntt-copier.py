@@ -53,6 +53,9 @@ import ntt_copier_strategies as strategies
 # Import diagnostic service
 from ntt_copier_diagnostics import DiagnosticService
 
+# Import database connection utility
+from ntt_db import get_db_connection
+
 app = typer.Typer()
 
 
@@ -160,10 +163,9 @@ def validate_destination_filesystem():
 class CopyWorker:
     """NTT copy worker using Claim-Analyze-Execute pattern."""
 
-    def __init__(self, worker_id: str, db_url: str, medium_hash: str, limit: int = 0,
+    def __init__(self, worker_id: str, medium_hash: str, limit: int = 0,
                  dry_run: bool = False, batch_size: int = 100):
         self.worker_id = worker_id
-        self.db_url = db_url
         self.medium_hash = medium_hash
         self.limit = limit
         self.dry_run = dry_run
@@ -194,8 +196,9 @@ class CopyWorker:
             'bytes': 0,
         }
 
-        # Database connection
-        self.conn = psycopg.connect(self.db_url, row_factory=dict_row, autocommit=False)
+        # Database connection via shared utility
+        self.conn = get_db_connection(row_factory=dict_row)
+        self.conn.autocommit = False
 
         # Force index usage for all queries - PostgreSQL planner chooses seqscan incorrectly
         with self.conn.cursor() as cur:
@@ -1735,16 +1738,6 @@ def main(
         logger.error("Run with: sudo bin/ntt-copier.py --medium-hash=<hash> [options]")
         sys.exit(1)
 
-    # Set PostgreSQL user to original user when running under sudo
-    if 'SUDO_USER' in os.environ:
-        os.environ['PGUSER'] = os.environ['SUDO_USER']
-
-    # Get database URL
-    db_url = os.environ.get('NTT_DB_URL', 'postgresql:///copyjob')
-    if os.geteuid() == 0 and 'SUDO_USER' in os.environ:
-        if '://' in db_url and '@' not in db_url:
-            db_url = db_url.replace(':///', f"://{os.environ['SUDO_USER']}@localhost/")
-
     logger.info("NTT Copier starting (batch mode)",
                 medium_hash=medium_hash,
                 limit=limit,
@@ -1758,7 +1751,6 @@ def main(
 
     worker = CopyWorker(
         worker_id=worker_id,
-        db_url=db_url,
         medium_hash=medium_hash,
         limit=limit,
         dry_run=dry_run,

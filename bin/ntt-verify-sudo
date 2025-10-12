@@ -1,8 +1,17 @@
 #!/bin/bash
 # Wrapper for ntt-verify.py that properly preserves environment under sudo
 
-# Load NTT environment
-source ~/.config/ntt/ntt.env
+# Source config from actual user's home (not root's ~)
+if [[ -n "$SUDO_USER" ]]; then
+  USER_HOME=$(eval echo ~$SUDO_USER)
+  CONFIG_FILE="$USER_HOME/.config/ntt/ntt.env"
+else
+  CONFIG_FILE=~/.config/ntt/ntt.env
+fi
+
+if [[ -f "$CONFIG_FILE" ]]; then
+  source "$CONFIG_FILE"
+fi
 
 # Run ntt-verify with environment variables passed explicitly
 sudo \

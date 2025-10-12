@@ -11,6 +11,9 @@
 set -eo pipefail
 PATH="/home/pball/projects/ntt/bin:$PATH"
 
+# NTT bin directory
+NTT_BIN="${NTT_BIN:-/home/pball/projects/ntt/bin}"
+
 # Global variables for cleanup tracking
 CLEANUP_NEEDED=false
 MOUNT_POINT=""
@@ -587,7 +590,7 @@ stage_mount() {
   echo "[$(date -Iseconds)] STAGE: Mount" >&2
 
   # Check if already mounted
-  if /home/pball/projects/ntt/bin/ntt-mount-helper status "$medium_hash" >/dev/null 2>&1; then
+  if "$NTT_BIN/ntt-mount-helper" status "$medium_hash" >/dev/null 2>&1; then
     echo "[$(date -Iseconds)] Already mounted, skipping" >&2
     return 1
   fi
@@ -630,7 +633,7 @@ SQL
   # Use ntt-mount-helper for mounting (captures JSON output)
   echo "[$(date -Iseconds)] Mounting $image_path" >&2
   local mount_output
-  mount_output=$(/home/pball/projects/ntt/bin/ntt-mount-helper mount "$medium_hash" "$image_path" 2>&1)
+  mount_output=$("$NTT_BIN/ntt-mount-helper" mount "$medium_hash" "$image_path" 2>&1)
   local mount_rc=$?
 
   if [[ $mount_rc -eq 0 ]]; then
@@ -804,7 +807,7 @@ stage_load() {
   echo "[$(date -Iseconds)] Running ntt-loader: $raw_file" >&2
   log load_start "{\"medium_hash\": \"$medium_hash\", \"raw\": \"$raw_file\"}"
 
-  if /home/pball/projects/ntt/bin/ntt-loader "$raw_file" "$medium_hash"; then
+  if "$NTT_BIN/ntt-loader" "$raw_file" "$medium_hash"; then
     # Get final inode count after loading
     local inode_count=$(psql_as_user "$DB_URL" -tAc "SELECT COUNT(*) FROM inode WHERE medium_hash = '$medium_hash'" 2>/dev/null || echo "0")
     log load_success "{\"medium_hash\": \"$medium_hash\", \"inode_count\": $inode_count}"
@@ -837,9 +840,50 @@ stage_copy() {
     echo "[$(date -Iseconds)] Batch (<10K files), running inline worker" >&2
     log copy_start "{\"medium_hash\": \"$medium_hash\", \"mode\": \"inline\", \"pending\": $pending_count}"
 
-    if /home/pball/projects/ntt/bin/ntt-copier.py --medium-hash "$medium_hash"; then
+    if "$NTT_BIN/ntt-copier.py" --medium-hash "$medium_hash"; then
       log copy_success "{\"medium_hash\": \"$medium_hash\"}"
-      return 0
+      echo "[$(date -Iseconds)] Copy stage: SUCCESS" >&2
+
+      # Check if all files are copied
+      local final_pending=$(psql_as_user "$DB_URL" -tAc \
+        "SELECT COUNT(*) FROM inode WHERE medium_hash = '$medium_hash' AND copied = false AND claimed_by IS NULL" 2>/dev/null || echo "?")
+
+      if [[ "$final_pending" == "0" ]]; then
+        echo "[$(date -Iseconds)] Copy complete! All $inode_count files copied." >&2
+
+        # Auto-run archiver
+        # echo ""
+        # echo -n "Create archive package? (Y/n): " >&2
+        # read -r arch_response < /dev/tty
+        # arch_response=${arch_response:-Y}
+
+        # if [[ "$arch_response" =~ ^[Yy] ]]; then
+          log archive_start "{\"medium_hash\": \"$medium_hash\"}"
+          echo "[$(date -Iseconds)] Running archiver..." >&2
+
+          if $force; then
+            archiver_cmd="$NTT_BIN/ntt-archiver --force $medium_hash"
+          else
+            archiver_cmd="$NTT_BIN/ntt-archiver $medium_hash"
+          fi
+
+          if $archiver_cmd; then
+            log archive_success "{\"medium_hash\": \"$medium_hash\"}"
+            echo "[$(date -Iseconds)] Archive stage: SUCCESS" >&2
+            return 0
+          else
+            echo "[$(date -Iseconds)] Archive stage: FAILED" >&2
+            log archive_error "{\"medium_hash\": \"$medium_hash\"}"
+            return 2
+          fi
+        # else
+        #   echo "Skipped. Run manually: ntt-archiver $medium_hash" >&2
+        #   return 0
+        # fi
+      else
+        echo "[$(date -Iseconds)] Copy incomplete - $final_pending files remain" >&2
+        return 0
+      fi
     else
       echo "[$(date -Iseconds)] ERROR: Copy worker failed" >&2
       log copy_error "{\"medium_hash\": \"$medium_hash\", \"error\": \"worker_failed\"}"
@@ -847,18 +891,18 @@ stage_copy() {
     fi
 
   else
-    # Large batch: offer interactive parallel workers
+    # Large batch: auto-launch parallel workers
     echo "[$(date -Iseconds)] Large batch ($inode_count files) detected" >&2
-    echo -n "Launch 16 parallel workers? (Y/n): " >&2
-    read -r response < /dev/tty  # Read from terminal (needed under sudo)
-    response=${response:-Y}
+    # echo -n "Launch 16 parallel workers? (Y/n): " >&2
+    # read -r response < /dev/tty  # Read from terminal (needed under sudo)
+    # response=${response:-Y}
 
-    if [[ "$response" =~ ^[Yy] ]]; then
+    # if [[ "$response" =~ ^[Yy] ]]; then
       log copy_start "{\"medium_hash\": \"$medium_hash\", \"mode\": \"parallel_interactive\", \"workers\": 16}"
       echo "[$(date -Iseconds)] Launching 16 workers..." >&2
 
       # Launch with --wait flag to block until complete
-      if /home/pball/projects/ntt/bin/ntt-copy-workers \
+      if "$NTT_BIN/ntt-copy-workers" \
           --medium-hash "$medium_hash" \
           --workers 16 \
           --wait; then
@@ -871,20 +915,20 @@ stage_copy() {
           echo "[$(date -Iseconds)] Copy complete! All $inode_count files copied." >&2
           log copy_success "{\"medium_hash\": \"$medium_hash\"}"
 
-          # Offer archiver
-          echo ""
-          echo -n "Create archive package? (Y/n): " >&2
-          read -r arch_response < /dev/tty
-          arch_response=${arch_response:-Y}
+          # Auto-run archiver
+          # echo ""
+          # echo -n "Create archive package? (Y/n): " >&2
+          # read -r arch_response < /dev/tty
+          # arch_response=${arch_response:-Y}
 
-          if [[ "$arch_response" =~ ^[Yy] ]]; then
+          # if [[ "$arch_response" =~ ^[Yy] ]]; then
             log archive_start "{\"medium_hash\": \"$medium_hash\"}"
             echo "[$(date -Iseconds)] Running archiver..." >&2
 
             if $force; then
-              archiver_cmd="/home/pball/projects/ntt/bin/ntt-archiver --force $medium_hash"
+              archiver_cmd="$NTT_BIN/ntt-archiver --force $medium_hash"
             else
-              archiver_cmd="/home/pball/projects/ntt/bin/ntt-archiver $medium_hash"
+              archiver_cmd="$NTT_BIN/ntt-archiver $medium_hash"
             fi
 
             if $archiver_cmd; then
@@ -896,10 +940,10 @@ stage_copy() {
               log archive_error "{\"medium_hash\": \"$medium_hash\"}"
               return 2
             fi
-          else
-            echo "Skipped. Run manually: ntt-archiver $medium_hash" >&2
-            return 0
-          fi
+          # else
+          #   echo "Skipped. Run manually: ntt-archiver $medium_hash" >&2
+          #   return 0
+          # fi
         else
           echo "[$(date -Iseconds)] ERROR: Copy incomplete - $final_pending files remain" >&2
           log copy_incomplete "{\"medium_hash\": \"$medium_hash\", \"remaining\": $final_pending}"
@@ -910,12 +954,12 @@ stage_copy() {
         log copy_error "{\"medium_hash\": \"$medium_hash\"}"
         return 2
       fi
-    else
-      # User declined
-      echo "Skipped. Run manually: ntt-copy-workers -m $medium_hash -w 16" >&2
-      log copy_defer "{\"medium_hash\": \"$medium_hash\", \"mode\": \"declined\"}"
-      return 1
-    fi
+    # else
+    #   # User declined
+    #   echo "Skipped. Run manually: ntt-copy-workers -m $medium_hash -w 16" >&2
+    #   log copy_defer "{\"medium_hash\": \"$medium_hash\", \"mode\": \"declined\"}"
+    #   return 1
+    # fi
   fi
 }
 
@@ -975,6 +1019,7 @@ handle_device_mode() {
 
   # Identify device with user message
   local identify_result=$(identify_device "$dev" "$user_message")
+  [[ -n "$identify_result" ]] || exit 1  # identify_device already logged error
   local medium_hash="${identify_result%%:*}"
   local temp="${identify_result#*:}"
   local medium_human="${temp%%:*}"
@@ -1077,22 +1122,22 @@ handle_device_mode() {
         local pending_count=$(psql_as_user "$DB_URL" -tAc "SELECT COUNT(*) FROM inode WHERE medium_hash = '$medium_hash' AND copied = false AND claimed_by IS NULL" 2>/dev/null || echo "0")
         if [[ "$pending_count" == "0" ]]; then
           echo "[$(date -Iseconds)] Copy stage: ALREADY COMPLETE" >&2
-          echo "[$(date -Iseconds)] All files already copied, offering archiver..." >&2
+          echo "[$(date -Iseconds)] All files already copied, running archiver..." >&2
 
-          # Offer archiver prompt
-          echo ""
-          echo -n "Create archive package? (Y/n): " >&2
-          read -r arch_response < /dev/tty
-          arch_response=${arch_response:-Y}
+          # Auto-run archiver
+          # echo ""
+          # echo -n "Create archive package? (Y/n): " >&2
+          # read -r arch_response < /dev/tty
+          # arch_response=${arch_response:-Y}
 
-          if [[ "$arch_response" =~ ^[Yy] ]]; then
+          # if [[ "$arch_response" =~ ^[Yy] ]]; then
             log archive_start "{\"medium_hash\": \"$medium_hash\"}"
             echo "[$(date -Iseconds)] Running archiver..." >&2
 
             if $force; then
-              archiver_cmd="/home/pball/projects/ntt/bin/ntt-archiver --force $medium_hash"
+              archiver_cmd="$NTT_BIN/ntt-archiver --force $medium_hash"
             else
-              archiver_cmd="/home/pball/projects/ntt/bin/ntt-archiver $medium_hash"
+              archiver_cmd="$NTT_BIN/ntt-archiver $medium_hash"
             fi
 
             if $archiver_cmd; then
@@ -1102,9 +1147,9 @@ handle_device_mode() {
               echo "[$(date -Iseconds)] Archive stage: FAILED" >&2
               log archive_error "{\"medium_hash\": \"$medium_hash\"}"
             fi
-          else
-            echo "Skipped. Run manually: ntt-archiver $medium_hash" >&2
-          fi
+          # else
+          #   echo "Skipped. Run manually: ntt-archiver $medium_hash" >&2
+          # fi
         else
           echo "[$(date -Iseconds)] Copy stage: DEFERRED (user declined)" >&2
         fi
@@ -1132,6 +1177,7 @@ handle_directory_mode() {
 
   # Identify path
   local identify_result=$(identify_path "$path")
+  [[ -n "$identify_result" ]] || exit 1  # identify_path already logged error
   local medium_hash="${identify_result%%:*}"
   local medium_human="${identify_result#*:}"
 
@@ -1164,6 +1210,7 @@ handle_image_mode() {
 
   # Identify image (content-based hash) with message
   local identify_result=$(identify_image "$image_path" "$user_message")
+  [[ -n "$identify_result" ]] || exit 1  # identify_image already logged error
   local medium_hash="${identify_result%%:*}"
   local temp="${identify_result#*:}"
   local medium_human="${temp%%:*}"
@@ -1257,22 +1304,22 @@ handle_image_mode() {
         local pending_count=$(psql_as_user "$DB_URL" -tAc "SELECT COUNT(*) FROM inode WHERE medium_hash = '$medium_hash' AND copied = false AND claimed_by IS NULL" 2>/dev/null || echo "0")
         if [[ "$pending_count" == "0" ]]; then
           echo "[$(date -Iseconds)] Copy stage: ALREADY COMPLETE" >&2
-          echo "[$(date -Iseconds)] All files already copied, offering archiver..." >&2
+          echo "[$(date -Iseconds)] All files already copied, running archiver..." >&2
 
-          # Offer archiver prompt
-          echo ""
-          echo -n "Create archive package? (Y/n): " >&2
-          read -r arch_response < /dev/tty
-          arch_response=${arch_response:-Y}
+          # Auto-run archiver
+          # echo ""
+          # echo -n "Create archive package? (Y/n): " >&2
+          # read -r arch_response < /dev/tty
+          # arch_response=${arch_response:-Y}
 
-          if [[ "$arch_response" =~ ^[Yy] ]]; then
+          # if [[ "$arch_response" =~ ^[Yy] ]]; then
             log archive_start "{\"medium_hash\": \"$medium_hash\"}"
             echo "[$(date -Iseconds)] Running archiver..." >&2
 
             if $force; then
-              archiver_cmd="/home/pball/projects/ntt/bin/ntt-archiver --force $medium_hash"
+              archiver_cmd="$NTT_BIN/ntt-archiver --force $medium_hash"
             else
-              archiver_cmd="/home/pball/projects/ntt/bin/ntt-archiver $medium_hash"
+              archiver_cmd="$NTT_BIN/ntt-archiver $medium_hash"
             fi
 
             if $archiver_cmd; then
@@ -1282,9 +1329,9 @@ handle_image_mode() {
               echo "[$(date -Iseconds)] Archive stage: FAILED" >&2
               log archive_error "{\"medium_hash\": \"$medium_hash\"}"
             fi
-          else
-            echo "Skipped. Run manually: ntt-archiver $medium_hash" >&2
-          fi
+          # else
+          #   echo "Skipped. Run manually: ntt-archiver $medium_hash" >&2
+          # fi
         else
           echo "[$(date -Iseconds)] Copy stage: DEFERRED (user declined)" >&2
         fi
@@ -1327,7 +1374,7 @@ handle_load_only_mode() {
   log load_only_start "{\"raw_file\": \"$raw_file\", \"medium_hash\": \"$medium_hash\"}"
 
   # Run loader directly (no enum, no copy workers)
-  /home/pball/projects/ntt/bin/ntt-loader "$raw_file" "$medium_hash"
+  "$NTT_BIN/ntt-loader" "$raw_file" "$medium_hash"
 
   log load_only_done "{\"medium_hash\": \"$medium_hash\", \"exit\": 0}"
 }

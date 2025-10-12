@@ -41,19 +41,12 @@ import psycopg
 from psycopg.rows import dict_row
 from loguru import logger
 
-# Database connection
-DB_URL = os.environ.get('NTT_DB_URL', 'postgresql:///copyjob')
+# Import database connection utility
+from ntt_db import get_db_connection
 
 # Storage paths
 BY_HASH_ROOT = Path('/data/cold/by-hash')
 ARCHIVE_ROOT = Path('/data/cold/archived')
-
-# Fix DB URL if running as sudo
-if 'SUDO_USER' in os.environ:
-    # When running with sudo, we need to connect as the sudo user
-    # Change the implicit connection to explicit user@localhost
-    if DB_URL.startswith('postgresql:///'):
-        DB_URL = DB_URL.replace(':///', f"://{os.environ['SUDO_USER']}@localhost/")
 
 
 def process_batch(batch_data, created_dirs, dir_lock, output_blobs, dry_run, verbose):
@@ -273,7 +266,7 @@ def main():
     conn_pool = []
     try:
         for i in range(4):
-            conn_pool.append(psycopg.connect(DB_URL, row_factory=dict_row))
+            conn_pool.append(get_db_connection(row_factory=dict_row))
     except Exception as e:
         logger.error(f"Failed to connect to database: {e}")
         return 1
