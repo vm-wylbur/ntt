@@ -9,7 +9,7 @@ ntt/processing-queue.md
 
 # Media Processing Log
 
-**Last updated:** 2025-10-10 (initialized)
+**Last updated:** 2025-10-11
 
 **IMPORTANT:** This is a log of processing history, NOT a plan.
 
@@ -21,15 +21,30 @@ prox-claude re-evaluates next medium from database on each iteration. External f
 
 | Hash (short) | Phase | Started | Worker | Notes |
 |--------------|-------|---------|--------|-------|
-| (none) | - | - | - | Ready to start Phase 1 |
+| 43fda374 | imaging | 2025-10-11 ~10:00 | ddrescue | Hitachi 750GB (waiting for completion) |
 
 ---
 
-## Completed Today
+## Completed Recently
+
+### 2025-10-11
 
 | Hash (short) | Completed | Duration | Issues Hit | Size | Notes |
 |--------------|-----------|----------|------------|------|-------|
-| (none yet) | - | - | - | - | - |
+| 00404a56 | 2025-10-11 ~11:30 | ~15 min | BUG-008 (Zip mount offset), BUG-009 (partition FK) | 1.4M | Zip disk, both bugs fixed and verified |
+| 5cb0dafa | 2025-10-11 ~12:00 | - | (none) | 112G | 1.67M files, completed earlier in session |
+| bb98aeca | 2025-10-11 ~12:05 | ~5 min | 4 I/O errors (auto-skipped) | 71M | 646 files, DiagnosticService auto-skip working |
+| 536a933b | 2025-10-11 12:32 | ~20 min | BUG-011 (ext4 noload, fixed) | 26G | 292,289 files, 3TB Seagate disk |
+
+### 2025-10-10
+
+| Hash (short) | Completed | Duration | Issues Hit | Size | Notes |
+|--------------|-----------|----------|------------|------|-------|
+| 579d3c3a | 2025-10-10 10:57 | - | (processed earlier) | 56G | Finished incomplete processing (added DB timestamps) |
+| 2b48bdc7 | 2025-10-10 12:17 | ~4 min | BEYOND_EOF (1 file skipped) | 832K | First test run, DiagnosticService auto-skip confirmed working |
+| ff9313ea | 2025-10-10 12:56 | ~35 min | BUG-002 (SQL ambiguity, fixed) | 640K | Fresh run, hit SQL bug during copying, fixed and completed |
+| c8714b2c | 2025-10-10 13:04 | ~2 min | (none) | 49M | Fresh run, clean completion (1358 files) |
+| 92f92600 | 2025-10-10 13:08 | ~2 min | (none) | 1.8G | Fresh run, sparse filesystem (2 large files) |
 
 ---
 
@@ -45,7 +60,7 @@ prox-claude re-evaluates next medium from database on each iteration. External f
 
 | Hash (short) | Reason | Problem Type | Archived | Notes |
 |--------------|--------|--------------|----------|-------|
-| (none) | - | - | - | - |
+| 031a3ceb | No recoverable filesystems | MOUNT_FAILED | 2025-10-11 | Maxtor 373GB RAID, mount attempts failed on all partitions |
 
 ---
 

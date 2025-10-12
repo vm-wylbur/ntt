@@ -197,7 +197,7 @@ def _run_backfill(batch_size: int, limit: int, dry_run: bool, by_hash_root: str,
 
     # Connect to database
     try:
-        conn = psycopg.connect(db_url, row_factory=dict_row)
+        conn = psycopg.connect(db_url, row_factory=dict_row, autocommit=True)
     except Exception as e:
         typer.echo(f"Error connecting to database: {e}", err=True)
         log_event("db_connection_error", error=str(e))

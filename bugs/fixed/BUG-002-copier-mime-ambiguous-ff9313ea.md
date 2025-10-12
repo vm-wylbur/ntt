@@ -154,3 +154,47 @@ This explicitly qualifies the fallback column with the table name, removing the 
 
 **Commit:** (pending - waiting for test verification)
 
+---
+
+## Severity Assessment (metrics-claude)
+
+**Analysis date:** 2025-10-10 13:05
+
+**Media affected:** 1 confirmed (ff9313ea)
+
+**Pattern frequency:**
+- Only occurrence in bug tracking system
+- No similar SQL ambiguity errors in other bug reports
+- First test run after code change that introduced the bug
+
+**Workaround availability:** None (required code fix)
+
+**Impact scope:**
+- Blocked copier database updates completely
+- Would affect 100% of media processed while bug existed
+- However, caught immediately on first test run and fixed within 12 minutes
+- Only 1 medium actually affected before fix deployed
+
+**Severity: HIGH**
+
+**Rationale:**
+- No workaround available (required code modification)
+- Completely blocked database transaction completion
+- Would have affected all subsequent media if not caught immediately
+- Database inconsistency risk (files in by-hash but not marked copied)
+- Not marked as **BLOCKER** because:
+  - Only 1 medium actually impacted
+  - Fixed within 12 minutes of discovery
+  - Did not block multiple media simultaneously
+  - Does not prevent future processing (fix deployed)
+
+**Resolution:**
+- Fixed in `ntt-copier.py:855` by qualifying column name
+- Verified by successful completion of ff9313ea after fix
+- No recurrence expected (SQL is now unambiguous)
+
+**Recommendations:**
+- Consider SQL linting in development workflow
+- Add test coverage for batch UPDATE queries
+- Pattern suggests recent code changes should be tested on small media first
+

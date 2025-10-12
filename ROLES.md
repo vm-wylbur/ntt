@@ -77,13 +77,51 @@ ORDER BY medium_human;
 
 #### 2. Pipeline Execution
 
-Run all phases from `media-processing-plan-2025-10-10.md`:
+**CRITICAL: Use tested scripts, never improvise custom commands**
 
-1. **Pre-flight checks** - Verify ddrescue done, IMG exists, DB ready
-2. **Enumeration** - `sudo bin/ntt-enum /mnt/ntt/$HASH $HASH /tmp/${HASH_SHORT}.raw`
-3. **Loading** - `sudo bin/ntt-loader /tmp/${HASH_SHORT}.raw $HASH`
-4. **Copying** - `sudo -E bin/ntt-copier.py --medium-hash $HASH ...`
-5. **Archiving** - `sudo tar -I 'zstd -T0' -cvf ...`
+**Option A - Orchestrator (Recommended):**
+```bash
+sudo bin/ntt-orchestrator --image /data/fast/img/<hash>.img
+```
+Orchestrator runs full pipeline: mount → enum → load → copy → archive → unmount
+
+**Option B - Individual Scripts (Manual Control):**
+```bash
+# 1. Mount
+sudo bin/ntt-mount-helper mount <hash> /data/fast/img/<hash>.img
+
+# 2. Enumerate
+sudo bin/ntt-enum /mnt/ntt/<hash> <hash> /data/fast/raw/<hash>.raw
+
+# 3. Load
+sudo bin/ntt-loader /data/fast/raw/<hash>.raw <hash>
+
+# 4. Copy
+sudo bin/ntt-copier.py --medium-hash <hash>
+# OR for large batches (≥10K files):
+sudo bin/ntt-copy-workers --medium-hash <hash> --workers 16 --wait
+
+# 5. Archive (includes safety checks + cleanup)
+sudo bin/ntt-archiver <hash>
+
+# 6. Unmount
+sudo bin/ntt-mount-helper unmount <hash>
+```
+
+**PROHIBITED - Never Do These:**
+- ❌ **Manual tar/zstd commands** (use `ntt-archiver` - has safety checks)
+- ❌ **Ad-hoc SQL for archiving** (use scripts - they update properly)
+- ❌ **Custom pipelines** (improvising bypasses logging, safety checks, error handling)
+- ❌ **Skipping tools** (every script has purpose: safety, logging, verification)
+
+**Why scripts matter:**
+- `ntt-archiver` verifies copy completion before archiving
+- `ntt-archiver` logs to archiver.jsonl for audit trail
+- `ntt-archiver` verifies archive integrity
+- `ntt-archiver` handles cleanup safely
+- Scripts have error handling, timeouts, rollback logic
+
+**Trust issue:** If prox-claude improvises instead of using tested scripts, automation cannot be trusted.
 
 **For each phase:**
 - Monitor output for expected behavior

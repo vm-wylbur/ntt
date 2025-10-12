@@ -130,7 +130,7 @@ For archival purposes (readonly access only), this is acceptable.
 
 **Fixed by:** prox-claude
 **Date:** 2025-10-11 12:12
-**Commit:** (pending)
+**Commit:** ce8c3f5
 
 ### Implementation
 
