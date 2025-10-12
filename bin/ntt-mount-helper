@@ -212,7 +212,7 @@ do_mount() {
   done < <(ls "${loop_device}"p* 2>/dev/null || true)
 
   if [[ "$has_partitions" == "true" ]]; then
-    # Multi-partition disk - mount each partition to subdirectory
+    # Multi-partition disk detected - but may only have one mountable partition
     echo "Multi-partition disk detected" >&2
 
     # First, scan for and assemble ALL RAID arrays on this disk
@@ -239,6 +239,50 @@ do_mount() {
       done
     fi
 
+    # Count mountable partitions to decide mount structure
+    # Single mountable partition → mount at base path (no /p1 subdirectory)
+    # Multiple mountable partitions → mount at /p1, /p2 subdirectories
+    local mountable_count=0
+
+    # Count regular partitions (skip extended containers, RAID members)
+    for part_dev in "${partition_devices[@]}"; do
+      local part_type
+      part_type=$(blkid -o value -s TYPE "$part_dev" 2>/dev/null || echo "")
+
+      # Skip extended partition containers (no TYPE)
+      [[ -z "$part_type" ]] && continue
+
+      # Skip RAID members (will be counted via md devices)
+      [[ "$part_type" == "linux_raid_member" ]] && continue
+
+      ((mountable_count++))
+    done
+
+    # Count assembled RAID arrays
+    if command -v mdadm >/dev/null 2>&1; then
+      for md_dev in /dev/md[0-9]* /dev/md/*; do
+        # Check if device exists (block device or symlink to block device)
+        [[ -b "$md_dev" ]] || [[ -L "$md_dev" && -b "$(readlink -f "$md_dev")" ]] || continue
+
+        # Check if it has a filesystem
+        local md_fs_type
+        md_fs_type=$(blkid -o value -s TYPE "$md_dev" 2>/dev/null || echo "")
+        [[ -n "$md_fs_type" ]] && ((mountable_count++))
+      done
+    fi
+
+    echo "  Found $mountable_count mountable partition(s)" >&2
+
+    # Decide mount structure based on mountable partition count
+    local use_base_path=false
+    if [[ $mountable_count -eq 1 ]]; then
+      echo "  Single mountable partition - will mount at base path" >&2
+      use_base_path=true
+    else
+      echo "  Multiple mountable partitions - will use /p{N} subdirectories" >&2
+      use_base_path=false
+    fi
+
     local partition_count=0
     local mounted_partitions=()
 
@@ -262,7 +306,14 @@ do_mount() {
       fi
 
       # Create partition mount point
-      local part_mount="$mount_point/p$part_num"
+      local part_mount
+      if [[ "$use_base_path" == "true" ]]; then
+        # Single mountable partition - use base path
+        part_mount="$mount_point"
+      else
+        # Multiple partitions - use /p{N} subdirectory
+        part_mount="$mount_point/p$part_num"
+      fi
       mkdir -p "$part_mount"
 
       # Get appropriate mount options for this filesystem type
@@ -322,7 +373,14 @@ do_mount() {
         local md_part_num=$((partition_count + 1))
 
         # Create mount point
-        local md_mount="$mount_point/p$md_part_num"
+        local md_mount
+        if [[ "$use_base_path" == "true" ]]; then
+          # Single mountable partition - use base path
+          md_mount="$mount_point"
+        else
+          # Multiple partitions - use /p{N} subdirectory
+          md_mount="$mount_point/p$md_part_num"
+        fi
         mkdir -p "$md_mount"
 
         # Get appropriate mount options for this filesystem type
@@ -351,7 +409,14 @@ do_mount() {
     fi
 
     # Output JSON for orchestrator
-    echo '{"layout":"multi","partitions":['
+    local layout_type
+    if [[ "$use_base_path" == "true" ]]; then
+      layout_type="single"
+    else
+      layout_type="multi"
+    fi
+
+    echo "{\"layout\":\"$layout_type\",\"partitions\":["
     local first=true
     for part_info in "${mounted_partitions[@]}"; do
       IFS=':' read -r num dev mnt fstype status <<< "$part_info"
