@@ -226,6 +226,17 @@ do_mount() {
       # Try non-degraded first, then force start with --run (for single-device RAID1)
       mdadm --assemble --scan --no-degraded 2>/dev/null || true
       mdadm --assemble --scan --run 2>/dev/null || true
+
+      # Activate any inactive arrays (auto-assembled but not started)
+      # This handles single-device RAID1 members that assemble as "inactive"
+      for md_dev in /dev/md[0-9]* /dev/md/*; do
+        [[ -b "$md_dev" ]] || [[ -L "$md_dev" && -b "$(readlink -f "$md_dev")" ]] || continue
+        # Check if array is inactive in /proc/mdstat
+        if grep -q "$(basename "$md_dev").*inactive" /proc/mdstat 2>/dev/null; then
+          echo "  Activating inactive array: $md_dev" >&2
+          mdadm --run "$md_dev" 2>/dev/null || echo "  Warning: Could not activate $md_dev" >&2
+        fi
+      done
     fi
 
     local partition_count=0
