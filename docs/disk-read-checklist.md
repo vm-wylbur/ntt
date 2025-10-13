@@ -127,6 +127,77 @@ sudo cat /tmp/${HASH_SHORT}.raw | tr '\034' '\n' | sort | uniq -d
 - Hardlinks (same inode, multiple paths) - **expected and OK**
 - Filesystem corruption showing same path multiple times - **problematic**
 
+### 4.1 HFS+ Catalog Corruption and Repair
+
+**CRITICAL**: HFS+ catalog corruption can cause massive data loss if not repaired. Always run fsck.hfsplus on HFS+ disks showing enumeration problems.
+
+**Symptoms of catalog corruption:**
+- Extremely slow enumeration (< 200 files/s vs expected 10k+ files/s)
+- Constant stalls (0.00 /s for extended periods)
+- Unexpectedly low file counts compared to disk capacity
+- Directory read errors or I/O errors during enumeration
+- Frequent timeouts during `find` operations
+
+**Repair procedure:**
+
+```bash
+# 1. Unmount the filesystem if mounted
+sudo umount /mnt/ntt/${HASH}
+
+# 2. Run fsck.hfsplus with -r (rebuild catalog from alternate copy)
+sudo fsck.hfsplus -r /data/fast/img/${HASH}.img
+
+# Expected output for successful repair:
+# ** Checking Catalog B-tree.
+# ** Rebuilding Catalog B-tree.
+# ** The volume <name> was repaired successfully.
+
+# 3. Re-mount and re-enumerate
+sudo bin/ntt-mount-helper mount ${HASH} /data/fast/img/${HASH}.img
+sudo bin/ntt-enum /mnt/ntt/${HASH} ${HASH} /data/fast/raw/${HASH}.raw
+```
+
+**Evidence from 8e61cad2 case study:**
+
+| Metric | Before fsck | After fsck | Improvement |
+|--------|-------------|------------|-------------|
+| Enum speed | 191 files/s | ~11k files/s | **57x faster** |
+| Total time | 6+ hours (incomplete) | 37 minutes | **10x faster** |
+| Files recovered | ~7M estimated | 20M+ actual | **3x more data** |
+| Behavior | Constant stalls | Normal with occasional stalls | Stable |
+
+**What fsck.hfsplus -r does:**
+- Rebuilds the catalog B-tree from the alternate copy stored on disk
+- Recovers catalog structure without needing readable data blocks
+- Fixes catalog inode (inode 4) corruption from bad sectors
+- Enables access to files even when original catalog is damaged
+
+**IMPORTANT**: Without fsck repair, you may lose access to 60-70% of the disk's data, even if the data blocks themselves are readable. The catalog corruption masks the existence of files.
+
+**When to run fsck:**
+1. Any HFS+ disk with enumeration speed < 1000 files/s
+2. Any HFS+ disk with extended stalls during enumeration
+3. Any HFS+ disk where file count seems suspiciously low
+4. Any HFS+ disk with "catalog file" errors in dmesg
+
+**Filesystem support:**
+- `fsck.hfsplus` - HFS+ repair (macOS-formatted disks)
+- `fsck.vfat` or `dosfsck` - FAT12/16/32 repair (Windows/DOS disks)
+- `e2fsck` - ext2/ext3/ext4 repair (Linux disks)
+- `xfs_repair` - XFS repair (Linux disks)
+- `btrfs check --repair` - Btrfs repair (Linux disks)
+
+**Record in database:**
+```sql
+UPDATE medium
+SET problems = problems || jsonb_build_object(
+  'catalog_corruption_repaired', true,
+  'fsck_output', 'Rebuilding Catalog B-tree... repaired successfully',
+  'recovery_improvement', '3x file count after repair'
+)
+WHERE medium_hash = '${HASH}';
+```
+
 ---
 
 ## 5. Copy Phase Error Patterns
