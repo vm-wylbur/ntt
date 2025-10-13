@@ -197,7 +197,7 @@ sudo -u "${SUDO_USER:-$USER}" psql "$DB_URL" -c "
 SET work_mem = '256MB';
 SET maintenance_work_mem = '1GB';
 SET synchronous_commit = OFF;
-SET statement_timeout = '5min';  -- Prevent indefinite hangs
+SET statement_timeout = '15min';  -- Prevent indefinite hangs
 
 -- medium row (if new) - use known medium_hash instead of scanning table
 INSERT INTO medium (medium_hash, added_at)
