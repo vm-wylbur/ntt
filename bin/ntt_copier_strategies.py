@@ -93,6 +93,9 @@ def parse_partition_path(path: str | bytes, medium_hash: str) -> Path:
     else:
         # Relative path - construct with mount base
         sanitized_path = path_str.replace('\\r', '\r').replace('\\n', '\n')
+        # Strip medium_hash prefix if present (carved files case)
+        if sanitized_path.startswith(f"{medium_hash}/"):
+            sanitized_path = sanitized_path[len(medium_hash)+1:]
         source_path = Path(expected_mount_prefix) / sanitized_path.lstrip('/')
 
     return source_path

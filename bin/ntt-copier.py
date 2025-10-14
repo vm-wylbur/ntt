@@ -253,6 +253,13 @@ class CopyWorker:
         # This avoids breaking FOR UPDATE SKIP LOCKED by committing mid-batch
         self._pending_diagnostic_events = []  # List of (medium_hash, ino, findings, action)
 
+        # Cache medium health for adaptive retry thresholds
+        self.medium_health = self.get_medium_health(self.medium_hash)
+        if self.medium_health is None:
+            logger.warning(f"Medium {self.medium_hash} has health=NULL (degraded), using reduced retry thresholds")
+        elif self.medium_health != 'ok':
+            logger.warning(f"Medium {self.medium_health[:8]} has health={self.medium_health}")
+
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals gracefully."""
         logger.info(f"Received signal {signum}, shutting down...")
@@ -360,6 +367,13 @@ class CopyWorker:
                 # Target is mounted
                 self._mounted_media.add(medium_hash)
                 logger.info(f"Medium {medium_hash} symlink target already mounted at {real_path}")
+                return mount_point
+
+            # Check if symlink target is an accessible directory (carved files case)
+            if Path(real_path).is_dir() and os.access(real_path, os.R_OK):
+                # Symlink points to accessible directory, no mounting needed
+                self._mounted_media.add(medium_hash)
+                logger.info(f"Medium {medium_hash} symlink points to accessible directory at {real_path} (no mount needed)")
                 return mount_point
 
         # Not mounted - need to mount it
@@ -683,7 +697,11 @@ class CopyWorker:
 
                     if not paths:
                         logger.warning(f"No paths found for inode {key}, skipping")
-                        results_by_inode[key] = None
+                        # BUG-018 FIX: Always populate result with error dict (not None)
+                        results_by_inode[key] = {
+                            'error_type': 'NoPathsError',
+                            'error_msg': 'No paths found for inode'
+                        }
                         continue
 
                     # Create work_unit in old format for process_work_unit
@@ -735,8 +753,9 @@ class CopyWorker:
                             inode_row['ino']
                         )
 
-                        # At checkpoint (retry #10), run full diagnostic analysis
-                        if retry_count == 10:
+                        # Adaptive diagnostic checkpoint: #5 for degraded media, #10 for healthy
+                        checkpoint_retry = 5 if self.medium_health is None else 10
+                        if retry_count == checkpoint_retry:
                             findings = self.diagnostics.diagnose_at_checkpoint(
                                 inode_row['medium_hash'],
                                 inode_row['ino'],
@@ -780,11 +799,15 @@ class CopyWorker:
 
                         # Log when max retries approached (safety net)
                         # This is Layer 2 - catches ANY error type that escapes Layer 1 (diagnostic auto-skip)
-                        if retry_count >= 50:
+                        # Adaptive threshold: 5 retries for degraded media, 50 for healthy
+                        max_retry_threshold = 5 if self.medium_health is None else 50
+                        if retry_count >= max_retry_threshold:
+                            health_desc = 'degraded' if self.medium_health is None else 'healthy'
                             logger.error(
                                 f"⚠️  MAX RETRIES REACHED "
                                 f"ino={inode_row['ino']} "
                                 f"retry={retry_count} "
+                                f"health={health_desc} threshold={max_retry_threshold} "
                                 f"(marking as failed with classification)"
                             )
 
@@ -817,10 +840,12 @@ class CopyWorker:
 
                             continue  # Skip to next inode - DON'T release claim for retry
 
-                        results_by_inode[key] = {
-                            'error_type': error_type,
-                            'error_msg': error_msg
-                        }
+                        # BUG-018 FIX: Ensure result is always populated for transient errors
+                        if key not in results_by_inode:
+                            results_by_inode[key] = {
+                                'error_type': error_type,
+                                'error_msg': error_msg
+                            }
                         action_counts['error'] = action_counts.get('error', 0) + 1
 
                 t_process_end = time.time()
@@ -843,6 +868,18 @@ class CopyWorker:
                 for inode_row in claimed_inodes:
                     key = (inode_row['medium_hash'], inode_row['ino'])
                     result = results_by_inode.get(key)
+
+                    # BUG-018 FIX: Safety net for None results (shouldn't happen with fix above)
+                    if result is None:
+                        logger.error(f"CRITICAL: No result for claimed inode {key}, treating as transient error")
+                        failed_inodes.append({
+                            'id': inode_row['id'],
+                            'ino': inode_row['ino'],
+                            'medium_hash': inode_row['medium_hash'],
+                            'error_type': 'MissingResultError',
+                            'error_msg': 'Inode processed but no result recorded (possible exception)'
+                        })
+                        continue
 
                     if isinstance(result, dict) and 'failure_status' in result:
                         # Max retries reached - mark with status (BUG-007 fix)
