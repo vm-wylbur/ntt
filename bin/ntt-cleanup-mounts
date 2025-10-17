@@ -60,6 +60,46 @@ mount_older_than() {
   [[ $age_hours -ge $hours ]]
 }
 
+# Cleanup orphaned loop devices (pointing to deleted files)
+cleanup_orphaned_loop_devices() {
+  echo "[$(date -Iseconds)] Checking for orphaned loop devices..."
+
+  # Find loop devices pointing to deleted files
+  local orphaned
+  orphaned=$(losetup -l 2>/dev/null | grep '(deleted)' | awk '{print $1}' || echo "")
+
+  if [[ -z "$orphaned" ]]; then
+    echo "[$(date -Iseconds)] No orphaned loop devices found"
+    return 0
+  fi
+
+  local count=$(echo "$orphaned" | wc -l)
+  echo "[$(date -Iseconds)] Found $count orphaned loop device(s)"
+
+  local detached=0
+  local failed=0
+
+  while IFS= read -r loop_dev; do
+    [[ -z "$loop_dev" ]] && continue
+
+    # Verify not mounted before detaching
+    if mount 2>/dev/null | grep -q "^$loop_dev"; then
+      echo "[$(date -Iseconds)] Skipping $loop_dev (still mounted)" >&2
+      ((failed++))
+    else
+      echo "[$(date -Iseconds)] Detaching orphaned $loop_dev"
+      if losetup -d "$loop_dev" 2>/dev/null; then
+        ((detached++))
+      else
+        echo "[$(date -Iseconds)] Warning: Could not detach $loop_dev" >&2
+        ((failed++))
+      fi
+    fi
+  done <<< "$orphaned"
+
+  echo "[$(date -Iseconds)] Orphaned loop cleanup: detached=$detached, failed=$failed"
+}
+
 # Main cleanup loop
 cleanup_mounts() {
   if [[ ! -d "$MOUNT_ROOT" ]]; then
@@ -114,3 +154,6 @@ cleanup_mounts() {
 
 # Run cleanup
 cleanup_mounts
+
+# Cleanup orphaned loop devices after mount cleanup
+cleanup_orphaned_loop_devices

@@ -115,12 +115,21 @@ stop_raid_arrays() {
 
 # Get mount options for filesystem type
 # ext4 needs 'noload' to skip journal recovery on readonly mounts
+# ext3 needs 'norecovery' instead of 'noload' when journal is dirty
 get_mount_options() {
   local fs_type="$1"
   local base_opts="ro,noatime,nodev,nosuid"
 
-  if [[ "$fs_type" == "ext4" || "$fs_type" == "ext3" || "$fs_type" == "ext2" ]]; then
+  if [[ "$fs_type" == "ext4" ]]; then
+    # ext4: noload works reliably for read-only mounts
     echo "${base_opts},noload"
+  elif [[ "$fs_type" == "ext3" ]]; then
+    # ext3: use norecovery to handle dirty journals
+    # norecovery allows read-only mount even with unclean shutdown
+    echo "${base_opts},norecovery"
+  elif [[ "$fs_type" == "ext2" ]]; then
+    # ext2: no journal, no special options needed
+    echo "$base_opts"
   else
     echo "$base_opts"
   fi
@@ -215,20 +224,60 @@ do_mount() {
     # Multi-partition disk detected - but may only have one mountable partition
     echo "Multi-partition disk detected" >&2
 
-    # First, scan for and assemble ALL RAID arrays on this disk
-    # This handles RAID partitions that don't show TYPE="linux_raid_member" in blkid
-    if command -v mdadm >/dev/null 2>&1; then
+    # Check for APM hybrid ISO/HFS+ discs (Mac optical media)
+    # These have Apple Partition Map with unmountable APM metadata in p1,
+    # but whole-disk has ISO9660 filesystem overlay
+    local pttype
+    pttype=$(blkid -o value -s PTTYPE "$loop_device" 2>/dev/null || echo "")
+    local whole_disk_fs
+    whole_disk_fs=$(blkid -o value -s TYPE "$loop_device" 2>/dev/null || echo "")
+
+    if [[ "$pttype" == "mac" ]] && [[ "$whole_disk_fs" =~ ^(iso9660|udf)$ ]]; then
+      echo "  APM hybrid $whole_disk_fs disc detected - mounting whole disk" >&2
+      local mount_opts
+      mount_opts=$(get_mount_options "$whole_disk_fs")
+
+      if mount -t "$whole_disk_fs" -o "$mount_opts" "$loop_device" "$mount_point" 2>/dev/null; then
+        echo "Mounted $loop_device at $mount_point (APM hybrid, fs_type: $whole_disk_fs)" >&2
+        echo '{"layout":"single","device":"'"$loop_device"'","mount":"'"$mount_point"'","fstype":"'"$whole_disk_fs"'","hybrid":"apm"}'
+        exit 0
+      else
+        echo "  Warning: Whole-disk $whole_disk_fs mount failed, trying partitions..." >&2
+      fi
+    fi
+
+    # Check if any partitions are RAID members before running mdadm
+    local has_raid=false
+    for part_dev in "${partition_devices[@]}"; do
+      local part_type
+      part_type=$(blkid -o value -s TYPE "$part_dev" 2>/dev/null || echo "")
+      if [[ "$part_type" == "linux_raid_member" ]]; then
+        has_raid=true
+        break
+      fi
+    done
+
+    # Only run mdadm if we found RAID members on this specific disk
+    if [[ "$has_raid" == "true" ]] && command -v mdadm >/dev/null 2>&1; then
       # Load RAID1 kernel module if not already loaded
       modprobe raid1 2>/dev/null || true
 
-      # Scan and assemble all RAID arrays found on these partitions
-      echo "Scanning for RAID arrays..." >&2
-      # Try non-degraded first, then force start with --run (for single-device RAID1)
-      mdadm --assemble --scan --no-degraded 2>/dev/null || true
-      mdadm --assemble --scan --run 2>/dev/null || true
+      echo "RAID members detected, assembling arrays..." >&2
 
-      # Activate any inactive arrays (auto-assembled but not started)
-      # This handles single-device RAID1 members that assemble as "inactive"
+      # Assemble arrays from specific partition devices only (not system-wide scan)
+      for part_dev in "${partition_devices[@]}"; do
+        local part_type
+        part_type=$(blkid -o value -s TYPE "$part_dev" 2>/dev/null || echo "")
+
+        # Only try to assemble RAID members
+        if [[ "$part_type" == "linux_raid_member" ]]; then
+          echo "  Checking $part_dev for RAID metadata..." >&2
+          # Try to assemble this specific device (--run allows degraded/single-device RAID1)
+          mdadm --assemble --run "$part_dev" 2>/dev/null || true
+        fi
+      done
+
+      # Activate any inactive arrays that were assembled
       for md_dev in /dev/md[0-9]* /dev/md/*; do
         [[ -b "$md_dev" ]] || [[ -L "$md_dev" && -b "$(readlink -f "$md_dev")" ]] || continue
         # Check if array is inactive in /proc/mdstat
@@ -596,12 +645,40 @@ do_unmount() {
   # Stop any RAID arrays that were mounted under this mount point
   stop_raid_arrays "$mount_point"
 
-  # Detach loop device if found
+  # Detach ALL loop devices for this medium (not just the mounted one)
+  # This handles orphaned devices from failed mount attempts
   if [[ -n "$loop_device" ]] && [[ "$loop_device" =~ ^/dev/loop ]]; then
-    if losetup -d "$loop_device" 2>/dev/null; then
-      echo "Detached loop device $loop_device"
+    # Get the base loop device name
+    local base_loop_device="${loop_device%p*}"
+
+    # Find the image file path from the loop device
+    local image_path
+    image_path=$(losetup -l | grep "^$base_loop_device" | awk '{for(i=6;i<=NF;i++) printf "%s ", $i; print ""}' | sed 's/ *$//' | sed 's/ (deleted)$//')
+
+    if [[ -n "$image_path" ]]; then
+      # Find ALL loop devices pointing to this image file
+      local all_loop_devices
+      all_loop_devices=$(losetup -l | grep -F "$image_path" | awk '{print $1}')
+
+      if [[ -n "$all_loop_devices" ]]; then
+        local device_count=$(echo "$all_loop_devices" | wc -l)
+        echo "Found $device_count loop device(s) for this image, detaching all..." >&2
+
+        while IFS= read -r loop_dev; do
+          if losetup -d "$loop_dev" 2>/dev/null; then
+            echo "  Detached $loop_dev" >&2
+          else
+            echo "  Warning: Could not detach $loop_dev" >&2
+          fi
+        done <<< "$all_loop_devices"
+      fi
     else
-      echo "Warning: Failed to detach $loop_device" >&2
+      # Fallback: just detach the one we found
+      if losetup -d "$base_loop_device" 2>/dev/null; then
+        echo "Detached loop device $base_loop_device"
+      else
+        echo "Warning: Failed to detach $base_loop_device" >&2
+      fi
     fi
   fi
 

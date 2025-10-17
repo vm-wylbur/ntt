@@ -302,3 +302,32 @@ Investigation revealed this is a widespread issue affecting all processed media.
 Recommendation: Implement both Solution 1 and Solution 2 for defense-in-depth. Solution 1 handles normal workflow, Solution 2 catches edge cases.
 
 Priority: Medium - not blocking processing but should be fixed to prevent resource exhaustion on long-running systems.
+
+---
+
+**Implementation by:** dev-claude
+**Date:** 2025-10-17 17:00
+
+**Changes made:**
+
+**Solution 1: Enhanced do_unmount() in ntt-mount-helper (lines 617-652)**
+- Find ALL loop devices pointing to the same image file (not just the mounted one)
+- Extract image path from loop device using `losetup -l`
+- Search for all loop devices with matching image path
+- Detach all found devices, logging each one
+- Handles both normal files and "(deleted)" files
+- Fallback to single-device detach if image path can't be determined
+
+**Solution 2: Added cleanup_orphaned_loop_devices() to ntt-cleanup-mounts (lines 63-101)**
+- Scans for loop devices pointing to "(deleted)" files
+- Verifies device is not mounted before detaching
+- Logs detached count and failed count
+- Called automatically after mount cleanup (line 159)
+- Runs periodically via cron for defense-in-depth
+
+**Defense-in-depth benefits:**
+- Solution 1: Prevents orphans during normal unmount operations
+- Solution 2: Catches orphans from crashes, manual interventions, or edge cases
+- Together they ensure loop devices don't accumulate over time
+
+**Ready for testing:** 2025-10-17 17:00
