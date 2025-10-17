@@ -1,0 +1,413 @@
+#!/usr/bin/env -S /home/pball/.local/bin/uv run --script
+# /// script
+# requires-python = ">=3.13"
+# dependencies = [
+#     "psycopg>=3.2.3",
+#     "loguru",
+# ]
+# ///
+# Author: PB and Claude
+# Date: 2025-10-13
+# License: (c) HRDAG, 2025, GPL-2 or newer
+#
+# ------
+# ntt/bin/ntt-backup
+#
+# Unified backup tool: pg_dump + deduplicated blob backup to external drive
+
+import argparse
+import psycopg
+import subprocess
+import sys
+import os
+import time
+import signal
+from pathlib import Path
+from datetime import datetime
+from loguru import logger
+
+# Use /tmp for lockfile (user-writable, survives reboots)
+LOCKFILE = Path("/tmp/ntt-backup.lock")
+
+class BackupLockError(Exception):
+    """Raised when backup is already running"""
+    pass
+
+def acquire_lock():
+    """Acquire exclusive lock, exit if already running"""
+    if LOCKFILE.exists():
+        # Check if process is actually running
+        try:
+            with LOCKFILE.open('r') as f:
+                pid = int(f.read().strip())
+            # Check if PID exists
+            os.kill(pid, 0)  # Doesn't kill, just checks existence
+            raise BackupLockError(f"ntt-backup already running (PID {pid})")
+        except (ProcessLookupError, ValueError):
+            # Stale lockfile, remove it
+            logger.warning("Removing stale lockfile", old_pid=LOCKFILE.read_text().strip())
+            LOCKFILE.unlink()
+
+    # Write our PID
+    with LOCKFILE.open('w') as f:
+        f.write(str(os.getpid()))
+    logger.info("Lock acquired", pid=os.getpid())
+
+def release_lock():
+    """Remove lockfile"""
+    LOCKFILE.unlink(missing_ok=True)
+    logger.info("Lock released")
+
+def validate_backup_mount(backup_root):
+    """Ensure backup drive is mounted and structure exists"""
+    root = Path(backup_root)
+
+    # Check if mount point exists
+    try:
+        if not root.exists():
+            raise RuntimeError(f"Backup root does not exist: {backup_root}")
+    except OSError as e:
+        raise RuntimeError(f"Cannot access backup root (I/O error, drive may be unmounted or failed): {backup_root} - {e}")
+
+    # Warn if not a mount point
+    if not root.is_mount():
+        logger.warning("Backup root may not be mounted (not a mount point)", path=str(root))
+
+    # Check required directories exist
+    by_hash = root / 'by-hash'
+    pgdump_dir = root / 'pgdump'
+
+    try:
+        if not by_hash.exists():
+            raise RuntimeError(f"Missing by-hash directory: {by_hash}")
+        if not pgdump_dir.exists():
+            raise RuntimeError(f"Missing pgdump directory: {pgdump_dir}")
+    except OSError as e:
+        raise RuntimeError(f"Cannot access backup directories (I/O error, drive may be in error state): {e}\n"
+                         f"Check mount status: mount | grep {backup_root}")
+
+    # Check it's writable
+    test_file = root / '.ntt-backup-test'
+    try:
+        test_file.touch()
+        test_file.unlink()
+    except Exception as e:
+        raise RuntimeError(f"Backup drive not writable: {e}")
+
+    logger.info("Backup drive validated", path=str(root))
+    return root
+
+class BackupWorker:
+    def __init__(self, batch_size=1000, backup_root='/mnt/ntt-backup',
+                 skip_pgdump=False, db_url=None):
+        self.batch_size = batch_size
+        self.backup_root = Path(backup_root)
+        self.skip_pgdump = skip_pgdump
+        self.db_url = db_url or os.environ.get('NTT_DB_URL', 'postgres:///copyjob')
+
+        # Fixed paths
+        self.source_root = Path('/data/cold/by-hash')
+        self.dest_root = self.backup_root / 'by-hash'
+
+        self.conn = None
+        self.stats = {
+            'files_copied': 0,
+            'bytes_copied': 0,
+            'start_time': time.time(),
+            'last_progress_time': time.time()
+        }
+
+    def connect_db(self):
+        """Connect to database"""
+        self.conn = psycopg.connect(self.db_url)
+        logger.info("Database connected", db_url=self.db_url)
+
+    def run_pgdump(self):
+        """Run pg_dump to backup database"""
+        timestamp = datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
+        dump_file = self.backup_root / 'pgdump' / f'copyjob-{timestamp}.pgdump'
+
+        logger.info("Starting database dump", dest=str(dump_file))
+
+        result = subprocess.run([
+            'pg_dump',
+            '-d', self.db_url,
+            '-F', 'c',  # Custom format
+            '-f', str(dump_file)
+        ], capture_output=True, text=True)
+
+        if result.returncode != 0:
+            raise RuntimeError(f"pg_dump failed: {result.stderr}")
+
+        # Get dump size
+        size_mb = dump_file.stat().st_size / 1024 / 1024
+        logger.bind(event="pgdump_complete").info(
+            "Database dump complete",
+            file=str(dump_file),
+            size_mb=round(size_mb, 1)
+        )
+
+        return dump_file
+
+    def get_pending_batch(self):
+        """Query DB for next batch of pending blobids"""
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                SELECT blobid FROM blobs
+                WHERE (external_copied IS FALSE OR external_copied IS NULL)
+                  AND (external_copy_failed IS FALSE OR external_copy_failed IS NULL)
+                LIMIT %s
+            """, (self.batch_size,))
+            return [row[0] for row in cur.fetchall()]
+
+    def blobid_to_relpath(self, blobid):
+        """Convert blobid to relative path: 00/00/00002152fd...b327"""
+        prefix1 = blobid[0:2]
+        prefix2 = blobid[2:4]
+        return f"{prefix1}/{prefix2}/{blobid}"
+
+    def relpath_to_blobid(self, relpath):
+        """Convert relative path back to blobid"""
+        return Path(relpath).name
+
+    def run_rsync_batch(self, blobids):
+        """Run rsync for batch, parse output, return (successful_ids, failed_ids, bytes)"""
+        # Create temp file with relative paths
+        temp_file = Path(f"/tmp/backup-batch-{int(time.time())}.txt")
+        with temp_file.open('w') as f:
+            for blobid in blobids:
+                f.write(self.blobid_to_relpath(blobid) + '\n')
+
+        try:
+            # Run rsync with itemized output
+            result = subprocess.run([
+                'rsync', '-a',
+                '--no-perms', '--no-owner', '--no-group',
+                '--ignore-times',
+                '--itemize-changes',
+                '--out-format=%i %n %l',
+                f'--files-from={temp_file}',
+                f'{self.source_root}/',
+                f'{self.dest_root}/'
+            ], capture_output=True, text=True, check=False)
+
+            # Parse output
+            successful = []
+            total_bytes = 0
+
+            for line in result.stdout.splitlines():
+                if line.startswith('>f'):
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        relpath = parts[1]
+                        size = int(parts[2])
+                        blobid = self.relpath_to_blobid(relpath)
+                        successful.append(blobid)
+                        total_bytes += size
+
+            # Failed = requested but not in successful
+            successful_set = set(successful)
+            failed = [bid for bid in blobids if bid not in successful_set]
+
+            return successful, failed, total_bytes
+
+        finally:
+            temp_file.unlink(missing_ok=True)
+
+    def mark_batch_copied(self, blobids):
+        """Mark batch as successfully copied in single transaction"""
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                UPDATE blobs
+                SET external_copied = TRUE,
+                    external_last_checked = NOW()
+                WHERE blobid = ANY(%s)
+            """, (blobids,))
+            self.conn.commit()
+
+    def mark_batch_failed(self, blobids):
+        """Mark batch as failed"""
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                UPDATE blobs
+                SET external_copy_failed = TRUE
+                WHERE blobid = ANY(%s)
+            """, (blobids,))
+            self.conn.commit()
+
+        # Log failures
+        for blobid in blobids:
+            logger.bind(event="error").warning("Blob copy failed", blobid=blobid)
+
+    def update_progress(self):
+        """Print console progress and log to JSON"""
+        elapsed = time.time() - self.stats['start_time']
+        files_per_min = (self.stats['files_copied'] / elapsed) * 60 if elapsed > 0 else 0
+        mb_per_min = (self.stats['bytes_copied'] / elapsed / 1024 / 1024) * 60 if elapsed > 0 else 0
+
+        # Get remaining count
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                SELECT COUNT(*) FROM blobs
+                WHERE (external_copied IS FALSE OR external_copied IS NULL)
+                  AND (external_copy_failed IS FALSE OR external_copy_failed IS NULL)
+            """)
+            remaining = cur.fetchone()[0]
+
+        # Calculate ETA
+        eta_hours = (remaining / files_per_min / 60) if files_per_min > 0 else 0
+
+        # Log structured progress
+        logger.bind(event="progress").info(
+            "Backup progress",
+            files_copied=self.stats['files_copied'],
+            bytes_copied=self.stats['bytes_copied'],
+            gb_copied=round(self.stats['bytes_copied'] / 1024 / 1024 / 1024, 2),
+            files_per_min=round(files_per_min, 0),
+            mb_per_min=round(mb_per_min, 1),
+            remaining=remaining,
+            eta_hours=round(eta_hours, 1)
+        )
+
+        self.stats['last_progress_time'] = time.time()
+
+    def run(self):
+        """Main backup workflow"""
+        logger.bind(event="start").info(
+            "Starting backup",
+            batch_size=self.batch_size,
+            source=str(self.source_root),
+            dest=str(self.dest_root),
+            skip_pgdump=self.skip_pgdump
+        )
+
+        try:
+            # Connect to database
+            self.connect_db()
+
+            # Run pg_dump unless skipped
+            if not self.skip_pgdump:
+                self.run_pgdump()
+            else:
+                logger.warning("Skipping database dump (--skip-pgdump)")
+
+            # Blob backup phase
+            logger.info("Starting blob backup")
+
+            while True:
+                batch = self.get_pending_batch()
+                if not batch:
+                    logger.info("No more pending blobs. Backup complete!")
+                    break
+
+                batch_start = time.time()
+                successful, failed, bytes_copied = self.run_rsync_batch(batch)
+                batch_duration = time.time() - batch_start
+
+                # Update database
+                if successful:
+                    self.mark_batch_copied(successful)
+                if failed:
+                    self.mark_batch_failed(failed)
+
+                # Update stats
+                self.stats['files_copied'] += len(successful)
+                self.stats['bytes_copied'] += bytes_copied
+
+                # Log batch completion
+                logger.bind(event="batch_complete").debug(
+                    "Batch processed",
+                    batch_size=len(batch),
+                    successful=len(successful),
+                    failed=len(failed),
+                    bytes=bytes_copied,
+                    duration_sec=round(batch_duration, 2)
+                )
+
+                # Progress update every 60 seconds
+                if time.time() - self.stats['last_progress_time'] > 60:
+                    self.update_progress()
+
+        except KeyboardInterrupt:
+            logger.warning("Interrupted by user")
+            self.update_progress()
+        except Exception as e:
+            logger.exception("Backup failed", error=str(e))
+            raise
+        finally:
+            if self.conn:
+                self.conn.close()
+            logger.bind(event="stop").info(
+                "Backup stopped",
+                total_files=self.stats['files_copied'],
+                total_bytes=self.stats['bytes_copied']
+            )
+
+def setup_logging():
+    """Configure loguru for console + JSON file logging"""
+    logger.remove()  # Remove default handler
+
+    # Console: human-readable
+    logger.add(
+        sys.stderr,
+        format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | {message}",
+        level="INFO"
+    )
+
+    # File: structured JSON
+    log_file = Path("/var/log/ntt/backup.jsonl")
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    logger.add(
+        str(log_file),
+        format="{message}",
+        level="DEBUG",
+        serialize=True  # Output as JSON
+    )
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='NTT Backup: Database + deduplicated blob backup to external drive'
+    )
+    parser.add_argument('--batch-size', type=int, default=1000,
+                       help='Number of blobs per batch (default: 1000)')
+    parser.add_argument('--backup-root', default='/mnt/ntt-backup',
+                       help='Backup drive root (default: /mnt/ntt-backup)')
+    parser.add_argument('--skip-pgdump', action='store_true',
+                       help='Skip database backup (for testing)')
+    parser.add_argument('--db-url', default=None,
+                       help='Database URL (default: from NTT_DB_URL env or postgres:///copyjob)')
+
+    args = parser.parse_args()
+
+    # Setup logging
+    setup_logging()
+
+    try:
+        # Acquire lock
+        acquire_lock()
+
+        # Validate backup mount
+        validate_backup_mount(args.backup_root)
+
+        # Run backup
+        worker = BackupWorker(
+            batch_size=args.batch_size,
+            backup_root=args.backup_root,
+            skip_pgdump=args.skip_pgdump,
+            db_url=args.db_url
+        )
+
+        worker.run()
+
+    except BackupLockError as e:
+        logger.error(str(e))
+        sys.exit(1)
+    except Exception as e:
+        logger.exception("Fatal error")
+        sys.exit(1)
+    finally:
+        release_lock()
+
+if __name__ == '__main__':
+    main()
