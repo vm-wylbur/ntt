@@ -811,6 +811,10 @@ stage_load() {
     # Get final inode count after loading
     local inode_count=$(psql_as_user "$DB_URL" -tAc "SELECT COUNT(*) FROM inode WHERE medium_hash = '$medium_hash'" 2>/dev/null || echo "0")
     log load_success "{\"medium_hash\": \"$medium_hash\", \"inode_count\": $inode_count}"
+
+    # Set enum_done timestamp
+    psql_as_user "$DB_URL" -c "UPDATE medium SET enum_done = NOW() WHERE medium_hash = '$medium_hash';" 2>/dev/null || true
+
     echo "$inode_count"  # Return inode count for smart scheduling
     return 0
   else
@@ -843,6 +847,9 @@ stage_copy() {
     if "$NTT_BIN/ntt-copier.py" --medium-hash "$medium_hash"; then
       log copy_success "{\"medium_hash\": \"$medium_hash\"}"
       echo "[$(date -Iseconds)] Copy stage: SUCCESS" >&2
+
+      # Set copy_done timestamp
+      psql_as_user "$DB_URL" -c "UPDATE medium SET copy_done = NOW() WHERE medium_hash = '$medium_hash';" 2>/dev/null || true
 
       # Check if all files are copied
       local final_pending=$(psql_as_user "$DB_URL" -tAc \
@@ -914,6 +921,9 @@ stage_copy() {
         if [[ "$final_pending" == "0" ]]; then
           echo "[$(date -Iseconds)] Copy complete! All $inode_count files copied." >&2
           log copy_success "{\"medium_hash\": \"$medium_hash\"}"
+
+          # Set copy_done timestamp
+          psql_as_user "$DB_URL" -c "UPDATE medium SET copy_done = NOW() WHERE medium_hash = '$medium_hash';" 2>/dev/null || true
 
           # Auto-run archiver
           # echo ""

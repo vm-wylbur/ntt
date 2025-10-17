@@ -301,7 +301,11 @@ Mount succeeds?
 ls works?
   ↓ NO → Record io_error → Archive → Done
   ↓ YES
-Enum succeeds?
+Enum starts → Monitor rate for 1-2 minutes
+  ↓
+Enum rate < 1000 files/s + HFS+? → YES → Run fsck.hfsplus -r → Remount → Restart enum
+  ↓ NO (or after fsck)
+Enum completes?
   ↓ NO → Investigate duplicates → Record duplicate_paths → Archive → Done
   ↓ YES
 Load succeeds?
@@ -312,6 +316,8 @@ Copy succeeds?
   ↓ YES
 Mark complete → Archive → Done
 ```
+
+**Key addition**: After enum starts, monitor the enumeration rate. If HFS+ filesystem shows < 1000 files/s sustained rate with frequent stalls, **STOP immediately** and run fsck.hfsplus -r before continuing. This prevents wasting hours on corrupted catalog enumeration.
 
 ---
 

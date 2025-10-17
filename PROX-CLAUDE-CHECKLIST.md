@@ -119,6 +119,19 @@ prox-claude verifies fix
 
 ---
 
+## CRITICAL: Before Declaring Data Loss
+
+**When seeing "No such file or directory" errors:**
+
+- [ ] **Verify at least ONE file actually missing** - Check filesystem directly, try alternate paths (base path, `/p1/`, etc.)
+- [ ] **If enumeration succeeded, data exists somewhere** - Find WHERE, not accept it's lost. Tool misconfiguration is more likely than mass corruption.
+- [ ] **Review recent mount/path changes** - Path mismatches from mount point changes cause `ENOENT` without actual data loss
+- [ ] **Test before generalizing** - One verified missing file before declaring thousands corrupt
+
+**See:** `docs/lessons/diagnosing-file-not-found-43fda374-2025-10-11.md` for full diagnostic procedure.
+
+---
+
 ## Phase 1: Enumeration
 
 **Goal:** Extract inode metadata from mounted filesystem

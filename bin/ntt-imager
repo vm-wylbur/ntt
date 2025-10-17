@@ -77,6 +77,18 @@ log() {
   echo "[$(date -Iseconds)] $*" | tee -a "$LOGFILE"
 }
 
+cleanup_and_exit() {
+  local exit_code="$1"
+
+  # Eject CD/DVD if device is optical drive
+  if [[ "$DEVICE" == "/dev/sr0" ]] || [[ "$DEVICE" == "/dev/cdrom" ]]; then
+    log "Ejecting optical drive: $DEVICE"
+    eject "$DEVICE" 2>&1 | tee -a "$LOGFILE" || log "Warning: Failed to eject $DEVICE"
+  fi
+
+  exit "$exit_code"
+}
+
 count_unfinished_sectors() {
   local mapfile="$1"
   if [[ ! -f "$mapfile" ]]; then
@@ -165,7 +177,7 @@ run_phase() {
     log "======================================"
     log "SUCCESS: 100% rescued after $elapsed hours"
     log "======================================"
-    exit 0
+    cleanup_and_exit 0
   fi
 }
 
@@ -224,7 +236,7 @@ if (( $(echo "$rescued_pct > 99" | bc -l) )); then
   log "Skipping phases 4-7 (diminishing returns)"
   log "Total time: $elapsed hours"
   log "======================================"
-  exit 0  # Exit with code 0 (success)
+  cleanup_and_exit 0
 fi
 
 # Bailout if disk is likely dead (≤25% rescued after aggressive scraping)
@@ -235,7 +247,7 @@ if (( $(echo "$rescued_pct <= 25" | bc -l) )); then
   log "Disk appears severely damaged, skipping phases 4-7"
   log "Total time: $elapsed hours"
   log "======================================"
-  exit 1  # Exit with code 1 (partial rescue)
+  cleanup_and_exit 1
 fi
 
 log "Rescued ${rescued_pct}% after Phase 3 (26-99%), continuing to Phase 4..."
@@ -256,7 +268,7 @@ if (( $(echo "$rescued_pct > 99" | bc -l) )); then
   log "Skipping Phases 5-7 (diminishing returns)"
   log "Total time: $elapsed hours"
   log "======================================"
-  exit 0
+  cleanup_and_exit 0
 fi
 
 log "Rescued ${rescued_pct}% after Phase 4 (≤99%), continuing to expensive phases..."
@@ -278,7 +290,7 @@ if (( $(echo "$rescued_pct >= 95" | bc -l) )); then
   log "Skipping Phases 6-7 (severely damaged media only)"
   log "Total time: $elapsed hours"
   log "======================================"
-  exit 0
+  cleanup_and_exit 0
 fi
 
 log "Rescued ${rescued_pct}% after Phase 5 (<95%), continuing to phases 6-7 for severely damaged media..."
@@ -315,10 +327,10 @@ log "======================================"
 if [[ $unfinished -eq 0 ]]; then
   log "SUCCESS: 100% rescued after $elapsed hours and 7 phases"
   log "======================================"
-  exit 0
+  cleanup_and_exit 0
 else
   log "EXHAUSTED: All 7 phases complete after $elapsed hours"
   log "Final status: ${rescued_pct}% rescued, $unfinished sectors unreadable"
   log "======================================"
-  exit 1
+  cleanup_and_exit 1
 fi
