@@ -11,7 +11,7 @@ ntt/bugs/BUG-015-orchestrator-false-success-reporting.md
 
 **Filed:** 2025-10-12 12:20
 **Filed by:** prox-claude
-**Status:** open
+**Status:** DUPLICATE of BUG-016 (fixed 2025-10-14)
 **Severity:** CRITICAL
 **Affected media:** da69350a5b27adf013e02994611cebc3 (CEH report CD-ROM), potentially all media processed through orchestrator
 **Phase:** load/copy pipeline stages
@@ -498,3 +498,46 @@ The bug was discovered while investigating why da69350a archive existed in cold 
 6. Resume processing with monitoring
 
 **Root cause:** Likely missing `wait` statement or backgrounding subprocess without waiting. Need to review orchestrator bash script for all subprocess invocations.
+
+---
+
+## Dev Notes (2025-10-17)
+
+**Investigation by:** dev-claude
+**Date:** 2025-10-17 16:45
+
+**Code review findings:**
+
+Examined `bin/ntt-orchestrator` lines 806-825 (load stage) and 845-865 (copy stage).
+
+**Root cause - CORRECTED:**
+
+The original hypothesis (missing `wait` or backgrounding) was **incorrect**. The orchestrator code shows:
+
+```bash
+# Line 810
+if "$NTT_BIN/ntt-loader" "$raw_file" "$medium_hash"; then
+  # ... log success ...
+
+# Line 847
+if "$NTT_BIN/ntt-copier.py" --medium-hash "$medium_hash"; then
+  # ... log success ...
+```
+
+These commands run **synchronously** (no `&` backgrounding). Bash waits for completion before proceeding.
+
+**Actual root cause:** Missing timestamp updates
+
+The real issue was that `enum_done` and `copy_done` timestamps were never set. This was **fixed in BUG-016** (commit f9b6057, 2025-10-14):
+- Line 816: `UPDATE medium SET enum_done = NOW()`
+- Line 852: `UPDATE medium SET copy_done = NOW()`
+
+**Status:** This bug is a **duplicate of BUG-016**, which has already been fixed and verified.
+
+**Evidence:**
+- Current orchestrator code (lines 810, 847) runs commands synchronously
+- Timestamp updates present (lines 816, 852)
+- No subprocess backgrounding found
+- File verification shows timestamps are now being set
+
+**Recommendation:** Close this as duplicate of BUG-016 (already fixed and moved to bugs/fixed/).

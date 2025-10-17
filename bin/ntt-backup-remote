@@ -4,6 +4,7 @@
 # dependencies = [
 #     "psycopg>=3.2.3",
 #     "loguru",
+#     "humanize",
 # ]
 # ///
 # Author: PB and Claude
@@ -11,9 +12,9 @@
 # License: (c) HRDAG, 2025, GPL-2 or newer
 #
 # ------
-# ntt/bin/ntt-backup
+# ntt/bin/ntt-backup-remote
 #
-# Unified backup tool: pg_dump + deduplicated blob backup to external drive
+# Remote backup tool: pg_dump + deduplicated blob backup to remote server via SSH
 
 import argparse
 import psycopg
@@ -22,12 +23,18 @@ import sys
 import os
 import time
 import signal
+import humanize
 from pathlib import Path
 from datetime import datetime
 from loguru import logger
 
 # Use /tmp for lockfile (user-writable, survives reboots)
-LOCKFILE = Path("/tmp/ntt-backup.lock")
+LOCKFILE = Path("/tmp/ntt-backup-remote.lock")
+
+# Remote backup configuration
+REMOTE_HOST = "pball@chll"
+REMOTE_PATH = "/storage/pball"
+SSH_KEY = "/home/pball/.ssh/id_ed25519"
 
 class BackupLockError(Exception):
     """Raised when backup is already running"""
@@ -42,7 +49,7 @@ def acquire_lock():
                 pid = int(f.read().strip())
             # Check if PID exists
             os.kill(pid, 0)  # Doesn't kill, just checks existence
-            raise BackupLockError(f"ntt-backup already running (PID {pid})")
+            raise BackupLockError(f"ntt-backup-remote already running (PID {pid})")
         except (ProcessLookupError, ValueError):
             # Stale lockfile, remove it
             logger.warning("Removing stale lockfile", old_pid=LOCKFILE.read_text().strip())
@@ -58,56 +65,42 @@ def release_lock():
     LOCKFILE.unlink(missing_ok=True)
     logger.info("Lock released")
 
-def validate_backup_mount(backup_root):
-    """Ensure backup drive is mounted and structure exists"""
-    root = Path(backup_root)
+def validate_remote_access():
+    """Ensure remote server is accessible and directories exist"""
+    logger.info("Testing remote connectivity", host=REMOTE_HOST, path=REMOTE_PATH)
 
-    # Check if mount point exists
-    try:
-        if not root.exists():
-            raise RuntimeError(f"Backup root does not exist: {backup_root}")
-    except OSError as e:
-        raise RuntimeError(f"Cannot access backup root (I/O error, drive may be unmounted or failed): {backup_root} - {e}")
+    # Test SSH connectivity
+    result = subprocess.run([
+        'ssh', '-i', SSH_KEY, '-o', 'ConnectTimeout=10',
+        REMOTE_HOST, 'echo', 'connected'
+    ], capture_output=True, text=True, timeout=15)
 
-    # Warn if not a mount point
-    if not root.is_mount():
-        logger.warning("Backup root may not be mounted (not a mount point)", path=str(root))
+    if result.returncode != 0:
+        raise RuntimeError(f"Cannot connect to remote host: {REMOTE_HOST}\n{result.stderr}")
 
-    # Check required directories exist
-    by_hash = root / 'by-hash'
-    pgdump_dir = root / 'pgdump'
+    # Check remote directories exist and are writable
+    check_cmd = f"test -d {REMOTE_PATH}/by-hash && test -d {REMOTE_PATH}/pgdump && test -w {REMOTE_PATH}"
+    result = subprocess.run([
+        'ssh', '-i', SSH_KEY, REMOTE_HOST, check_cmd
+    ], capture_output=True, text=True)
 
-    try:
-        if not by_hash.exists():
-            raise RuntimeError(f"Missing by-hash directory: {by_hash}")
-        if not pgdump_dir.exists():
-            raise RuntimeError(f"Missing pgdump directory: {pgdump_dir}")
-    except OSError as e:
-        raise RuntimeError(f"Cannot access backup directories (I/O error, drive may be in error state): {e}\n"
-                         f"Check mount status: mount | grep {backup_root}")
+    if result.returncode != 0:
+        raise RuntimeError(f"Remote directories missing or not writable: {REMOTE_HOST}:{REMOTE_PATH}")
 
-    # Check it's writable
-    test_file = root / '.ntt-backup-test'
-    try:
-        test_file.touch()
-        test_file.unlink()
-    except Exception as e:
-        raise RuntimeError(f"Backup drive not writable: {e}")
-
-    logger.info("Backup drive validated", path=str(root))
-    return root
+    logger.info("Remote access validated", host=REMOTE_HOST, path=REMOTE_PATH)
 
 class BackupWorker:
-    def __init__(self, batch_size=1000, backup_root='/mnt/ntt-backup',
-                 skip_pgdump=False, db_url=None):
+    def __init__(self, batch_size=1000, skip_pgdump=False, db_url=None):
         self.batch_size = batch_size
-        self.backup_root = Path(backup_root)
         self.skip_pgdump = skip_pgdump
         self.db_url = db_url or os.environ.get('NTT_DB_URL', 'postgres:///copyjob')
 
-        # Fixed paths
+        # Fixed paths for remote
         self.source_root = Path('/data/cold/by-hash')
-        self.dest_root = self.backup_root / 'by-hash'
+        self.remote_host = REMOTE_HOST
+        self.remote_path = REMOTE_PATH
+        self.ssh_key = SSH_KEY
+        self.dest_root = f"{self.remote_host}:{self.remote_path}/by-hash/"
 
         self.conn = None
         self.stats = {
@@ -123,44 +116,61 @@ class BackupWorker:
         logger.info("Database connected", db_url=self.db_url)
 
     def run_pgdump(self):
-        """Run pg_dump to backup database with rotation"""
-        dump_file = self.backup_root / 'pgdump' / 'copyjob.pgdump'
-        prior_file = self.backup_root / 'pgdump' / 'copyjob.pgdump-prior'
+        """Run pg_dump and copy to remote with rotation"""
+        local_dump = Path('/tmp/copyjob.pgdump')
+        remote_dump = f"{self.remote_host}:{self.remote_path}/pgdump/copyjob.pgdump"
+        remote_prior = f"{self.remote_host}:{self.remote_path}/pgdump/copyjob.pgdump-prior"
 
-        # Rotate existing backup
-        if dump_file.exists():
-            logger.debug("Rotating previous dump", old=str(dump_file), new=str(prior_file))
-            dump_file.rename(prior_file)
+        logger.info("Starting database dump", dest=str(local_dump))
 
-        logger.info("Starting database dump", dest=str(dump_file))
-
+        # Dump to /tmp locally
         result = subprocess.run([
             'pg_dump',
             '-d', self.db_url,
             '-F', 'c',  # Custom format
-            '-f', str(dump_file)
+            '-f', str(local_dump)
         ], capture_output=True, text=True)
 
         if result.returncode != 0:
             raise RuntimeError(f"pg_dump failed: {result.stderr}")
 
-        # Get dump size
-        size_mb = dump_file.stat().st_size / 1024 / 1024
+        size_mb = local_dump.stat().st_size / 1024 / 1024
+        logger.info("Database dump complete", size_mb=round(size_mb, 1))
+
+        # Rotate remote backup (prior will be overwritten on next backup)
+        logger.info("Copying dump to remote", dest=remote_dump)
+        subprocess.run([
+            'ssh', '-i', self.ssh_key, self.remote_host,
+            f'mv {self.remote_path}/pgdump/copyjob.pgdump {self.remote_path}/pgdump/copyjob.pgdump-prior 2>/dev/null || true'
+        ], capture_output=True)
+
+        # Copy new dump to remote
+        result = subprocess.run([
+            'rsync', '-a', '-e', f'ssh -i {self.ssh_key}',
+            str(local_dump), remote_dump
+        ], capture_output=True, text=True)
+
+        if result.returncode != 0:
+            raise RuntimeError(f"Failed to copy dump to remote: {result.stderr}")
+
+        # Clean up local temp file
+        local_dump.unlink()
+
         logger.bind(event="pgdump_complete").info(
-            "Database dump complete",
-            file=str(dump_file),
+            "Database dump copied to remote",
+            dest=remote_dump,
             size_mb=round(size_mb, 1)
         )
 
-        return dump_file
+        return remote_dump
 
     def get_pending_batch(self):
-        """Query DB for next batch of pending blobids"""
+        """Query DB for next batch of pending blobids for remote backup"""
         with self.conn.cursor() as cur:
             cur.execute("""
                 SELECT blobid FROM blobs
-                WHERE (external_copied IS FALSE OR external_copied IS NULL)
-                  AND (external_copy_failed IS FALSE OR external_copy_failed IS NULL)
+                WHERE (remote_copied IS FALSE OR remote_copied IS NULL)
+                  AND (remote_copy_failed IS FALSE OR remote_copy_failed IS NULL)
                 LIMIT %s
             """, (self.batch_size,))
             return [row[0] for row in cur.fetchall()]
@@ -176,7 +186,7 @@ class BackupWorker:
         return Path(relpath).name
 
     def run_rsync_batch(self, blobids):
-        """Run rsync for batch, parse output, return (successful_ids, failed_ids, bytes)"""
+        """Run rsync for batch to remote via SSH, parse output, return (successful_ids, failed_ids, bytes)"""
         # Create temp file with relative paths
         temp_file = Path(f"/tmp/backup-batch-{int(time.time())}.txt")
         with temp_file.open('w') as f:
@@ -184,16 +194,17 @@ class BackupWorker:
                 f.write(self.blobid_to_relpath(blobid) + '\n')
 
         try:
-            # Run rsync with itemized output
+            # Run rsync with itemized output to remote via SSH
             result = subprocess.run([
                 'rsync', '-a',
                 '--no-perms', '--no-owner', '--no-group',
                 '--ignore-times',
                 '--itemize-changes',
                 '--out-format=%i %n %l',
+                '-e', f'ssh -i {self.ssh_key}',
                 f'--files-from={temp_file}',
                 f'{self.source_root}/',
-                f'{self.dest_root}/'
+                f'{self.dest_root}'
             ], capture_output=True, text=True, check=False)
 
             # Parse output
@@ -201,7 +212,7 @@ class BackupWorker:
             total_bytes = 0
 
             for line in result.stdout.splitlines():
-                if line.startswith('>f'):
+                if line.startswith('<f') or line.startswith('>f'):
                     parts = line.split()
                     if len(parts) >= 3:
                         relpath = parts[1]
@@ -220,29 +231,29 @@ class BackupWorker:
             temp_file.unlink(missing_ok=True)
 
     def mark_batch_copied(self, blobids):
-        """Mark batch as successfully copied in single transaction"""
+        """Mark batch as successfully copied to remote in single transaction"""
         with self.conn.cursor() as cur:
             cur.execute("""
                 UPDATE blobs
-                SET external_copied = TRUE,
-                    external_last_checked = NOW()
+                SET remote_copied = TRUE,
+                    remote_last_checked = NOW()
                 WHERE blobid = ANY(%s)
             """, (blobids,))
             self.conn.commit()
 
     def mark_batch_failed(self, blobids):
-        """Mark batch as failed"""
+        """Mark batch as failed for remote backup"""
         with self.conn.cursor() as cur:
             cur.execute("""
                 UPDATE blobs
-                SET external_copy_failed = TRUE
+                SET remote_copy_failed = TRUE
                 WHERE blobid = ANY(%s)
             """, (blobids,))
             self.conn.commit()
 
         # Log failures
         for blobid in blobids:
-            logger.bind(event="error").warning("Blob copy failed", blobid=blobid)
+            logger.bind(event="error").warning("Remote blob copy failed", blobid=blobid)
 
     def update_progress(self):
         """Print console progress and log to JSON"""
@@ -250,19 +261,32 @@ class BackupWorker:
         files_per_min = (self.stats['files_copied'] / elapsed) * 60 if elapsed > 0 else 0
         mb_per_min = (self.stats['bytes_copied'] / elapsed / 1024 / 1024) * 60 if elapsed > 0 else 0
 
-        # Get remaining count
+        # Get remaining count for remote backup
         with self.conn.cursor() as cur:
             cur.execute("""
                 SELECT COUNT(*) FROM blobs
-                WHERE (external_copied IS FALSE OR external_copied IS NULL)
-                  AND (external_copy_failed IS FALSE OR external_copy_failed IS NULL)
+                WHERE (remote_copied IS FALSE OR remote_copied IS NULL)
+                  AND (remote_copy_failed IS FALSE OR remote_copy_failed IS NULL)
             """)
             remaining = cur.fetchone()[0]
 
         # Calculate ETA
         eta_hours = (remaining / files_per_min / 60) if files_per_min > 0 else 0
 
-        # Log structured progress
+        # Format human-readable progress for console
+        total_files = self.stats['files_copied'] + remaining
+        files_copied_fmt = humanize.intcomma(self.stats['files_copied'])
+        total_files_fmt = humanize.intcomma(total_files)
+        bytes_fmt = humanize.naturalsize(self.stats['bytes_copied'], binary=True)
+        files_rate = int(files_per_min)
+        eta_h = int(eta_hours)
+
+        progress_msg = f"{files_copied_fmt}/{total_files_fmt} files | {bytes_fmt} | {files_rate}/min | {eta_h}h left"
+
+        # Log to console with formatted message
+        logger.info(progress_msg)
+
+        # Log structured progress to JSON file
         logger.bind(event="progress").info(
             "Backup progress",
             files_copied=self.stats['files_copied'],
@@ -277,12 +301,13 @@ class BackupWorker:
         self.stats['last_progress_time'] = time.time()
 
     def run(self):
-        """Main backup workflow"""
+        """Main remote backup workflow"""
         logger.bind(event="start").info(
-            "Starting backup",
+            "Starting remote backup",
             batch_size=self.batch_size,
             source=str(self.source_root),
-            dest=str(self.dest_root),
+            dest=self.dest_root,
+            remote_host=self.remote_host,
             skip_pgdump=self.skip_pgdump
         )
 
@@ -352,15 +377,21 @@ def setup_logging():
     """Configure loguru for console + JSON file logging"""
     logger.remove()  # Remove default handler
 
-    # Console: human-readable
+    # Console: human-readable (exclude structured events that don't have meaningful messages)
+    def console_filter(record):
+        # Skip the "Backup progress" structured log line (event="progress")
+        # We already print the human-readable progress line before it
+        return record["extra"].get("event") != "progress"
+
     logger.add(
         sys.stderr,
         format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | {message}",
-        level="INFO"
+        level="INFO",
+        filter=console_filter
     )
 
     # File: structured JSON
-    log_file = Path("/var/log/ntt/backup.jsonl")
+    log_file = Path("/var/log/ntt/backup-remote.jsonl")
     log_file.parent.mkdir(parents=True, exist_ok=True)
 
     logger.add(
@@ -372,12 +403,10 @@ def setup_logging():
 
 def main():
     parser = argparse.ArgumentParser(
-        description='NTT Backup: Database + deduplicated blob backup to external drive'
+        description='NTT Remote Backup: Database + deduplicated blob backup to remote server via SSH'
     )
     parser.add_argument('--batch-size', type=int, default=1000,
                        help='Number of blobs per batch (default: 1000)')
-    parser.add_argument('--backup-root', default='/mnt/ntt-backup',
-                       help='Backup drive root (default: /mnt/ntt-backup)')
     parser.add_argument('--skip-pgdump', action='store_true',
                        help='Skip database backup (for testing)')
     parser.add_argument('--db-url', default=None,
@@ -392,13 +421,12 @@ def main():
         # Acquire lock
         acquire_lock()
 
-        # Validate backup mount
-        validate_backup_mount(args.backup_root)
+        # Validate remote access
+        validate_remote_access()
 
         # Run backup
         worker = BackupWorker(
             batch_size=args.batch_size,
-            backup_root=args.backup_root,
             skip_pgdump=args.skip_pgdump,
             db_url=args.db_url
         )
