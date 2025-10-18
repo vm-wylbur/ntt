@@ -15,7 +15,7 @@ ntt/ROLES.md
 
 **All Claudes may read all files.** Write permissions and responsibilities defined below.
 
-**Version:** 2025-10-10
+**Version:** 2025-10-14
 **Maintainer:** PB
 
 ---
@@ -106,6 +106,9 @@ sudo bin/ntt-archiver <hash>
 
 # 6. Unmount
 sudo bin/ntt-mount-helper unmount <hash>
+
+# Verify (after archiving)
+sudo bin/ntt-verify-archived-media <hash>
 ```
 
 **PROHIBITED - Never Do These:**
@@ -166,8 +169,22 @@ UPDATE medium SET problems = jsonb_build_object(
 
 **Mark phase completion:**
 ```sql
+-- NOTE: ntt-orchestrator now sets these automatically (BUG-016 fixed as of 2025-10-14)
 UPDATE medium SET enum_done = NOW() WHERE medium_hash = '$HASH';
 UPDATE medium SET copy_done = NOW() WHERE medium_hash = '$HASH';
+```
+
+**Verify completion timestamps:**
+```sql
+-- Check that orchestrator set timestamps correctly
+SELECT medium_hash, enum_done, copy_done
+FROM medium
+WHERE medium_hash = '$HASH';
+
+-- Audit for missing timestamps (should return 0 rows for newly processed media)
+SELECT medium_hash FROM medium
+WHERE image_path IS NOT NULL
+  AND (enum_done IS NULL OR copy_done IS NULL);
 ```
 
 #### 5. Queue Maintenance
@@ -548,14 +565,14 @@ FROM medium;
 
 ## Coordination Patterns
 
-### Pattern 1: Standard Bug Fix
+### Pattern 1: Standard Bug Fix (Historical Example - BUG-016 Fixed)
 
-1. **prox-claude:** Files `bugs/BUG-001-loader-timeout-579d3c3a.md`
-2. **prox-claude:** Updates queue: 579d3c3a blocked, continues with other media
-3. **dev-claude:** Investigates, fixes code, appends Dev Notes
-4. **prox-claude:** Sees "ready for testing", verifies fix
-5. **prox-claude:** All tests pass, moves to bugs/fixed/, unblocks 579d3c3a
-6. **metrics-claude:** (later) Notes in report: "BUG-001 fixed, reduced load time 5min→3s"
+1. **prox-claude:** Filed `bugs/BUG-016-orchestrator-missing-timestamp-updates.md`
+2. **prox-claude:** Updated queue: multiple media showing as incomplete, continued processing
+3. **dev-claude:** Investigated orchestrator code, added timestamp updates after stages
+4. **prox-claude:** Verified fix on new media, all timestamps set correctly
+5. **prox-claude:** Moved bugs/BUG-016-* to bugs/fixed/, updated status in doc
+6. **metrics-claude:** Can now accurately track completion without manual verification
 
 ### Pattern 2: Pattern Emerges
 
@@ -712,4 +729,20 @@ Concrete, measurable criteria:
 **This document is the single source of truth for role boundaries and communication protocols.**
 
 **Maintained by:** PB
-**Last updated:** 2025-10-10
+**Last updated:** 2025-10-14
+
+---
+
+## Recent Tool Additions (2025-10-13/14)
+
+New tools available in `bin/`:
+- **ntt-backup**: External backup system (PostgreSQL + blobs to USB drive)
+- **ntt-backup-worker**: Worker process for blob backup operations
+- **ntt-backup-wrapper.sh**: Wrapper with mount validation and auto-recovery
+- **ntt-verify-archived-media**: Verify archived media have files in by-hash storage
+- **audit-cdrom-completion.sh**: Check completion status of CD/DVD media
+- **audit-cdrom-report.sh**: Generate completion reports for optical media
+- **remediate-incomplete-media.sh**: Fix media with missing timestamps or orphaned data
+- **ntt-create-backup-dirs.sh**: One-time setup for external backup directory structure
+
+See `docs/external-backup-plan.md` for backup system details (Phase 5 currently in progress).
