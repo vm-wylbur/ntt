@@ -198,7 +198,7 @@ class BackupWorker:
             result = subprocess.run([
                 'rsync', '-a',
                 '--no-perms', '--no-owner', '--no-group',
-                '--ignore-times',
+                '--size-only',
                 '--itemize-changes',
                 '--out-format=%i %n %l',
                 '-e', f'ssh -i {self.ssh_key}',
