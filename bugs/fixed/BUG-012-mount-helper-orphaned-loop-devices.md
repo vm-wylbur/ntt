@@ -331,3 +331,167 @@ Priority: Medium - not blocking processing but should be fixed to prevent resour
 - Together they ensure loop devices don't accumulate over time
 
 **Ready for testing:** 2025-10-17 17:00
+
+---
+
+## Testing Results
+
+**Tested by:** prox-claude
+**Date:** 2025-10-17 18:45
+
+### Test Scenario
+
+Created controlled test environment with medium 9bfbfb9e7b86a330b4c45c1332e749e2.img:
+
+```bash
+# Setup: Created 4 loop devices total
+sudo losetup -f --show -r -P /data/fast/img/9bfbfb9e7b86a330b4c45c1332e749e2.img  # /dev/loop0
+sudo losetup -f --show -r -P /data/fast/img/9bfbfb9e7b86a330b4c45c1332e749e2.img  # /dev/loop1
+sudo losetup -f --show -r -P /data/fast/img/9bfbfb9e7b86a330b4c45c1332e749e2.img  # /dev/loop2
+# Mount-helper created /dev/loop3 during mount
+
+# Action: Run unmount
+sudo bin/ntt-mount-helper unmount 9bfbfb9e7b86a330b4c45c1332e749e2
+
+# Verification:
+losetup -l | grep 9bfbfb9e
+```
+
+**Expected:** 0 loop devices remaining (all 4 detached)
+**Actual:** All 4 loop devices still attached
+
+```
+/dev/loop0  0 0  1 0 /data/fast/img/9bfbfb9e7b86a330b4c45c1332e749e2.img  0 512
+/dev/loop1  0 0  1 0 /data/fast/img/9bfbfb9e7b86a330b4c45c1332e749e2.img  0 512
+/dev/loop2  0 0  1 0 /data/fast/img/9bfbfb9e7b86a330b4c45c1332e749e2.img  0 512
+/dev/loop3  0 0  1 0 /data/fast/img/9bfbfb9e7b86a330b4c45c1332e749e2.img  0 512
+```
+
+**Result:** ❌ **TEST FAILED** - No loop devices were detached
+
+---
+
+### Root Cause Analysis
+
+**Bug location:** `bin/ntt-mount-helper` lines 656-662
+
+**Problematic code:**
+```bash
+# Line 656: Extract image path from loop device
+image_path=$(losetup -l | grep "^$base_loop_device" | awk '{for(i=6;i<=NF;i++) printf "%s ", $i; print ""}' | sed 's/ *$//' | sed 's/ (deleted)$//')
+
+# Line 662: Search for all loop devices with matching image path
+all_loop_devices=$(losetup -l | grep -F "$image_path" | awk '{print $1}')
+```
+
+**Issue:** The awk command extracts fields 6 through end-of-line, but `losetup -l` output format is:
+
+```
+NAME SIZELIMIT OFFSET AUTOCLEAR RO BACK-FILE DIO LOG-SEC
+```
+
+- Field 6 = `BACK-FILE` (the actual image path) ✅
+- Field 7 = `DIO` (direct I/O flag: 0 or 1)
+- Field 8 = `LOG-SEC` (logical sector size: typically 512)
+
+**Result:** `image_path` contains extra fields:
+```bash
+# Expected:
+/data/fast/img/9bfbfb9e7b86a330b4c45c1332e749e2.img
+
+# Actual:
+/data/fast/img/9bfbfb9e7b86a330b4c45c1332e749e2.img 0 512
+```
+
+**Impact:** The `grep -F "$image_path"` at line 662 searches for the literal string:
+```
+/data/fast/img/9bfbfb9e7b86a330b4c45c1332e749e2.img 0 512
+```
+
+This string does NOT exist in the `losetup -l` output because the BACK-FILE column doesn't include the DIO and LOG-SEC values. The grep fails to match ANY loop devices, so nothing gets detached.
+
+---
+
+### Proposed Fix
+
+**Change line 656** to extract only field 6 (BACK-FILE column):
+
+```bash
+# Current (BROKEN):
+image_path=$(losetup -l | grep "^$base_loop_device" | awk '{for(i=6;i<=NF;i++) printf "%s ", $i; print ""}' | sed 's/ *$//' | sed 's/ (deleted)$//')
+
+# Fixed:
+image_path=$(losetup -l | grep "^$base_loop_device" | awk '{print $6}' | sed 's/(deleted)$//')
+```
+
+**Why this works:**
+- `awk '{print $6}'` extracts ONLY the BACK-FILE column
+- `sed 's/(deleted)$//'` strips the "(deleted)" suffix if present
+- The resulting `image_path` will match the BACK-FILE values in other rows
+- `grep -F "$image_path"` will correctly find all loop devices pointing to that image
+
+---
+
+### Status
+
+**Implementation status:** FAILED - fix does not work as implemented
+**Action required:** dev-claude needs to correct line 656 in `bin/ntt-mount-helper`
+**Priority:** Medium - loop devices still accumulating, but Solution 2 (ntt-cleanup-mounts) provides fallback cleanup
+
+---
+
+## Fix Applied and Re-tested
+
+**Fixed by:** PB
+**Date:** 2025-10-17 19:00
+
+**Code change applied to `bin/ntt-mount-helper` line 656:**
+
+```bash
+# Before (BROKEN):
+image_path=$(losetup -l | grep "^$base_loop_device" | awk '{for(i=6;i<=NF;i++) printf "%s ", $i; print ""}' | sed 's/ *$//' | sed 's/ (deleted)$//')
+
+# After (FIXED):
+image_path=$(losetup -l | grep "^$base_loop_device" | awk '{print $6}' | sed 's/(deleted)$//')
+```
+
+**Re-test performed by:** prox-claude
+**Date:** 2025-10-17 19:05
+
+### Re-test Scenario
+
+```bash
+# Setup: Create 4 loop devices
+sudo losetup -f --show -r -P /data/fast/img/9bfbfb9e...img  # /dev/loop0
+sudo losetup -f --show -r -P /data/fast/img/9bfbfb9e...img  # /dev/loop1
+sudo losetup -f --show -r -P /data/fast/img/9bfbfb9e...img  # /dev/loop2
+sudo bin/ntt-mount-helper mount 9bfbfb9e... /data/fast/img/9bfbfb9e...img  # /dev/loop3
+
+# Verify 4 loop devices exist
+sudo losetup -l | grep 9bfbfb9e
+# Output: 4 loop devices confirmed
+
+# Run unmount
+sudo bin/ntt-mount-helper unmount 9bfbfb9e7b86a330b4c45c1332e749e2
+# Output:
+# Unmounted /mnt/ntt/9bfbfb9e7b86a330b4c45c1332e749e2
+# Found 4 loop device(s) for this image, detaching all...
+#   Detached /dev/loop1
+#   Detached /dev/loop2
+#   Detached /dev/loop0
+#   Detached /dev/loop3
+
+# Verify cleanup
+sudo losetup -l | grep 9bfbfb9e
+# Output: No loop devices remaining
+```
+
+**Result:** ✅ **TEST PASSED**
+
+- All 4 loop devices successfully detached
+- 0 orphaned loop devices remaining
+- Fix verified working as expected
+
+**Status:** FIXED - Ready to move to bugs/fixed/
+
+---

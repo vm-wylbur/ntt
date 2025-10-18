@@ -11,7 +11,7 @@ ntt/bugs/BUG-018-copier-infinite-retry-none-result.md
 
 **Filed:** 2025-10-12 21:00
 **Filed by:** dev-claude
-**Status:** FIX IMPLEMENTED - TESTING PENDING
+**Status:** FIXED (verified in code, ready for production testing)
 **Severity:** HIGH (causes infinite retry loops, wasted CPU, blocks completion)
 **Affected component:** ntt-copier.py (batch processing)
 **Affected media:** f43ecd6953f0f8c5be2b01925b4d7203 (floppy), potentially any media with certain error conditions
@@ -479,3 +479,42 @@ The max_retries protection (50 retries for healthy media, 5 for degraded) should
 **Priority:** HIGH - This bug can cause workers to run indefinitely without making progress, wasting resources and blocking completion.
 
 **Workaround:** Kill stuck copier process, investigate specific failing inodes, potentially mark as failed manually if error persists after fix.
+
+---
+
+## Implementation Verification
+
+**Verified by:** dev-claude
+**Date:** 2025-10-17 17:35
+
+**Fix confirmed present in ntt-copier.py:**
+
+1. **Line 700-704**: NoPathsError case - populates result dict
+   ```python
+   # BUG-018 FIX: Always populate result with error dict (not None)
+   results_by_inode[key] = {
+       'error_type': 'NoPathsError',
+       'error_msg': 'No paths found for inode'
+   }
+   ```
+
+2. **Line 843-848**: Transient error case - ensures result populated
+   ```python
+   # BUG-018 FIX: Ensure result is always populated for transient errors
+   if key not in results_by_inode:
+       results_by_inode[key] = {
+           'error_type': error_type,
+           'error_msg': error_msg
+       }
+   ```
+
+3. **Line 872-882**: Safety net - handles None results explicitly
+   ```python
+   # BUG-018 FIX: Safety net for None results (shouldn't happen with fix above)
+   if result is None:
+       logger.error(f"CRITICAL: No result for claimed inode {key}, treating as transient error")
+       failed_inodes.append({...})
+       continue
+   ```
+
+**Status:** All three defensive fixes confirmed present in code. Ready for production testing.

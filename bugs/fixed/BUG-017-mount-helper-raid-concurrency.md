@@ -11,7 +11,7 @@ ntt/bugs/BUG-017-mount-helper-raid-concurrency.md
 
 **Filed:** 2025-10-12 14:25
 **Filed by:** dev-claude
-**Status:** open
+**Status:** FIXED (duplicate of BUG-019, committed 2025-10-17)
 **Severity:** HIGH (blocks mounting when RAID arrays active)
 **Affected media:** 594d2e75c6d629e0c7df7758bf5d7b8d (ST3000DM001 3TB), potentially all RAID1 media
 **Phase:** Mounting
@@ -335,3 +335,28 @@ The fix requires moving from global scanning to targeted assembly using RAID UUI
 **Immediate workaround:** Manually mount RAID media (as done for 594d) until fix is deployed.
 
 **Priority:** HIGH - Blocks parallel processing of RAID media (43fda374, 594d, and likely many more in collection).
+
+---
+
+## Resolution Notes
+
+**Updated by:** dev-claude
+**Date:** 2025-10-17 17:30
+
+**Status:** FIXED as part of BUG-019
+
+BUG-019 fixed the root cause identified in this bug:
+- Removed system-wide `mdadm --assemble --scan` entirely
+- Added pre-check for RAID members using `blkid TYPE="linux_raid_member"`
+- Only run mdadm if RAID members actually detected on the specific disk
+- Use targeted `mdadm --assemble --run <device>` per partition instead of global scan
+
+**Changes:** `bin/ntt-mount-helper` lines 249-269 (committed 2025-10-17)
+
+**Result:**
+- No more system-wide scanning
+- Each mount operation is independent
+- Concurrent RAID media mounting is now safe
+- Non-RAID disks skip mdadm entirely (faster)
+
+**Recommendation:** Close as duplicate of BUG-019 after verification testing
