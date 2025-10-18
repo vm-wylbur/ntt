@@ -304,7 +304,7 @@ do_mount() {
       # Skip RAID members (will be counted via md devices)
       [[ "$part_type" == "linux_raid_member" ]] && continue
 
-      ((mountable_count++))
+      ((mountable_count++)) || true
     done
 
     # Count assembled RAID arrays
@@ -316,7 +316,7 @@ do_mount() {
         # Check if it has a filesystem
         local md_fs_type
         md_fs_type=$(blkid -o value -s TYPE "$md_dev" 2>/dev/null || echo "")
-        [[ -n "$md_fs_type" ]] && ((mountable_count++))
+        [[ -n "$md_fs_type" ]] && { ((mountable_count++)) || true; }
       done
     fi
 
@@ -354,6 +354,25 @@ do_mount() {
         continue
       fi
 
+      # Skip swap partitions (can't be mounted as filesystems)
+      if [[ "$part_type" == "swap" ]]; then
+        echo "  Skipping $part_dev (swap partition)" >&2
+        continue
+      fi
+
+      # Validate partition geometry before attempting mount
+      # Check dmesg for kernel truncation warnings (partition extends beyond EOF)
+      # This prevents mount from hanging in D-state on corrupted/truncated partitions
+      local loop_name
+      loop_name=$(basename "$loop_device")
+
+      # dmesg shows: "loop23: p2 size 19535040 extends beyond EOD, truncated"
+      if dmesg 2>/dev/null | tail -100 | grep -q "$loop_name:.*p$part_num.*beyond EOD.*truncated"; then
+        echo "  Skipping $part_dev (partition extends beyond device end - kernel truncated)" >&2
+        mounted_partitions+=("$part_num:$part_dev::$part_type:truncated")
+        continue
+      fi
+
       # Create partition mount point
       local part_mount
       if [[ "$use_base_path" == "true" ]]; then
@@ -369,13 +388,24 @@ do_mount() {
       local mount_opts
       mount_opts=$(get_mount_options "$part_type")
 
-      # Try to mount this partition
-      if mount -t "$part_type" -o "$mount_opts" "$part_dev" "$part_mount" 2>/dev/null; then
+      # Try to mount this partition - capture errors for diagnostics
+      # Use timeout with KILL signal to prevent hangs on corrupted/truncated partitions
+      # Note: Mount can enter uninterruptible sleep (D state) which requires SIGKILL
+      local mount_error
+      mount_error=$(timeout -s KILL 10 mount -t "$part_type" -o "$mount_opts" "$part_dev" "$part_mount" 2>&1)
+      local mount_status=$?
+
+      # timeout returns 124 on timeout, 137 when SIGKILL used
+      if [[ $mount_status -eq 124 ]] || [[ $mount_status -eq 137 ]]; then
+        mount_error="Mount command timed out after 10 seconds (likely corrupted/truncated partition)"
+      fi
+
+      if [[ $mount_status -eq 0 ]]; then
         echo "  Mounted $part_dev at $part_mount (fs_type: $part_type)" >&2
         mounted_partitions+=("$part_num:$part_dev:$part_mount:$part_type:ok")
         partition_count=$((partition_count + 1))
       else
-        echo "  Failed to mount $part_dev" >&2
+        echo "  Failed to mount $part_dev (type: $part_type): $mount_error" >&2
         rmdir "$part_mount" 2>/dev/null || true
         mounted_partitions+=("$part_num:$part_dev::$part_type:failed")
       fi
@@ -436,13 +466,23 @@ do_mount() {
         local md_mount_opts
         md_mount_opts=$(get_mount_options "$md_fs_type")
 
-        # Try to mount
-        if mount -t "$md_fs_type" -o "$md_mount_opts" "$md_dev" "$md_mount" 2>/dev/null; then
+        # Try to mount - capture errors for diagnostics
+        # Use timeout with KILL signal to prevent hangs on corrupted partitions
+        local md_mount_error
+        md_mount_error=$(timeout -s KILL 10 mount -t "$md_fs_type" -o "$md_mount_opts" "$md_dev" "$md_mount" 2>&1)
+        local md_mount_status=$?
+
+        # timeout returns 124 on timeout, 137 when SIGKILL used
+        if [[ $md_mount_status -eq 124 ]] || [[ $md_mount_status -eq 137 ]]; then
+          md_mount_error="Mount command timed out after 10 seconds (likely corrupted partition)"
+        fi
+
+        if [[ $md_mount_status -eq 0 ]]; then
           echo "  Mounted $md_dev at $md_mount (RAID, fs_type: $md_fs_type)" >&2
           mounted_partitions+=("$md_part_num:$md_dev:$md_mount:$md_fs_type:ok")
           partition_count=$((partition_count + 1))
         else
-          echo "  Failed to mount $md_dev" >&2
+          echo "  Failed to mount $md_dev (type: $md_fs_type): $md_mount_error" >&2
           rmdir "$md_mount" 2>/dev/null || true
         fi
       done
@@ -652,8 +692,9 @@ do_unmount() {
     local base_loop_device="${loop_device%p*}"
 
     # Find the image file path from the loop device
+    # Extract only field 6 (BACK-FILE column) from losetup -l output
     local image_path
-    image_path=$(losetup -l | grep "^$base_loop_device" | awk '{for(i=6;i<=NF;i++) printf "%s ", $i; print ""}' | sed 's/ *$//' | sed 's/ (deleted)$//')
+    image_path=$(losetup -l | grep "^$base_loop_device" | awk '{print $6}' | sed 's/(deleted)$//')
 
     if [[ -n "$image_path" ]]; then
       # Find ALL loop devices pointing to this image file
