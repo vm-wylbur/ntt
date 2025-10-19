@@ -12,8 +12,9 @@
 # License: (c) HRDAG, 2025, GPL-2 or newer
 #
 # ------
-# ntt/bin/ntt-backup-remote
+# ntt/bin/ntt-backup-remote-scp-nocontrol
 #
+# TEST VERSION: Remote backup without ControlMaster (testing performance)
 # Remote backup tool: pg_dump + deduplicated blob backup to remote server via SSH
 
 import argparse
@@ -116,7 +117,7 @@ class BackupWorker:
         self.dest_root = f"{self.remote_host}:{self.remote_path}/by-hash/"
 
         self.conn = None
-        self.control_path = f'/tmp/ssh-backup-worker-{self.worker_id}'
+        # Removed: self.control_path (testing without ControlMaster)
         self.stats = {
             'files_copied': 0,
             'bytes_copied': 0,
@@ -172,13 +173,13 @@ class BackupWorker:
         # Rotate remote backup (prior will be overwritten on next backup)
         logger.info("Copying dump to remote", dest=remote_dump)
         subprocess.run([
-            'ssh', '-i', self.ssh_key, '-o', 'ForwardX11=no', self.remote_host,
+            'ssh', '-i', self.ssh_key, self.remote_host,
             f'mv {self.remote_path}/pgdump/copyjob.pgdump {self.remote_path}/pgdump/copyjob.pgdump-prior 2>/dev/null || true'
         ], capture_output=True)
 
         # Copy new dump to remote
         result = subprocess.run([
-            'rsync', '-a', '-e', f'ssh -i {self.ssh_key} -o ForwardX11=no',
+            'rsync', '-a', '-e', f'ssh -i {self.ssh_key}',
             str(local_dump), remote_dump
         ], capture_output=True, text=True)
 
@@ -220,88 +221,76 @@ class BackupWorker:
         """Convert relative path back to blobid"""
         return Path(relpath).name
 
-    def run_rsync_batch(self, blobids):
-        """Run rsync for batch to remote via SSH, parse output, return (successful_ids, failed_ids, bytes)"""
-        # Create temp file with relative paths
-        temp_file = Path(f"/tmp/backup-batch-{int(time.time())}-{self.worker_id}.txt")
-        files_included = 0
-        files_missing = 0
-        with temp_file.open('w') as f:
-            for blobid in blobids:
-                relpath = self.blobid_to_relpath(blobid)
-                # Verify source file exists before adding to batch
-                source_path = Path(self.source_root) / relpath
-                if source_path.exists():
-                    f.write(relpath + '\n')
-                    files_included += 1
-                else:
-                    logger.warning("Source file missing", worker_id=self.worker_id, blobid=blobid, path=str(source_path))
-                    files_missing += 1
+    def run_scp_batch(self, blobids):
+        """Run scp for batch to remote via SSH, return (successful_ids, failed_ids, bytes)"""
+        # Build list of source files and calculate total bytes
+        blobid_to_size = {}
+        missing_blobids = []
+        rel_files = []
+
+        for blobid in blobids:
+            relpath = self.blobid_to_relpath(blobid)
+            source_path = Path(self.source_root) / relpath
+            if source_path.exists():
+                blobid_to_size[blobid] = source_path.stat().st_size
+                rel_files.append(relpath)
+            else:
+                logger.warning("Source file missing", worker_id=self.worker_id, blobid=blobid, path=str(source_path))
+                missing_blobids.append(blobid)
 
         # Debug log for first few batches
         if self.stats['files_copied'] < 200:
             logger.debug("Batch file list created",
                        worker_id=self.worker_id,
                        requested=len(blobids),
-                       included=files_included,
-                       missing=files_missing,
-                       temp_file=str(temp_file))
+                       included=len(rel_files),
+                       missing=len(missing_blobids))
 
-        try:
-            # Run rsync with itemized output to remote via SSH with ControlMaster
-            result = subprocess.run([
-                'rsync', '-a',
-                '--no-perms', '--no-owner', '--no-group',
-                '--size-only',
-                '--itemize-changes',
-                '--out-format=%i %n %l',
-                '-e', f'ssh -T -o BatchMode=yes -o RemoteCommand=none -o RequestTTY=no -o ForwardX11=no -i {self.ssh_key} -o ControlMaster=no -o ControlPath={self.control_path}',
-                f'--files-from={temp_file}',
-                f'{self.source_root}/',
-                f'{self.dest_root}'
-            ], capture_output=True, text=True, check=False)
+        if not rel_files:
+            # All files missing
+            return [], blobids, 0
 
-            # Log rsync errors if any (check stderr even if returncode is 0)
-            if result.stderr:
-                logger.warning("Rsync errors encountered",
-                              worker_id=self.worker_id,
-                              returncode=result.returncode,
-                              stderr=result.stderr[:1000])  # First 1000 chars
+        # Create temp file with relative paths for tar -T
+        temp_file = Path(f"/tmp/backup-batch-{int(time.time())}-{self.worker_id}.txt")
+        with temp_file.open('w') as f:
+            for relpath in rel_files:
+                f.write(relpath + '\n')
 
-            # Debug: log rsync output for first few batches
-            if self.stats['files_copied'] < 200:
-                logger.debug("Rsync output",
-                           worker_id=self.worker_id,
-                           returncode=result.returncode,
-                           stdout_lines=len(result.stdout.splitlines()),
-                           stderr_lines=len(result.stderr.splitlines()),
-                           stdout_sample=result.stdout[:500] if result.stdout else "",
-                           stderr_sample=result.stderr[:500] if result.stderr else "")
+        # Use tar over ssh to transfer with directory structure (no ControlMaster)
+        tar_cmd = f"cd {self.source_root} && tar cf - -T {temp_file} | ssh -C -o BatchMode=yes -o RemoteCommand=none -o RequestTTY=no -o ForwardX11=no -o StrictHostKeyChecking=accept-new -i {self.ssh_key} {self.remote_host} 'cd {self.remote_path}/by-hash && tar xf -'"
 
-            # Parse output
+        result = subprocess.run(tar_cmd, shell=True, capture_output=True, text=True, check=False)
+
+        # Log actual errors (not SSH warnings)
+        if result.returncode != 0:
+            logger.warning("SCP/tar batch failed",
+                          worker_id=self.worker_id,
+                          returncode=result.returncode,
+                          stderr=result.stderr,
+                          batch_size=len(blobids))
+
+        # Debug: log output for first few batches
+        if self.stats['files_copied'] < 200:
+            logger.debug("SCP/tar output",
+                       worker_id=self.worker_id,
+                       returncode=result.returncode,
+                       stderr_sample=result.stderr[:500] if result.stderr else "")
+
+        # If returncode is 0, all files succeeded
+        if result.returncode == 0:
+            successful = list(blobid_to_size.keys())
+            failed = missing_blobids
+            total_bytes = sum(blobid_to_size.values())
+        else:
+            # All files failed
             successful = []
+            failed = blobids
             total_bytes = 0
 
-            for line in result.stdout.splitlines():
-                if line.startswith('<f') or line.startswith('>f'):
-                    parts = line.split()
-                    if len(parts) >= 3:
-                        relpath = parts[1]
-                        size = int(parts[2])
-                        blobid = self.relpath_to_blobid(relpath)
-                        successful.append(blobid)
-                        total_bytes += size
+        # Clean up temp file
+        temp_file.unlink(missing_ok=True)
 
-            # Failed = requested but not in successful
-            successful_set = set(successful)
-            failed = [bid for bid in blobids if bid not in successful_set]
-
-            return successful, failed, total_bytes
-
-        finally:
-            # Keep first temp file for debugging
-            if self.stats['files_copied'] >= 10:
-                temp_file.unlink(missing_ok=True)
+        return successful, failed, total_bytes
 
     def mark_batch_copied(self, blobids):
         """Mark batch as successfully copied to remote in single transaction"""
@@ -404,21 +393,7 @@ class BackupWorker:
             # Blob backup phase
             logger.info("Starting blob backup")
 
-            # Establish SSH ControlMaster connection for this worker
-            # Each worker gets its own control socket for parallel SSH streams
-            logger.debug("Establishing SSH ControlMaster connection",
-                       worker_id=self.worker_id,
-                       control_path=self.control_path)
-            subprocess.run([
-                'ssh', '-fN',  # -f backgrounds, -N no command
-                '-o', 'BatchMode=yes', '-o', 'RemoteCommand=none', '-o', 'RequestTTY=no',
-                '-o', 'ForwardX11=no',
-                '-i', self.ssh_key,
-                '-o', 'ControlMaster=yes',
-                '-o', f'ControlPath={self.control_path}',
-                '-o', 'ControlPersist=30m',
-                self.remote_host
-            ], capture_output=True, check=False)
+            # REMOVED: ControlMaster connection setup (testing without it)
 
             # Query totals once at startup (filtered by this worker's hex range)
             with self.conn.cursor() as cur:
@@ -466,7 +441,7 @@ class BackupWorker:
                     break
 
                 batch_start = time.time()
-                successful, failed, bytes_copied = self.run_rsync_batch(batch)
+                successful, failed, bytes_copied = self.run_scp_batch(batch)
                 batch_duration = time.time() - batch_start
 
                 # Update database
@@ -511,10 +486,7 @@ class BackupWorker:
             logger.exception("Backup failed", error=str(e))
             raise
         finally:
-            # Close SSH ControlMaster connection
-            subprocess.run([
-                'ssh', '-O', 'exit', '-o', f'ControlPath={self.control_path}', self.remote_host
-            ], capture_output=True, check=False)
+            # REMOVED: ControlMaster cleanup (testing without it)
 
             if self.conn:
                 self.conn.close()

@@ -35,6 +35,61 @@ validate_hash() {
   fi
 }
 
+# Extract LVM metadata from partition device
+# Returns JSON string with LVM metadata or empty if not LVM
+extract_lvm_metadata() {
+  local part_dev="$1"
+
+  # Check if this is an LVM member
+  local lvm_type
+  lvm_type=$(blkid -o value -s TYPE "$part_dev" 2>/dev/null || echo "")
+
+  if [[ "$lvm_type" != "LVM1_member" ]] && [[ "$lvm_type" != "LVM2_member" ]]; then
+    return 1
+  fi
+
+  # Extract PV UUID
+  local pv_uuid
+  pv_uuid=$(blkid -o value -s UUID "$part_dev" 2>/dev/null || echo "")
+
+  # Extract VG name from raw LVM metadata
+  # LVM1 and LVM2 store VG name in metadata at start of PV
+  # Look for repeated alphanumeric strings that look like VG names
+  local vg_name=""
+  local vg_candidates
+  vg_candidates=$(dd if="$part_dev" bs=4096 count=16 2>/dev/null | strings | grep -E "^[a-zA-Z0-9_-]{2,32}$" | sort | uniq -c | sort -rn | head -5)
+
+  # VG name appears many times in metadata (highest frequency wins)
+  vg_name=$(echo "$vg_candidates" | head -1 | awk '{print $2}')
+
+  # Extract LV names (look for /dev/VG/LV patterns)
+  local lv_names=()
+  if [[ -n "$vg_name" ]]; then
+    while IFS= read -r lv_path; do
+      # Extract just the LV name from /dev/VG/LV
+      local lv_name="${lv_path##*/}"
+      [[ -n "$lv_name" ]] && lv_names+=("$lv_name")
+    done < <(dd if="$part_dev" bs=4096 count=64 2>/dev/null | strings | grep -E "^/dev/$vg_name/[a-zA-Z0-9_-]+" | sort -u)
+  fi
+
+  # Build JSON output
+  local lv_list=""
+  if [[ ${#lv_names[@]} -gt 0 ]]; then
+    # Properly format JSON array with quoted elements
+    local lv_json=""
+    for lv in "${lv_names[@]}"; do
+      [[ -n "$lv_json" ]] && lv_json+=","
+      lv_json+="\"$lv\""
+    done
+    lv_list="[$lv_json]"
+  else
+    lv_list="[]"
+  fi
+
+  echo "{\"lvm_type\":\"$lvm_type\",\"pv_uuid\":\"$pv_uuid\",\"vg_name\":\"$vg_name\",\"lv_names\":$lv_list}"
+  return 0
+}
+
 # Assemble RAID array from partition device
 # Returns md device path on success, empty string on failure
 assemble_raid_array() {
@@ -293,7 +348,7 @@ do_mount() {
     # Multiple mountable partitions → mount at /p1, /p2 subdirectories
     local mountable_count=0
 
-    # Count regular partitions (skip extended containers, RAID members)
+    # Count regular partitions (skip extended containers, RAID members, LVM members)
     for part_dev in "${partition_devices[@]}"; do
       local part_type
       part_type=$(blkid -o value -s TYPE "$part_dev" 2>/dev/null || echo "")
@@ -303,6 +358,10 @@ do_mount() {
 
       # Skip RAID members (will be counted via md devices)
       [[ "$part_type" == "linux_raid_member" ]] && continue
+
+      # Skip LVM members (will be handled by LVM activation)
+      [[ "$part_type" == "LVM1_member" ]] && continue
+      [[ "$part_type" == "LVM2_member" ]] && continue
 
       ((mountable_count++)) || true
     done
@@ -354,6 +413,22 @@ do_mount() {
         continue
       fi
 
+      # Handle LVM members - extract metadata and skip mounting
+      if [[ "$part_type" == "LVM1_member" ]] || [[ "$part_type" == "LVM2_member" ]]; then
+        echo "  Detecting LVM member: $part_dev" >&2
+        local lvm_metadata
+        lvm_metadata=$(extract_lvm_metadata "$part_dev" 2>/dev/null || echo "")
+
+        if [[ -n "$lvm_metadata" ]]; then
+          echo "  LVM metadata extracted: $lvm_metadata" >&2
+          mounted_partitions+=("$part_num:$part_dev::$part_type:lvm_detected:$lvm_metadata")
+        else
+          echo "  Warning: Failed to extract LVM metadata from $part_dev" >&2
+          mounted_partitions+=("$part_num:$part_dev::$part_type:lvm_no_metadata")
+        fi
+        continue
+      fi
+
       # Skip swap partitions (can't be mounted as filesystems)
       if [[ "$part_type" == "swap" ]]; then
         echo "  Skipping $part_dev (swap partition)" >&2
@@ -367,7 +442,9 @@ do_mount() {
       loop_name=$(basename "$loop_device")
 
       # dmesg shows: "loop23: p2 size 19535040 extends beyond EOD, truncated"
-      if dmesg 2>/dev/null | tail -100 | grep -q "$loop_name:.*p$part_num.*beyond EOD.*truncated"; then
+      # Search ALL dmesg (not just tail -100) to catch warnings even if they've scrolled
+      # This is critical for workers that mount the disk long after orchestrator created it
+      if sudo dmesg 2>/dev/null | grep "$loop_name:" | grep -q "p$part_num.*beyond EOD.*truncated"; then
         echo "  Skipping $part_dev (partition extends beyond device end - kernel truncated)" >&2
         mounted_partitions+=("$part_num:$part_dev::$part_type:truncated")
         continue
@@ -488,13 +565,19 @@ do_mount() {
       done
     fi
 
-    if [[ $partition_count -eq 0 ]]; then
-      # No partitions mounted successfully - cleanup any assembled RAID arrays
+    if [[ $partition_count -eq 0 ]] && [[ ${#mounted_partitions[@]} -eq 0 ]]; then
+      # No partitions at all (not even LVM/truncated) - this is a real failure
       stop_raid_arrays "$mount_point"
       losetup -d "$loop_device" 2>/dev/null || true
       rmdir "$mount_point" 2>/dev/null || true
       echo "Error: No partitions could be mounted" >&2
       exit 1
+    fi
+
+    # If we have partition info (even if unmounted), output JSON
+    # This captures LVM metadata, truncated partitions, etc.
+    if [[ $partition_count -eq 0 ]]; then
+      echo "Warning: No partitions mounted, but partition metadata captured" >&2
     fi
 
     # Output JSON for orchestrator
@@ -508,10 +591,17 @@ do_mount() {
     echo "{\"layout\":\"$layout_type\",\"partitions\":["
     local first=true
     for part_info in "${mounted_partitions[@]}"; do
-      IFS=':' read -r num dev mnt fstype status <<< "$part_info"
+      # Parse all fields (lvm_metadata is optional 6th field)
+      IFS=':' read -r num dev mnt fstype status lvm_metadata <<< "$part_info"
       [[ "$first" == "true" ]] || echo ','
       first=false
-      echo -n "{\"num\":$num,\"device\":\"$dev\",\"mount\":\"$mnt\",\"fstype\":\"$fstype\",\"status\":\"$status\"}"
+
+      # Build JSON with LVM metadata if present
+      if [[ -n "$lvm_metadata" ]] && [[ "$lvm_metadata" != "" ]]; then
+        echo -n "{\"num\":$num,\"device\":\"$dev\",\"mount\":\"$mnt\",\"fstype\":\"$fstype\",\"status\":\"$status\",\"lvm\":$lvm_metadata}"
+      else
+        echo -n "{\"num\":$num,\"device\":\"$dev\",\"mount\":\"$mnt\",\"fstype\":\"$fstype\",\"status\":\"$status\"}"
+      fi
     done
     echo ']}'
 

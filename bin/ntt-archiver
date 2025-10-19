@@ -146,11 +146,25 @@ fi
 echo "[$(date -Iseconds)] Starting archive process for $MEDIUM_HASH" >&2
 log archive_start "{\"medium_hash\": \"$MEDIUM_HASH\", \"force\": $FORCE, \"verbose\": $VERBOSE}"
 
-# Check if source files exist
-SOURCE_FILES=("$IMAGE_ROOT/${MEDIUM_HASH}"*)
-if [[ ! -e "${SOURCE_FILES[0]}" ]]; then
-  fail "No source files found: $IMAGE_ROOT/${MEDIUM_HASH}*"
+# Check if source files exist (try multiple locations)
+SEARCH_PATHS=("$IMAGE_ROOT" "/data/cold/img-unprocessed")
+SOURCE_FILES=()
+FOUND_IN=""
+
+for search_path in "${SEARCH_PATHS[@]}"; do
+  CANDIDATES=("$search_path/${MEDIUM_HASH}"*)
+  if [[ -e "${CANDIDATES[0]}" ]]; then
+    SOURCE_FILES=("${CANDIDATES[@]}")
+    FOUND_IN="$search_path"
+    break
+  fi
+done
+
+if [[ ${#SOURCE_FILES[@]} -eq 0 ]]; then
+  fail "No source files found in: ${SEARCH_PATHS[*]} (pattern: ${MEDIUM_HASH}*)"
 fi
+
+echo "[$(date -Iseconds)] Found source files in: $FOUND_IN" >&2
 
 if [[ "$VERBOSE" == "true" ]]; then
   echo "[$(date -Iseconds)] Found source files:" >&2
@@ -204,7 +218,7 @@ fi
 echo "[$(date -Iseconds)] Creating archive: $ARCHIVE_FILE" >&2
 log archive_create_start "{\"medium_hash\": \"$MEDIUM_HASH\", \"archive\": \"$ARCHIVE_FILE\"}"
 
-TAR_OPTS="-C $IMAGE_ROOT -c"
+TAR_OPTS="-C $FOUND_IN -c"
 if [[ "$VERBOSE" == "true" ]]; then
   TAR_OPTS="$TAR_OPTS -v"
 fi
@@ -255,7 +269,7 @@ for f in "${SOURCE_FILES[@]}"; do
 done
 
 # Verify source files are gone
-REMAINING_FILES=("$IMAGE_ROOT/${MEDIUM_HASH}"*)
+REMAINING_FILES=("$FOUND_IN/${MEDIUM_HASH}"*)
 if [[ -e "${REMAINING_FILES[0]}" ]]; then
   echo "[$(date -Iseconds)] WARNING: Some source files still exist:" >&2
   for f in "${REMAINING_FILES[@]}"; do

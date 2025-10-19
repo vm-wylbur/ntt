@@ -10,7 +10,7 @@
 
 set -euo pipefail
 
-REMOTE_HOST="pball@chll"
+REMOTE_HOST="pball@chll-script"
 REMOTE_PATH="/storage/pball"
 SSH_KEY="/home/pball/.ssh/id_ed25519"
 MAX_RETRIES=3

@@ -648,6 +648,48 @@ SQL
       local layout=$(echo "$json_line" | jq -r '.layout')
       echo "[$(date -Iseconds)] Mount successful: layout=$layout" >&2
       log mount_success "{\"medium_hash\": \"$medium_hash\", \"image_path\": \"$image_path\", \"layout\": \"$layout\"}"
+
+      # Parse and store LVM metadata if present
+      local lvm_info=""
+      local lvm_count=$(echo "$json_line" | jq '[.partitions[] | select(.lvm != null)] | length')
+
+      if [[ "$lvm_count" -gt 0 ]]; then
+        echo "[$(date -Iseconds)] Found $lvm_count LVM partition(s), extracting metadata..." >&2
+
+        # Build LVM metadata summary
+        lvm_info="=== LVM METADATA ===\n"
+        lvm_info+="Found $lvm_count LVM physical volume(s)\n\n"
+
+        # Extract each LVM partition's metadata
+        local part_idx=0
+        while true; do
+          local lvm_data=$(echo "$json_line" | jq -r ".partitions[$part_idx].lvm // empty" 2>/dev/null)
+          [[ -z "$lvm_data" || "$lvm_data" == "null" ]] && { ((part_idx++)) || true; [[ $part_idx -ge 10 ]] && break; continue; }
+
+          local part_num=$(echo "$json_line" | jq -r ".partitions[$part_idx].num")
+          local lvm_type=$(echo "$lvm_data" | jq -r '.lvm_type')
+          local pv_uuid=$(echo "$lvm_data" | jq -r '.pv_uuid')
+          local vg_name=$(echo "$lvm_data" | jq -r '.vg_name')
+          local lv_names=$(echo "$lvm_data" | jq -r '.lv_names | join(", ")')
+
+          lvm_info+="Partition p${part_num}:\n"
+          lvm_info+="  Type: $lvm_type\n"
+          lvm_info+="  PV UUID: $pv_uuid\n"
+          lvm_info+="  VG Name: $vg_name\n"
+          lvm_info+="  LV Names: $lv_names\n\n"
+
+          ((part_idx++)) || true
+          [[ $part_idx -ge 10 ]] && break
+        done
+
+        # Store to database diagnostics
+        echo "[$(date -Iseconds)] Storing LVM metadata to database..." >&2
+        psql_as_user "$DB_URL" -c "UPDATE medium SET diagnostics = diagnostics || E'\n\n$lvm_info' WHERE medium_hash = '$medium_hash';" 2>/dev/null || {
+          echo "[$(date -Iseconds)] WARNING: Failed to store LVM metadata to database" >&2
+        }
+
+        log lvm_metadata_stored "{\"medium_hash\": \"$medium_hash\", \"lvm_partition_count\": $lvm_count}"
+      fi
     else
       # No JSON output (backward compatibility)
       echo "[$(date -Iseconds)] Mount successful (no layout metadata)" >&2
