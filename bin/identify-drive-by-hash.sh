@@ -312,21 +312,41 @@ chmod 644 "$LOG_JSON" 2>/dev/null || true
 # Check if v0 or v2 hash matches any existing medium records
 DB_MATCH_V0=""
 DB_MATCH_V2=""
+DB_ERROR=""
 
 if command -v psql &>/dev/null; then
-  # Query for v0 hash match
-  DB_MATCH_V0=$(sudo -u postgres psql -d copyjob -tAc "
-    SELECT medium_hash, medium_human, health, problems
-    FROM medium
-    WHERE medium_hash = '$HASH_V0';
-  " 2>/dev/null || true)
+  # Test database connectivity first
+  if ! sudo -u postgres psql -d copyjob -tAc "SELECT 1;" >/dev/null 2>&1; then
+    DB_ERROR="Database unavailable (PostgreSQL not running or connection failed)"
+  else
+    # Query for v0 hash match
+    DB_MATCH_V0=$(sudo -u postgres psql -d copyjob -tAc "
+      SELECT medium_hash, medium_human, health, problems
+      FROM medium
+      WHERE medium_hash = '$HASH_V0';
+    " 2>&1)
 
-  # Query for v2 hash match
-  DB_MATCH_V2=$(sudo -u postgres psql -d copyjob -tAc "
-    SELECT medium_hash, medium_human, health, problems
-    FROM medium
-    WHERE medium_hash = '$HASH_V2';
-  " 2>/dev/null || true)
+    # Check if query failed
+    if [[ $? -ne 0 ]]; then
+      DB_ERROR="Database query failed: $DB_MATCH_V0"
+      DB_MATCH_V0=""
+    fi
+
+    # Query for v2 hash match (only if v0 query succeeded)
+    if [[ -z "$DB_ERROR" ]]; then
+      DB_MATCH_V2=$(sudo -u postgres psql -d copyjob -tAc "
+        SELECT medium_hash, medium_human, health, problems
+        FROM medium
+        WHERE medium_hash = '$HASH_V2';
+      " 2>&1)
+
+      # Check if query failed
+      if [[ $? -ne 0 ]]; then
+        DB_ERROR="Database query failed: $DB_MATCH_V2"
+        DB_MATCH_V2=""
+      fi
+    fi
+  fi
 fi
 
 # ---------- Print Human-Readable Output ----------
@@ -348,7 +368,10 @@ echo "Hash (v2/hybrid Oct 10+):         $HASH_V2"
 echo ""
 
 # Display database match results
-if [[ -n "$DB_MATCH_V0" ]]; then
+if [[ -n "$DB_ERROR" ]]; then
+  echo "Database: ERROR - $DB_ERROR"
+  echo ""
+elif [[ -n "$DB_MATCH_V0" ]]; then
   IFS='|' read -r db_hash db_human db_health db_problems <<< "$DB_MATCH_V0"
   echo "Database: MATCH v0 (${HASH_V0:0:6})"
   echo ""
