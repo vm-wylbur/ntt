@@ -88,21 +88,56 @@ For 3033499e, expect:
 
 All drive scans are logged to `/var/log/ntt/drive-identification.jsonl` for future reference.
 
-## Database Status
+## Database Status - CRITICAL DATA LOSS RISK
 
+**URGENCY**: This is the most critical orphaned media case - complete data loss without physical disk recovery.
+
+**Current state (as of 2025-10-18):**
 ```sql
 medium_hash: 3033499e89e2efe1f2057c571aeb793a
 medium_human: orphaned_3033499e
-health: incomplete
-problems: {
-  "need_re_imaging": true,
-  "reason": "IMG file deleted before loading - need to locate physical disk for re-imaging",
-  "enumerated_files": 5040408,
-  "old_raw_file": "/data/fast/raw/3033499e89e2efe1f2057c571aeb793a.raw",
-  "content": "xt MacBook Pro Time Machine 2013-02-07",
-  "old_mount_point": "/mnt/tmp3"
-}
+enum_done: NULL
+copy_done: NULL
+
+-- Database records: ZERO
+SELECT COUNT(*) FROM inode WHERE medium_hash = '3033499e...';  -- 0 rows
+SELECT COUNT(*) FROM path WHERE medium_hash = '3033499e...';   -- 0 rows
+SELECT COUNT(*) FROM old_enum_3033499e;                        -- 0 rows (table exists but empty)
 ```
+
+**What we have:**
+- Raw enumeration file: `/data/fast/raw/3033499e89e2efe1f2057c571aeb793a.raw` (830 MB, 5,040,408 files)
+- Medium record with orphaned status
+- Metadata: "xt's MacBook Pro" Time Machine backup from 2013-02-07
+
+**What we DON'T have:**
+- ❌ IMG file (deleted before loading phase)
+- ❌ Database records (raw file was NEVER loaded into inode/path tables)
+- ❌ Any blobids
+- ❌ Any actual file data
+
+**Result**: Without finding and re-imaging the physical disk, 5+ million files are permanently lost.
+
+## Search Status (2025-10-18)
+
+**Scanned drives (SATA via USB):** 18 drives scanned, NO MATCH
+- 5 small 2.5" drives (93-465GB)
+- 8 large 3.5" drives (279-3000GB)
+- None matched v1 hash `3033499e...`
+
+**Remaining candidates:** 3 IDE/ATAPI drives, ~300GB each
+- Located but not yet scanned (requires IDE controller card installation)
+- Scanning requires machine power-down for each drive swap
+- **Expected disk size**: 300-500GB physical drive (contains ~283GB data)
+- **Expected filesystem**: HFS+ (Mac OS Extended)
+- **Expected label**: Related to "xt's MacBook Pro" or "Time Machine"
+
+**Next step:** Power down, install IDE card, scan the 3 IDE/ATAPI 300GB drives using `bin/identify-drive-by-hash.sh`
+
+**If none of the 3 IDE drives match:**
+- Data is permanently lost (5+ million files unrecoverable)
+- Update medium record to document final search attempt
+- Mark raw file for archival/deletion
 
 ## Re-Imaging Procedure (when disk is found)
 
@@ -150,14 +185,17 @@ problems: {
 
 ## Notes
 
+- **CRITICAL**: Data is completely inaccessible without physical disk - no database records exist
 - **Hash format**: 3033499e uses v1 (content-only) from Oct 2, 2025 enumeration
 - **Enumeration format**: Old raw file format uses permissions (775, 644) instead of filetype (d, f, l)
+- **Processing gap**: Raw file created Oct 2, but IMG was deleted before loading phase, so data never reached database
 - **Re-enumeration**: Will happen automatically when orchestrator processes the re-imaged disk
 - **Time Machine backup characteristics**:
   - Many hardlinks (Time Machine hardlinks unchanged files across snapshots)
   - Possible multiple backup snapshots if disk wasn't dedicated to single backup
   - Standard Mac applications and user data structure
 - **Drive identification log**: All candidate drive scans logged to `/var/log/ntt/drive-identification.jsonl`
+- **Search priority**: HIGH - only 3 IDE drives remain as candidates, must check them
 
 ## References
 
