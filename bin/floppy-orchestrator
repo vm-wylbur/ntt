@@ -265,21 +265,32 @@ write_metadata() {
 }
 
 show_disks() {
-  echo "STATUS  | SECTORS          | MESSAGE"
-  echo "--------|------------------|$(printf '%.0s-' {1..60})"
+  echo "HASH | TRIES | STATUS  | FLUX | SECTORS          | MESSAGE"
+  echo "-----|-------|---------|------|------------------|$(printf '%.0s-' {1..50})"
 
-  # Find all metadata.json files and process them
+  # Build index of all reads grouped by content_hash
+  local temp_index="/tmp/floppy-index-$$"
   local temp_file="/tmp/floppy-show-$$"
+  > "$temp_index"
   > "$temp_file"
 
   for meta in "$DISK_ROOT"/*/metadata.json; do
     [[ -f "$meta" ]] || continue
 
     local dir=$(dirname "$meta")
+    local session_hash=$(jq -r '.session_hash' "$meta" 2>/dev/null || echo "")
+    local content_hash=$(jq -r '.content_hash' "$meta" 2>/dev/null || echo "")
     local status=$(jq -r '.read_status' "$meta" 2>/dev/null || echo "unknown")
     local message=$(jq -r '.message' "$meta" 2>/dev/null || echo "")
     local sectors_found=$(jq -r '.diagnostics.sectors_found // 0' "$meta" 2>/dev/null || echo "0")
     local sectors_total=$(jq -r '.diagnostics.sectors_total // 0' "$meta" 2>/dev/null || echo "0")
+
+    # Skip entries with missing critical data
+    [[ -z "$message" ]] && continue
+    [[ -z "$session_hash" ]] && continue
+
+    # Use session_hash if content_hash is missing/null
+    [[ -z "$content_hash" || "$content_hash" == "null" ]] && content_hash="$session_hash"
 
     # Fallback: parse log file if metadata is missing sector info
     if [[ $sectors_found -eq 0 && $sectors_total -eq 0 ]]; then
@@ -310,25 +321,106 @@ show_disks() {
       fi
     fi
 
+    # Check for flux files (any .scp file in directory)
+    local flux_status="    "  # 4 spaces for "no flux"
+    if ls "$dir"/*.scp 1>/dev/null 2>&1; then
+      flux_status="FLUX"
+    elif [[ "$status" == "partial" || "$status" == "failed" ]]; then
+      flux_status="NEED"  # Partial/failed but no flux captured yet
+    fi
+
+    # Extract first 4 chars of session_hash
+    local hash_prefix="${session_hash:0:4}"
+
     # Sort order: failed (1), partial (2), success (3)
     local sort_key=3
     [[ "$status" == "failed" ]] && sort_key=1
     [[ "$status" == "partial" ]] && sort_key=2
 
-    # Write to temp file for sorting
-    printf "%d|%-7s | %4d/%4d (%3d%%) | %s\n" \
-      "$sort_key" "$status" "$sectors_found" "$sectors_total" "$percent" "$message" \
-      >> "$temp_file"
+    # Store in index: message|session_hash|percent|status|flux_status|sectors_found|sectors_total|sort_key|hash_prefix|dir
+    printf "%s|%s|%d|%s|%s|%d|%d|%d|%s|%s\n" \
+      "$message" "$session_hash" "$percent" "$status" "$flux_status" \
+      "$sectors_found" "$sectors_total" "$sort_key" "$hash_prefix" "$dir" \
+      >> "$temp_index"
   done
+
+  # Process index: find best read for each message (physical disk)
+  local prev_message=""
+  local best_percent=0
+  local attempt_count=0
+  local has_any_flux=false
+
+  # Track best values across attempts
+  local best_hash_prefix=""
+  local best_status=""
+  local best_sectors_found=0
+  local best_sectors_total=0
+  local best_sort_key=0
+
+  while IFS='|' read -r message session_hash percent status flux_status sectors_found sectors_total sort_key hash_prefix dir; do
+    if [[ "$message" != "$prev_message" ]]; then
+      # New disk - output previous best if exists
+      if [[ -n "$prev_message" ]]; then
+        # Rebuild line with final attempt count and flux status
+        local display_flux="NEED"
+        [[ "$has_any_flux" == "true" ]] && display_flux="FLUX"
+        [[ "$best_status" == "success" ]] && display_flux="    "
+        printf "%d|%s | %d | %-7s | %-4s | %4d/%4d (%3d%%) | %s\n" \
+          "$best_sort_key" "$best_hash_prefix" "$attempt_count" "$best_status" "$display_flux" \
+          "$best_sectors_found" "$best_sectors_total" "$best_percent" "$prev_message" \
+          >> "$temp_file"
+      fi
+
+      # Reset for new disk
+      prev_message="$message"
+      best_percent=$percent
+      best_hash_prefix="$hash_prefix"
+      best_status="$status"
+      best_sectors_found=$sectors_found
+      best_sectors_total=$sectors_total
+      best_sort_key=$sort_key
+      attempt_count=1
+      has_any_flux=false
+      [[ "$flux_status" == "FLUX" ]] && has_any_flux=true
+    else
+      # Same disk - another attempt
+      attempt_count=$((attempt_count + 1))
+      [[ "$flux_status" == "FLUX" ]] && has_any_flux=true
+
+      # Update best if this is better (compare sectors_found, not percent)
+      if [[ $sectors_found -gt $best_sectors_found ]]; then
+        best_percent=$percent
+        best_hash_prefix="$hash_prefix"
+        best_status="$status"
+        best_sectors_found=$sectors_found
+        best_sectors_total=$sectors_total
+        best_sort_key=$sort_key
+      fi
+    fi
+  done < <(sort -t'|' -k1,1 "$temp_index")
+
+  # Output final best (last disk in list)
+  if [[ -n "$prev_message" ]]; then
+    local display_flux="NEED"
+    [[ "$has_any_flux" == "true" ]] && display_flux="FLUX"
+    [[ "$best_status" == "success" ]] && display_flux="    "
+    printf "%d|%s | %d | %-7s | %-4s | %4d/%4d (%3d%%) | %s\n" \
+      "$best_sort_key" "$best_hash_prefix" "$attempt_count" "$best_status" "$display_flux" \
+      "$best_sectors_found" "$best_sectors_total" "$best_percent" "$prev_message" \
+      >> "$temp_file"
+  fi
+
+  # Count totals by status and flux BEFORE removing temp file
+  local total=$(wc -l < "$temp_file" 2>/dev/null || echo "0")
+  local need_flux=$(grep -c "| NEED |" "$temp_file" 2>/dev/null || echo "0")
+  local has_flux=$(grep -c "| FLUX |" "$temp_file" 2>/dev/null || echo "0")
 
   # Sort and display (failed first, then partial, then success)
   sort -t'|' -k1,1n "$temp_file" | cut -d'|' -f2-
-  rm -f "$temp_file"
+  rm -f "$temp_file" "$temp_index"
 
-  # Count totals
-  local total=$(find "$DISK_ROOT" -name metadata.json 2>/dev/null | wc -l)
   echo ""
-  echo "Total disks: $total"
+  echo "Total disks: $total | Need flux: $need_flux | Has flux: $has_flux"
 }
 
 # ---------- argparse ----------
