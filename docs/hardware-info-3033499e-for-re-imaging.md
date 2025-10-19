@@ -54,10 +54,15 @@ Sample paths from enumeration:
 **Identification procedure:**
 
 1. **Connect candidate drive** in external USB housing
-2. **Run identification script**:
+2. **Run identification script** (auto-detects from dmesg):
    ```bash
-   sudo bin/identify-drive-by-hash.sh /dev/sdX
+   sudo bin/identify-drive-by-hash.sh
    ```
+   - Script detects recently connected drive from dmesg
+   - Shows dmesg output and detected device
+   - Prompts: "Identify this device? (Y/n)"
+   - Or specify device manually: `sudo bin/identify-drive-by-hash.sh /dev/sdX`
+
 3. **Watch for v1 hash match**: `3033499e89e2efe1f2057c571aeb793a`
 4. **Expected characteristics** (for reference):
    - **Size**: ~300GB (283GB of data)
