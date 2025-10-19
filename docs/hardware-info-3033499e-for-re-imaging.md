@@ -118,26 +118,48 @@ SELECT COUNT(*) FROM old_enum_3033499e;                        -- 0 rows (table 
 
 **Result**: Without finding and re-imaging the physical disk, 5+ million files are permanently lost.
 
-## Search Status (2025-10-18)
+## Search Status (2025-10-19)
 
-**Scanned drives (SATA via USB):** 18 drives scanned, NO MATCH
-- 5 small 2.5" drives (93-465GB)
-- 8 large 3.5" drives (279-3000GB)
-- None matched v1 hash `3033499e...`
+**CRITICAL DISCOVERY**: Hash `3033499e` is a PARTITION hash, not a whole-drive hash!
 
-**Remaining candidates:** 3 IDE/ATAPI drives, ~300GB each
-- Located but not yet scanned (requires IDE controller card installation)
-- Scanning requires machine power-down for each drive swap
-- **Expected disk size**: 300-500GB physical drive (contains ~283GB data)
-- **Expected filesystem**: HFS+ (Mac OS Extended)
-- **Expected label**: Related to "xt's MacBook Pro" or "Time Machine"
+**Evidence**:
+- Manual mount point `/mnt/tmp3` (not standard `/mnt/ntt/[hash]` pattern)
+- Enumerated Oct 2, 2025 from manually mounted partition
+- All whole-drive scans found no match because we hashed drives, not partitions
 
-**Next step:** Power down, install IDE card, scan the 3 IDE/ATAPI 300GB drives using `bin/identify-drive-by-hash.sh`
+**Scanned drives:** 21 total (18 SATA via USB + 3 IDE/ATAPI)
+- None matched when hashing WHOLE DRIVES
+- But `3033499e` is a PARTITION hash - need to check partitions in IMG files
 
-**If none of the 3 IDE drives match:**
-- Data is permanently lost (5+ million files unrecoverable)
-- Update medium record to document final search attempt
-- Mark raw file for archival/deletion
+**Candidate drives with HFS+ partitions (250-500GB range) - IMG files available:**
+
+1. **ST3300631AS** (Serial: 5NF1EW1Q) - 279GB
+   - medium_hash: `94e154e3b3095a3b2b9cea9cf3c15bed`
+   - Partition: HFS+ 279GB labeled "bigpig"
+   - IMG: `/data/fast/img/94e154e3b3095a3b2b9cea9cf3c15bed.img`
+
+2. **ST3400633AS** (Serial: 3NF1QT4B) - 372GB
+   - medium_hash: `5cb0dafa977e17bf7e5f8f54a32690cd`
+   - Partition: HFS+ 372GB labeled "Untitled 1"
+   - IMG: `/data/fast/img/5cb0dafa977e17bf7e5f8f54a32690cd.img`
+
+3. **Maxtor 6H400F0** (Serial: H80R4WPH) - 372GB
+   - medium_hash: `b5bc63f6e7ed181f3ca876fefb69cf69`
+   - Partition: HFS+ 372GB labeled "Untitled 1"
+   - IMG: `/data/fast/img/b5bc63f6e7ed181f3ca876fefb69cf69.img`
+
+**Other drives checked (no IMG available):**
+
+4. **Hitachi HTS545050B9A300** (Serial: 090713PB4400Q7HB7ASG) - 465GB
+   - v2 hash: `d6c63baf2ab797fbb7cc8a744d01e861`
+   - Partition: HFS+ 465GB labeled "Time Machine Backups"
+   - Status: Unreadable/damaged - not processed
+
+5. **Hitachi HTS545050B9A300** (Serial: 090713PB4400Q7HB2E2G) - 465GB
+   - v0 hash: `488de202f73bd976de4e7048f4e1f39a`
+   - No HFS+ partition - not a candidate
+
+**Next step:** Mount IMG files as loopback devices and hash partitions to find which contains 3033499e partition
 
 ## Re-Imaging Procedure (when disk is found)
 
