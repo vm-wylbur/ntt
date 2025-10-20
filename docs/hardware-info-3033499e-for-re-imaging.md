@@ -131,22 +131,27 @@ SELECT COUNT(*) FROM old_enum_3033499e;                        -- 0 rows (table 
 - None matched when hashing WHOLE DRIVES
 - But `3033499e` is a PARTITION hash - need to check partitions in IMG files
 
-**Candidate drives with HFS+ partitions (250-500GB range) - IMG files available:**
+**Candidate drives with HFS+ partitions (250-500GB range) - Checked 2025-10-19:**
 
-1. **ST3300631AS** (Serial: 5NF1EW1Q) - 279GB
+1. **ST3300631AS** (Serial: 5NF1EW1Q) - 279GB - ❌ NO MATCH
    - medium_hash: `94e154e3b3095a3b2b9cea9cf3c15bed`
-   - Partition: HFS+ 279GB labeled "bigpig"
-   - IMG: `/data/fast/img/94e154e3b3095a3b2b9cea9cf3c15bed.img`
+   - Partition 1: HFS+ 279GB labeled "bigpig"
+   - Partition v0: af658aff300ee0e1056521e9b629325f
+   - Partition v1: fa7d0d6d34427b180628ee286b0195fc
+   - IMG: `/data/cold/img-read/94e154e3b3095a3b2b9cea9cf3c15bed.tar.zst`
 
-2. **ST3400633AS** (Serial: 3NF1QT4B) - 372GB
+2. **ST3400633AS** (Serial: 3NF1QT4B) - 372GB - ❌ NO MATCH
    - medium_hash: `5cb0dafa977e17bf7e5f8f54a32690cd`
-   - Partition: HFS+ 372GB labeled "Untitled 1"
-   - IMG: `/data/fast/img/5cb0dafa977e17bf7e5f8f54a32690cd.img`
+   - Partition 1: EFI 200M - v0: 8d72b7b2, v1: 75cb74e9
+   - Partition 2: HFS+ 372.3GB labeled "Untitled 1" - v0: b23d61c7, v1: ef541724
+   - IMG: `/data/cold/img-read/5cb0dafa977e17bf7e5f8f54a32690cd.tar.zst`
 
-3. **Maxtor 6H400F0** (Serial: H80R4WPH) - 372GB
+3. **Maxtor 6H400F0** (Serial: H80R4WPH) - 372GB - ❌ NO MATCH
    - medium_hash: `b5bc63f6e7ed181f3ca876fefb69cf69`
-   - Partition: HFS+ 372GB labeled "Untitled 1"
-   - IMG: `/data/fast/img/b5bc63f6e7ed181f3ca876fefb69cf69.img`
+   - Partition 1: HFS+ 372.6GB labeled "Untitled 1"
+   - Partition v0: b5bc63f6e7ed181f3ca876fefb69cf69 (matches whole-drive)
+   - Partition v1: 8f40c468519d06b28a808fd70707257a
+   - IMG: `/data/cold/img-read/b5bc63f6e7ed181f3ca876fefb69cf69.tar.zst`
 
 **Other drives checked (no IMG available):**
 
@@ -159,7 +164,9 @@ SELECT COUNT(*) FROM old_enum_3033499e;                        -- 0 rows (table 
    - v0 hash: `488de202f73bd976de4e7048f4e1f39a`
    - No HFS+ partition - not a candidate
 
-**Next step:** Mount IMG files as loopback devices and hash partitions to find which contains 3033499e partition
+**STATUS:** All HFS+ candidates in 250-500GB range checked - NO MATCH FOUND.
+
+**Next steps:** Expand search criteria - check other size ranges, filesystem types, or investigate manual enumeration history.
 
 ## Re-Imaging Procedure (when disk is found)
 
@@ -219,10 +226,82 @@ SELECT COUNT(*) FROM old_enum_3033499e;                        -- 0 rows (table 
 - **Drive identification log**: All candidate drive scans logged to `/var/log/ntt/drive-identification.jsonl`
 - **Search priority**: HIGH - only 3 IDE drives remain as candidates, must check them
 
+## RESOLUTION (2025-10-20) - HASH WAS WRONG, DATA FOUND IN DATABASE
+
+**STATUS: RESOLVED - NO RE-IMAGING NEEDED**
+
+### Final Discovery
+
+After exhaustive drive searching failed, we built a materialized view search system (`path_search`) to search the database for files from the 3033499e raw enumeration. **Result: ALL FILES FOUND IN DATABASE.**
+
+**The hash `3033499e89e2efe1f2057c571aeb793a` was INCORRECT** (likely typo or data corruption in filename).
+
+### Database Search Results
+
+Using the `path_search` materialized view (see `docs/path-search-solution.md`), we tested:
+
+1. **10,000 filename sample**: 100% found in database (0 orphaned)
+2. **1,793,021 parent_filename patterns**: 100% found in database
+
+**Two medium_hashes both contain 100% of the partition's files:**
+- `d9549175fb3638efbc919bdc01cb3310`: 5,880,473 paths (100%)
+- `cff53715105387e3c20b6c2e4d7f305f`: 5,880,473 paths (100%)
+
+### Root Cause Analysis
+
+Investigation revealed these are **the SAME partition enumerated TWICE at different mount points**:
+
+```sql
+-- Sample paths show different mount points:
+-- d9549175: /mnt/ntt/d9549175fb3638efbc919bdc01cb3310/.HFS+ Private Directory Data...
+-- cff53715: /mnt/ntt-partition3/.HFS+ Private Directory Data...
+```
+
+**Timeline:**
+1. Partition mounted at `/mnt/ntt-partition3/` → hash `cff53715...`
+2. Same partition mounted at `/mnt/ntt/d9549175.../` → hash `d9549175...`
+3. Manual mount at `/mnt/tmp3/` created raw file with WRONG hash `3033499e...`
+
+Since NTT hash includes mount path, different mount points = different hashes for identical content.
+
+### Database Status - CORRECTED
+
+```sql
+-- ACTUAL database state (not orphaned):
+SELECT COUNT(*) FROM path WHERE medium_hash = 'd9549175fb3638efbc919bdc01cb3310';
+-- Result: 5,880,473 rows
+
+SELECT COUNT(*) FROM path WHERE medium_hash = 'cff53715105387e3c20b6c2e4d7f305f';
+-- Result: 5,880,473 rows
+
+-- Both hashes have:
+- enum_done: TRUE
+- Full database records in inode/path tables
+- Ready for copying/archiving
+```
+
+### Recommendations
+
+1. **Use correct hash**: `d9549175fb3638efbc919bdc01cb3310` OR `cff53715105387e3c20b6c2e4d7f305f`
+2. **Remove duplicate**: Consider removing one partition to avoid double-processing
+3. **Delete incorrect raw file**: `/data/fast/raw/3033499e89e2efe1f2057c571aeb793a.raw` (no longer needed)
+4. **Archive medium record**: Update `medium_hash = '3033499e...'` record to note it was an incorrect hash
+
+### Technical Achievement
+
+This investigation led to building a production-ready search system:
+- **path_search materialized view**: 205M rows, 119GB storage
+- **Query performance**: 1ms for single filename (vs 12+ seconds on partitioned table)
+- **12,000x speedup** over partition scanning approaches
+- **Reusable** for future orphaned media searches
+
+See complete technical documentation: `docs/path-search-solution.md`
+
 ## References
 
+- **RESOLUTION**: `docs/path-search-solution.md` - Materialized view search system and final findings
 - Investigation session: `docs/sessions/orphaned-raw-investigation-2025-10-18.md`
-- Raw file preserved at: `/data/fast/raw/3033499e89e2efe1f2057c571aeb793a.raw`
+- Raw file (incorrect hash): `/data/fast/raw/3033499e89e2efe1f2057c571aeb793a.raw`
 - Hash format documentation: `docs/hash-format.md`
 - Identification script: `bin/identify-drive-by-hash.sh`
 - Identification log: `/var/log/ntt/drive-identification.jsonl`
