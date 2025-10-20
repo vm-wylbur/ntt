@@ -1,25 +1,30 @@
-# Deprecated Scripts
+# Deprecated Backup Scripts
 
-These scripts are superseded and kept for historical reference only.
+These scripts have been replaced by `ntt-backup-remote-scp-nocontrol`.
 
-## ntt-loader-old (176 lines)
-**Deprecated:** 2025-10-11
-**Reason:** Pre-partitioning architecture, replaced by ntt-loader
-**Superseded by:** bin/ntt-loader
+## Deprecated Scripts
 
-## ntt-loader-partitioned (200 lines)
-**Deprecated:** 2025-10-11
-**Reason:** Functionality merged into ntt-loader
-**Superseded by:** bin/ntt-loader
+### ntt-backup-remote
+- **Method:** rsync
+- **Performance:** 9.2 MB/s
+- **Reason for deprecation:** 16% slower than tar streaming
+- **Date deprecated:** 2025-10-18
 
-## ntt-loader-detach (325 lines)
-**Deprecated:** 2025-10-11
-**Reason:** Experimental DETACH/ATTACH pattern incompatible with parent-level foreign keys
-**Issue:** See docs/lessons/partition-migration-postmortem-2025-10-05.md
-**Superseded by:** bin/ntt-loader (uses standard partition operations)
+### ntt-backup-remote-scp  
+- **Method:** tar streaming with SSH ControlMaster
+- **Performance:** Not fully tested
+- **Reason for deprecation:** Unnecessary complexity, ControlMaster doesn't improve performance
+- **Date deprecated:** 2025-10-18
 
----
+### ntt-backup-remote-wrapper.sh
+- **Method:** Bash wrapper calling ntt-backup-remote (rsync)
+- **Performance:** 9.2 MB/s
+- **Reason for deprecation:** Wraps deprecated rsync implementation
+- **Date deprecated:** 2025-10-18
 
-**Do not use these scripts in production.**
+## Active Script
 
-If you need to reference historical loader implementations, these files are preserved here.
+**ntt-backup-remote-scp-nocontrol** - tar streaming without ControlMaster
+- Performance: 10.7 MB/s (89% of network ceiling)
+- Simple, reliable, well-tested
+- Error handling fixed 2025-10-18
