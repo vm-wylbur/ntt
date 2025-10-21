@@ -11,7 +11,8 @@ ntt/bugs/BUG-021-orchestrator-health-calculation-wrong-031a3ceb.md
 
 **Filed:** 2025-10-20 19:30
 **Filed by:** prox-claude
-**Status:** open
+**Status:** RESOLVED ✓
+**Verified:** 2025-10-20 20:14
 **Affected media:** 031a3ceb (031a3ceb158fb23993c16de83fca6833)
 **Phase:** mount
 
@@ -147,3 +148,111 @@ According to ntt-imager exit codes and thresholds:
 - Only 1 bad sector (512 bytes)
 - 10 read errors over 373GB = 0.0000027% error rate
 - This is excellent recovery quality
+
+---
+
+## Dev Notes
+
+**Investigation:** 2025-10-20
+
+Analyzed `bin/ntt-orchestrator` health calculation workflow. Found that `handle_image_mode` (called when using `--image` flag) never calculates health from the mapfile, while `handle_device_mode` does.
+
+**Root cause:**
+
+1. `handle_image_mode` (line 1400) inserts medium with hardcoded health="ok"
+2. For existing media, the ON CONFLICT clause (lines 1123-1125) only updates `message` and `diagnostics` - NOT `health`
+3. Medium 031a3ceb already existed in database with stale health="failed" from a previous run
+4. The stale health value persists, causing `stage_mount` (line 675) to refuse mounting
+5. `update_health_from_mapfile` is only called in `handle_device_mode` (line 1180), not in `handle_image_mode`
+
+**Verified mapfile parsing works correctly:**
+- rescued: 400,088,456,704 bytes
+- total: 400,088,457,216 bytes
+- percentage: 99.9999998720%
+- Should calculate as "incomplete" (>=90% but <100%)
+
+**Changes made:**
+
+- `bin/ntt-orchestrator:1403-1407` - Added health calculation from mapfile in `handle_image_mode`
+  - Constructs MAP path from image_path
+  - Calls `update_health_from_mapfile` if mapfile exists
+  - Now matches behavior of `handle_device_mode`
+
+**Testing performed:**
+
+Code review confirms fix addresses root cause. The health calculation logic is already tested and working in `handle_device_mode` - we're simply calling it from the correct location in `handle_image_mode`.
+
+**Ready for testing:** 2025-10-20 (awaiting prox-claude verification)
+
+---
+
+## Verification Results
+
+**Test date:** 2025-10-20 20:14
+**Tested by:** prox-claude
+
+### Test Run
+
+```bash
+sudo bin/ntt-orchestrator --image /data/fast/img/031a3ceb158fb23993c16de83fca6833.img --force
+```
+
+**Output:**
+```
+[2025-10-20T20:14:33-07:00] Updating health: 99.99% rescued → health=incomplete
+[2025-10-20T20:14:33-07:00] === STATE-BASED PIPELINE START ===
+[2025-10-20T20:14:33-07:00] STAGE: Mount
+[2025-10-20T20:14:33-07:00] WARNING: Mounting with health=incomplete (degraded media, expect errors)
+[2025-10-20T20:14:33-07:00] Mounting /data/fast/img/031a3ceb158fb23993c16de83fca6833.img
+[2025-10-20T20:14:33-07:00] ERROR: Mount failed
+```
+
+### Success Criteria - All Met ✓
+
+- [x] Health calculated as "incomplete" (NOT "failed") for 99.99% recovery
+- [x] Orchestrator allows mount to proceed (not blocked by health check)
+- [x] Mount attempt made (failed due to different reason - see below)
+- [x] No false "health=failed" errors for images with >95% recovery
+
+### Mount Failure Analysis
+
+Mount failed but NOT due to health calculation bug. Investigation revealed:
+
+**Partition 2 analysis:**
+- `blkid` reports no TYPE (only PARTUUID)
+- `file -s` misidentifies as "SIMH tape data"
+- Direct mount attempt fails: "wrong fs type, bad option, bad superblock"
+- Hexdump shows partition filled with 0x55 bytes (01010101 pattern)
+
+**Conclusion:** Partition 2 was **deliberately wiped** before imaging (0x55 is common wipe pattern). No filesystem exists to mount.
+
+**Bad sector location:**
+- Bad sector at 0x212E56BE00 (133.7GB into disk)
+- Partition 2 ends at ~8GB
+- Bad sector is in partition 7 (345.5G RAID partition), not partition 2
+
+**Partitions:**
+- p1: 94MB RAID (fd) - correctly skipped by mount-helper
+- p2: 7.5GB Linux (83) - **wiped, no filesystem**
+- p3: 973MB swap - not mountable
+- p5, p6, p7: RAID members (fd) - correctly skipped
+
+### Verdict
+
+**BUG-021 is RESOLVED.** The health calculation bug has been fixed:
+- Health now correctly calculated from mapfile in `handle_image_mode`
+- 99.99% recovery → health="incomplete" (correct)
+- Mount attempt proceeds without health check blocking
+
+The mount failure is expected - partition 2 contains no filesystem data (wiped with 0x55 pattern). This is NOT a bug in the orchestrator.
+
+**Database record to update:**
+```sql
+UPDATE medium
+SET problems = jsonb_build_object(
+  'mount_failed', true,
+  'reason', 'Partition 2 wiped (0x55 pattern), no filesystem',
+  'details', '99.99% imaging success, but p2 deliberately erased before imaging'
+)
+WHERE medium_hash = '031a3ceb158fb23993c16de83fca6833';
+```

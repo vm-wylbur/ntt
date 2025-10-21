@@ -1400,6 +1400,12 @@ handle_image_mode() {
   insert_medium "$medium_hash" "$medium_human" "ok" "$message" "$DIAGNOSTICS"
   psql_as_user "$DB_URL" -c "UPDATE medium SET image_path = '$image_path' WHERE medium_hash = '$medium_hash';" 2>/dev/null || true
 
+  # Update health based on mapfile (if exists)
+  MAP="${image_path%.img}.map"
+  if [[ -f "$MAP" ]]; then
+    update_health_from_mapfile "$medium_hash" "$MAP"
+  fi
+
   log medium_inserted "{\"medium_hash\":\"$medium_hash\",\"medium_human\":\"$medium_human\",\"mode\":\"image\"}"
 
   # Run state-based pipeline stages

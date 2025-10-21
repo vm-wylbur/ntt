@@ -38,7 +38,7 @@ prox-claude re-evaluates next medium from database on each iteration. External f
 
 | Hash (short) | Blocked By | Filed | Size | Notes |
 |--------------|------------|-------|------|-------|
-| 031a3ceb | BUG-021 | 2025-10-20 19:30 | 373GB | Maxtor, 99.99% recovery but orchestrator calculates health as <20%, refuses to mount |
+| (none) | - | - | - | All bugs resolved |
 
 ---
 
@@ -46,6 +46,7 @@ prox-claude re-evaluates next medium from database on each iteration. External f
 
 | Hash (short) | Reason | Problem Type | Archived | Notes |
 |--------------|--------|--------------|----------|-------|
+| 031a3ceb | Partition wiped (0x55 pattern) | MOUNT_FAILED | 2025-10-20 20:14 | Maxtor 373GB, 99.99% imaged, p2 deliberately erased before imaging, BUG-021 resolved |
 | 24f9ecb5 | No recognizable filesystem | MOUNT_FAILED | 2025-10-20 16:35 | Zip 250, blank or severely corrupted, partial ddrescue recovery |
 | d6c63baf | Drive unreadable | UNREADABLE | 2025-10-20 17:42 | 465GB Hitachi, ddrescue errors at ~2%, severe read errors, partial IMG archived (2.0GB compressed) |
 

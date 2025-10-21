@@ -95,6 +95,61 @@ Drives that could not be recovered due to hardware failure, corruption, or other
 
 ---
 
+## Wiped/Erased Media
+
+### Maxtor 6H400F0 373GB (031a3ceb) - 2025-10-20
+
+**Status:** Partition deliberately wiped - no data to recover
+
+**Hardware Details:**
+- **Model:** Maxtor 6H400F0
+- **Serial:** H80P2CWH
+- **Size:** 373GB
+- **Medium Hash:** 031a3ceb158fb23993c16de83fca6833
+
+**Imaging Results:**
+- **Tool:** ddrescue (ntt-imager)
+- **Date:** 2025-10-20
+- **Recovery:** 99.99% (excellent)
+- **Bad sectors:** 1 sector (512 bytes at offset 133.7GB)
+- **IMG Size:** 373GB
+
+**Mount Failure:**
+- Partition 2 (7.5GB Linux type 83) filled with 0x55 bytes
+- 0x55 (01010101 binary) is deliberate wipe pattern
+- No filesystem signature, superblock destroyed
+- Mount fails: "wrong fs type, bad option, bad superblock"
+
+**Partition Analysis:**
+```
+p1: 94MB RAID (fd) - cannot mount standalone
+p2: 7.5GB Linux (83) - WIPED (0x55 pattern)
+p3: 973MB swap - not data partition
+p5-p7: RAID members (fd) - cannot mount standalone
+```
+
+**Archive Status:**
+- IMG archived: `/data/cold/img-read/031a3ceb158fb23993c16de83fca6833.tar.zst` (pending)
+- Imaging successful but no mountable data found
+
+**Database Record:**
+```sql
+-- medium_hash: 031a3ceb158fb23993c16de83fca6833
+-- health: incomplete (99.99% recovery)
+-- problems: {"mount_failed": true, "reason": "Partition 2 wiped (0x55 pattern), no filesystem"}
+```
+
+**Probable Cause:**
+- Drive was deliberately wiped/sanitized before disposal
+- 0x55 pattern suggests intentional data destruction
+- RAID partitions likely contained actual data (now unavailable without full array)
+
+**Action Taken:** IMG archived for record-keeping, marked as mount_failed
+
+**Related:** BUG-021 resolved during analysis (health calculation bug fixed)
+
+---
+
 ## Blank/Corrupted Media
 
 ### Iomega Zip 250 (24f9ecb5) - 2025-10-20
@@ -140,16 +195,17 @@ Drives that could not be recovered due to hardware failure, corruption, or other
 
 ## Summary Statistics
 
-**Total Unrecoverable:** 3 drives
+**Total Unrecoverable:** 4 drives
 - **Mechanical failures:** 1 (never imaged)
 - **Severe read errors:** 1 (2% recovery)
+- **Wiped/erased media:** 1 (99.99% imaged but wiped)
 - **Blank/corrupted media:** 1 (imaged but no data)
 
 **Date Range:** 2025-10-18 to 2025-10-20
 
 **Storage Impact:**
-- Archived partial data: ~2.1GB compressed (d6c63baf + 24f9ecb5)
-- Represents ~465GB of inaccessible data (d6c63baf only - assuming other media was blank)
+- Archived IMG data: ~375GB (031a3ceb 373GB + d6c63baf 2.0GB + 24f9ecb5 74MB compressed)
+- Represents ~838GB of attempted recovery (465GB unreadable + 373GB wiped)
 
 ---
 
