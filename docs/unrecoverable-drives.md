@@ -115,18 +115,27 @@ Drives that could not be recovered due to hardware failure, corruption, or other
 - **IMG Size:** 373GB
 
 **Mount Failure:**
-- Partition 2 (7.5GB Linux type 83) filled with 0x55 bytes
-- 0x55 (01010101 binary) is deliberate wipe pattern
-- No filesystem signature, superblock destroyed
+- All partitions filled with 0x55 bytes (01010101 binary = deliberate wipe pattern)
+- No filesystem signatures, superblocks destroyed
 - Mount fails: "wrong fs type, bad option, bad superblock"
 
 **Partition Analysis:**
 ```
-p1: 94MB RAID (fd) - cannot mount standalone
+p1: 94MB RAID1 (fd) - RAID metadata intact, filesystem wiped
+    └─ mdadm: "Microknoppix:0" array (Nov 2011)
+    └─ Assembled in degraded mode: 0x55 pattern throughout
 p2: 7.5GB Linux (83) - WIPED (0x55 pattern)
 p3: 973MB swap - not data partition
-p5-p7: RAID members (fd) - cannot mount standalone
+p5: 9.3GB RAID (fd) - RAID superblock destroyed, wiped
+p6: 9.3GB RAID (fd) - RAID superblock destroyed, wiped
+p7: 345.5GB RAID (fd) - RAID superblock destroyed, wiped
 ```
+
+**RAID Recovery Attempt:**
+- Tested mdadm degraded mode on p1 (RAID1 with 1 device)
+- Array assembled successfully, but contains only 0x55 pattern
+- p5-p7: mdadm reports "No md superblock detected" (destroyed)
+- Conclusion: Thorough sanitization - even RAID metadata mostly destroyed
 
 **Archive Status:**
 - IMG archived: `/data/cold/img-read/031a3ceb158fb23993c16de83fca6833.tar.zst` (pending)
@@ -136,13 +145,24 @@ p5-p7: RAID members (fd) - cannot mount standalone
 ```sql
 -- medium_hash: 031a3ceb158fb23993c16de83fca6833
 -- health: incomplete (99.99% recovery)
--- problems: {"mount_failed": true, "reason": "Partition 2 wiped (0x55 pattern), no filesystem"}
+-- problems: {
+--   "mount_failed": true,
+--   "reason": "All partitions wiped (0x55 pattern)",
+--   "details": "RAID1 metadata intact but filesystem wiped. p5-p7 RAID superblocks destroyed. Deliberate sanitization.",
+--   "raid_analysis": {
+--     "p1_raid1": "Microknoppix:0 array, metadata intact, data wiped",
+--     "p5_p6_p7": "RAID superblocks destroyed, data wiped",
+--     "tested": "mdadm degraded mode - no recoverable data"
+--   }
+-- }
 ```
 
 **Probable Cause:**
 - Drive was deliberately wiped/sanitized before disposal
-- 0x55 pattern suggests intentional data destruction
-- RAID partitions likely contained actual data (now unavailable without full array)
+- 0x55 pattern suggests intentional data destruction (common DoD 5220.22-M wipe pattern)
+- Thorough sanitization: destroyed RAID superblocks on p5-p7, wiped all filesystems
+- RAID1 on p1 preserved metadata but wiped filesystem
+- Likely part of secure decommissioning process before drive disposal
 
 **Action Taken:** IMG archived for record-keeping, marked as mount_failed
 
