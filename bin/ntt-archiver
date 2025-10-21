@@ -71,7 +71,7 @@ fail() {
 usage() {
   cat <<EOF
 Usage:
-  sudo $0 <medium_hash> [--force] [--verbose]
+  sudo $0 <medium_hash> [--force] [--verbose] [--floppy]
 
 Archives disk image files to cold storage after copying completes.
 
@@ -81,13 +81,19 @@ Arguments:
 Options:
   --force        Skip safety checks (copy completion, existing archive)
   --verbose      Show tar progress and detailed output
+  --floppy       Archive floppy disk (different source/destination)
 
 Archives:
-  Source: $IMAGE_ROOT/<hash>*
-  Destination: $ARCHIVE_ROOT/<hash>.tar.zst
+  Normal mode:
+    Source: $IMAGE_ROOT/<hash>*
+    Destination: $ARCHIVE_ROOT/<hash>.tar.zst
+
+  Floppy mode (--floppy):
+    Source: /data/fast/floppies/disks/<hash>/ (entire directory)
+    Destination: $ARCHIVE_ROOT/floppies/<hash>.tar.zst
 
 Safety checks (unless --force):
-  - All inodes must be copied
+  - All inodes must be copied (normal mode only)
   - Archive must not already exist
 
 Exit codes:
@@ -98,6 +104,7 @@ Exit codes:
 Examples:
   sudo $0 af1349b9f5f9a1a6a0404dea36dcc949
   sudo $0 af1349b9f5f9a1a6a0404dea36dcc949 --force
+  sudo $0 af1349b9f5f9a1a6a0404dea36dcc949 --floppy
 EOF
   exit 1
 }
@@ -108,6 +115,7 @@ EOF
 MEDIUM_HASH=""
 FORCE=false
 VERBOSE=false
+FLOPPY_MODE=false
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -117,6 +125,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --verbose)
       VERBOSE=true
+      shift
+      ;;
+    --floppy)
+      FLOPPY_MODE=true
       shift
       ;;
     -*)
@@ -144,37 +156,68 @@ fi
 
 # ---------- main ----------
 echo "[$(date -Iseconds)] Starting archive process for $MEDIUM_HASH" >&2
-log archive_start "{\"medium_hash\": \"$MEDIUM_HASH\", \"force\": $FORCE, \"verbose\": $VERBOSE}"
+log archive_start "{\"medium_hash\": \"$MEDIUM_HASH\", \"force\": $FORCE, \"verbose\": $VERBOSE, \"floppy\": $FLOPPY_MODE}"
 
-# Check if source files exist (try multiple locations)
-SEARCH_PATHS=("$IMAGE_ROOT" "/data/cold/img-unprocessed")
-SOURCE_FILES=()
-FOUND_IN=""
+# Check if source files exist
+if [[ "$FLOPPY_MODE" == "true" ]]; then
+  # Floppy mode: archive entire directory
+  FLOPPY_SOURCE_DIR="/data/fast/floppies/disks/${MEDIUM_HASH}"
 
-for search_path in "${SEARCH_PATHS[@]}"; do
-  CANDIDATES=("$search_path/${MEDIUM_HASH}"*)
-  if [[ -e "${CANDIDATES[0]}" ]]; then
-    SOURCE_FILES=("${CANDIDATES[@]}")
-    FOUND_IN="$search_path"
-    break
+  if [[ ! -d "$FLOPPY_SOURCE_DIR" ]]; then
+    fail "Floppy source directory not found: $FLOPPY_SOURCE_DIR"
   fi
-done
 
-if [[ ${#SOURCE_FILES[@]} -eq 0 ]]; then
-  fail "No source files found in: ${SEARCH_PATHS[*]} (pattern: ${MEDIUM_HASH}*)"
-fi
+  # Get all files in directory
+  SOURCE_FILES=("$FLOPPY_SOURCE_DIR"/*)
+  if [[ ! -e "${SOURCE_FILES[0]}" ]]; then
+    fail "No files found in floppy directory: $FLOPPY_SOURCE_DIR"
+  fi
 
-echo "[$(date -Iseconds)] Found source files in: $FOUND_IN" >&2
+  FOUND_IN="$(dirname "$FLOPPY_SOURCE_DIR")"
+  echo "[$(date -Iseconds)] Found floppy directory: $FLOPPY_SOURCE_DIR" >&2
 
-if [[ "$VERBOSE" == "true" ]]; then
-  echo "[$(date -Iseconds)] Found source files:" >&2
-  for f in "${SOURCE_FILES[@]}"; do
-    ls -lh "$f" >&2
+  if [[ "$VERBOSE" == "true" ]]; then
+    echo "[$(date -Iseconds)] Found files:" >&2
+    for f in "${SOURCE_FILES[@]}"; do
+      ls -lh "$f" >&2
+    done
+  fi
+else
+  # Normal mode: search for files with hash prefix
+  SEARCH_PATHS=("$IMAGE_ROOT" "/data/cold/img-unprocessed")
+  SOURCE_FILES=()
+  FOUND_IN=""
+
+  for search_path in "${SEARCH_PATHS[@]}"; do
+    CANDIDATES=("$search_path/${MEDIUM_HASH}"*)
+    if [[ -e "${CANDIDATES[0]}" ]]; then
+      SOURCE_FILES=("${CANDIDATES[@]}")
+      FOUND_IN="$search_path"
+      break
+    fi
   done
+
+  if [[ ${#SOURCE_FILES[@]} -eq 0 ]]; then
+    fail "No source files found in: ${SEARCH_PATHS[*]} (pattern: ${MEDIUM_HASH}*)"
+  fi
+
+  echo "[$(date -Iseconds)] Found source files in: $FOUND_IN" >&2
+
+  if [[ "$VERBOSE" == "true" ]]; then
+    echo "[$(date -Iseconds)] Found source files:" >&2
+    for f in "${SOURCE_FILES[@]}"; do
+      ls -lh "$f" >&2
+    done
+  fi
 fi
 
 # Check if archive already exists
-ARCHIVE_FILE="$ARCHIVE_ROOT/${MEDIUM_HASH}.tar.zst"
+if [[ "$FLOPPY_MODE" == "true" ]]; then
+  ARCHIVE_FILE="$ARCHIVE_ROOT/floppies/${MEDIUM_HASH}.tar.zst"
+  mkdir -p "$ARCHIVE_ROOT/floppies"
+else
+  ARCHIVE_FILE="$ARCHIVE_ROOT/${MEDIUM_HASH}.tar.zst"
+fi
 if [[ -f "$ARCHIVE_FILE" ]]; then
   if [[ "$FORCE" == "true" ]]; then
     echo "[$(date -Iseconds)] WARNING: Archive already exists, overwriting (--force)" >&2
@@ -186,8 +229,8 @@ if [[ -f "$ARCHIVE_FILE" ]]; then
   fi
 fi
 
-# Safety check: Verify all inodes are copied (unless --force)
-if [[ "$FORCE" == "false" ]]; then
+# Safety check: Verify all inodes are copied (unless --force or floppy mode)
+if [[ "$FORCE" == "false" ]] && [[ "$FLOPPY_MODE" == "false" ]]; then
   echo "[$(date -Iseconds)] Checking copy completion..." >&2
 
   COPY_STATUS=$(psql_as_user "$DB_URL" -tAc "
@@ -210,24 +253,36 @@ if [[ "$FORCE" == "false" ]]; then
     fail "Copy incomplete: $PENDING of $TOTAL inodes not copied (use --force to skip)"
   else
     echo "[$(date -Iseconds)] Copy complete: $COPIED of $TOTAL inodes copied" >&2
-    log copy_verified "{\"medium_hash\": \"$MEDIUM_HASH\", \"copied\": $COPIED, \"total\": $TOTAL}"
+    log copy_verified "{\"medium_hash\": \"$MEDIUM_HASH\", \"copied\": $COPIED, \"total\": $TOTAL, \"floppy\": false}"
   fi
+elif [[ "$FLOPPY_MODE" == "true" ]]; then
+  echo "[$(date -Iseconds)] Floppy mode: skipping inode copy verification" >&2
 fi
 
 # Create archive
 echo "[$(date -Iseconds)] Creating archive: $ARCHIVE_FILE" >&2
-log archive_create_start "{\"medium_hash\": \"$MEDIUM_HASH\", \"archive\": \"$ARCHIVE_FILE\"}"
+log archive_create_start "{\"medium_hash\": \"$MEDIUM_HASH\", \"archive\": \"$ARCHIVE_FILE\", \"floppy\": $FLOPPY_MODE}"
 
-TAR_OPTS="-C $FOUND_IN -c"
-if [[ "$VERBOSE" == "true" ]]; then
-  TAR_OPTS="$TAR_OPTS -v"
+if [[ "$FLOPPY_MODE" == "true" ]]; then
+  # Floppy mode: archive entire directory
+  TAR_OPTS="-C $FOUND_IN -c"
+  if [[ "$VERBOSE" == "true" ]]; then
+    TAR_OPTS="$TAR_OPTS -v"
+  fi
+  FILE_PATTERNS=("$MEDIUM_HASH")
+else
+  # Normal mode: archive individual files
+  TAR_OPTS="-C $FOUND_IN -c"
+  if [[ "$VERBOSE" == "true" ]]; then
+    TAR_OPTS="$TAR_OPTS -v"
+  fi
+
+  # Build file list (just basenames, tar will handle them from -C directory)
+  FILE_PATTERNS=()
+  for f in "${SOURCE_FILES[@]}"; do
+    FILE_PATTERNS+=("$(basename "$f")")
+  done
 fi
-
-# Build file list (just basenames, tar will handle them from -C directory)
-FILE_PATTERNS=()
-for f in "${SOURCE_FILES[@]}"; do
-  FILE_PATTERNS+=("$(basename "$f")")
-done
 
 # Create archive with zstd compression
 if tar $TAR_OPTS "${FILE_PATTERNS[@]}" | zstd > "$ARCHIVE_FILE"; then
@@ -255,34 +310,51 @@ fi
 
 ARCHIVE_SIZE_HUMAN=$(stat -c%s "$ARCHIVE_FILE" | numfmt --to=iec-i --suffix=B 2>/dev/null || echo "${ARCHIVE_SIZE} bytes")
 echo "[$(date -Iseconds)] Archive verified: $ARCHIVE_SIZE_HUMAN" >&2
-log archive_verified "{\"medium_hash\": \"$MEDIUM_HASH\", \"archive\": \"$ARCHIVE_FILE\", \"size\": $ARCHIVE_SIZE}"
+log archive_verified "{\"medium_hash\": \"$MEDIUM_HASH\", \"archive\": \"$ARCHIVE_FILE\", \"size\": $ARCHIVE_SIZE, \"floppy\": $FLOPPY_MODE}"
 
 # Remove source files
-echo "[$(date -Iseconds)] Removing source files..." >&2
-log source_remove_start "{\"medium_hash\": \"$MEDIUM_HASH\", \"count\": ${#SOURCE_FILES[@]}}"
+if [[ "$FLOPPY_MODE" == "true" ]]; then
+  # Floppy mode: remove entire directory
+  echo "[$(date -Iseconds)] Removing floppy directory: $FLOPPY_SOURCE_DIR" >&2
+  log source_remove_start "{\"medium_hash\": \"$MEDIUM_HASH\", \"floppy\": true, \"directory\": \"$FLOPPY_SOURCE_DIR\"}"
 
-for f in "${SOURCE_FILES[@]}"; do
-  if [[ "$VERBOSE" == "true" ]]; then
-    echo "[$(date -Iseconds)]   Removing: $f" >&2
+  rm -rf "$FLOPPY_SOURCE_DIR"
+
+  # Verify directory is gone
+  if [[ -d "$FLOPPY_SOURCE_DIR" ]]; then
+    fail "Floppy directory removal failed: $FLOPPY_SOURCE_DIR still exists"
   fi
-  rm -f "$f"
-done
 
-# Verify source files are gone
-REMAINING_FILES=("$FOUND_IN/${MEDIUM_HASH}"*)
-if [[ -e "${REMAINING_FILES[0]}" ]]; then
-  echo "[$(date -Iseconds)] WARNING: Some source files still exist:" >&2
-  for f in "${REMAINING_FILES[@]}"; do
-    ls -lh "$f" >&2
+  echo "[$(date -Iseconds)] Floppy directory removed successfully" >&2
+  log source_removed "{\"medium_hash\": \"$MEDIUM_HASH\", \"floppy\": true}"
+else
+  # Normal mode: remove individual files
+  echo "[$(date -Iseconds)] Removing source files..." >&2
+  log source_remove_start "{\"medium_hash\": \"$MEDIUM_HASH\", \"count\": ${#SOURCE_FILES[@]}, \"floppy\": false}"
+
+  for f in "${SOURCE_FILES[@]}"; do
+    if [[ "$VERBOSE" == "true" ]]; then
+      echo "[$(date -Iseconds)]   Removing: $f" >&2
+    fi
+    rm -f "$f"
   done
-  fail "Source file removal verification failed"
-fi
 
-echo "[$(date -Iseconds)] Source files removed successfully" >&2
-log source_removed "{\"medium_hash\": \"$MEDIUM_HASH\"}"
+  # Verify source files are gone
+  REMAINING_FILES=("$FOUND_IN/${MEDIUM_HASH}"*)
+  if [[ -e "${REMAINING_FILES[0]}" ]]; then
+    echo "[$(date -Iseconds)] WARNING: Some source files still exist:" >&2
+    for f in "${REMAINING_FILES[@]}"; do
+      ls -lh "$f" >&2
+    done
+    fail "Source file removal verification failed"
+  fi
+
+  echo "[$(date -Iseconds)] Source files removed successfully" >&2
+  log source_removed "{\"medium_hash\": \"$MEDIUM_HASH\", \"floppy\": false}"
+fi
 
 # Success
 echo "[$(date -Iseconds)] Archive complete: $ARCHIVE_FILE ($ARCHIVE_SIZE_HUMAN)" >&2
-log archive_done "{\"medium_hash\": \"$MEDIUM_HASH\", \"archive\": \"$ARCHIVE_FILE\", \"size\": $ARCHIVE_SIZE, \"exit\": 0}"
+log archive_done "{\"medium_hash\": \"$MEDIUM_HASH\", \"archive\": \"$ARCHIVE_FILE\", \"size\": $ARCHIVE_SIZE, \"floppy\": $FLOPPY_MODE, \"exit\": 0}"
 
 exit 0

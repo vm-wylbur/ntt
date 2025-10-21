@@ -18,6 +18,7 @@ NTT_BIN="${NTT_BIN:-/home/pball/projects/ntt/bin}"
 CLEANUP_NEEDED=false
 MOUNT_POINT=""
 LOOP_DEVICE=""
+FLOPPY_SYMLINK_PATH=""  # Tracks symlink created in floppy mode
 
 # Cleanup trap for error handling
 cleanup() {
@@ -536,6 +537,66 @@ update_health_from_mapfile() {
   psql_as_user "$DB_URL" -c "UPDATE medium SET health = '$health' WHERE medium_hash = '$medium_hash';" 2>/dev/null || true
 }
 
+# ---------- cleanup functions ----------
+medium_exists_incomplete() {
+  local medium_hash="$1"
+
+  # Check if medium exists with incomplete state (enum_done=NULL or copy_done=NULL)
+  local incomplete=$(psql_as_user "$DB_URL" -tAc "
+    SELECT 1 FROM medium
+    WHERE medium_hash = '$medium_hash'
+    AND (enum_done IS NULL OR copy_done IS NULL)
+  " 2>/dev/null || echo "")
+
+  if [[ -n "$incomplete" ]]; then
+    return 0  # Medium exists and is incomplete
+  else
+    return 1  # Medium doesn't exist or is complete
+  fi
+}
+
+cleanup_incomplete_attempt() {
+  local medium_hash="$1"
+
+  echo "[$(date -Iseconds)] Cleaning up incomplete attempt for $medium_hash..." >&2
+
+  # Remove raw file if exists
+  local raw_file="$RAW_ROOT/${medium_hash}.raw"
+  if [[ -f "$raw_file" ]]; then
+    echo "[$(date -Iseconds)]   Removing raw file: $raw_file" >&2
+    rm -f "$raw_file"
+  fi
+
+  # Drop partition tables if they exist
+  local hash8="${medium_hash:0:8}"
+  local inode_table="inode_p_${hash8}"
+  local path_table="path_p_${hash8}"
+
+  # Check if tables exist and drop them
+  local table_exists=$(psql_as_user "$DB_URL" -tAc "
+    SELECT 1 FROM pg_tables
+    WHERE schemaname = 'public'
+    AND tablename IN ('$inode_table', '$path_table')
+  " 2>/dev/null || echo "")
+
+  if [[ -n "$table_exists" ]]; then
+    echo "[$(date -Iseconds)]   Dropping partition tables: ${inode_table}, ${path_table}" >&2
+    psql_as_user "$DB_URL" -c "DROP TABLE IF EXISTS ${inode_table} CASCADE;" 2>/dev/null || true
+    psql_as_user "$DB_URL" -c "DROP TABLE IF EXISTS ${path_table} CASCADE;" 2>/dev/null || true
+  fi
+
+  # Reset medium record (keep it but clear incomplete state)
+  echo "[$(date -Iseconds)]   Resetting medium record" >&2
+  psql_as_user "$DB_URL" -c "
+    UPDATE medium
+    SET enum_done = NULL, copy_done = NULL
+    WHERE medium_hash = '$medium_hash';
+  " 2>/dev/null || true
+
+  log cleanup_incomplete "{\"medium_hash\": \"$medium_hash\", \"raw_removed\": true, \"tables_dropped\": true}"
+  echo "[$(date -Iseconds)] Cleanup complete" >&2
+}
+
 # ---------- pipeline state functions ----------
 check_pipeline_state() {
   local medium_hash="$1"
@@ -910,15 +971,26 @@ stage_copy() {
           log archive_start "{\"medium_hash\": \"$medium_hash\"}"
           echo "[$(date -Iseconds)] Running archiver..." >&2
 
+          # Build archiver command with optional --floppy flag
+          archiver_cmd="$NTT_BIN/ntt-archiver"
           if $force; then
-            archiver_cmd="$NTT_BIN/ntt-archiver --force $medium_hash"
-          else
-            archiver_cmd="$NTT_BIN/ntt-archiver $medium_hash"
+            archiver_cmd="$archiver_cmd --force"
           fi
+          if [[ "$FLOPPY_MODE" == "true" ]]; then
+            archiver_cmd="$archiver_cmd --floppy"
+          fi
+          archiver_cmd="$archiver_cmd $medium_hash"
 
           if $archiver_cmd; then
             log archive_success "{\"medium_hash\": \"$medium_hash\"}"
             echo "[$(date -Iseconds)] Archive stage: SUCCESS" >&2
+
+            # If floppy mode, remove symlink after successful archive
+            if [[ -n "$FLOPPY_SYMLINK_PATH" ]]; then
+              echo "[$(date -Iseconds)] FLOPPY MODE: Removing symlink $FLOPPY_SYMLINK_PATH" >&2
+              rm -f "$FLOPPY_SYMLINK_PATH"
+              FLOPPY_SYMLINK_PATH=""
+            fi
             return 0
           else
             echo "[$(date -Iseconds)] Archive stage: FAILED" >&2
@@ -1186,15 +1258,26 @@ handle_device_mode() {
             log archive_start "{\"medium_hash\": \"$medium_hash\"}"
             echo "[$(date -Iseconds)] Running archiver..." >&2
 
+            # Build archiver command with optional --floppy flag
+            archiver_cmd="$NTT_BIN/ntt-archiver"
             if $force; then
-              archiver_cmd="$NTT_BIN/ntt-archiver --force $medium_hash"
-            else
-              archiver_cmd="$NTT_BIN/ntt-archiver $medium_hash"
+              archiver_cmd="$archiver_cmd --force"
             fi
+            if [[ "$FLOPPY_MODE" == "true" ]]; then
+              archiver_cmd="$archiver_cmd --floppy"
+            fi
+            archiver_cmd="$archiver_cmd $medium_hash"
 
             if $archiver_cmd; then
               log archive_success "{\"medium_hash\": \"$medium_hash\"}"
               echo "[$(date -Iseconds)] Archive stage: SUCCESS" >&2
+
+              # If floppy mode and symlink was created, remove it
+              if [[ "$FLOPPY_MODE" == "true" ]] && [[ "$symlink_created" == "true" ]]; then
+                local symlink_path="$IMAGE_ROOT/${medium_hash}.img"
+                echo "[$(date -Iseconds)] FLOPPY MODE: Removing symlink $symlink_path" >&2
+                rm -f "$symlink_path"
+              fi
             else
               echo "[$(date -Iseconds)] Archive stage: FAILED" >&2
               log archive_error "{\"medium_hash\": \"$medium_hash\"}"
@@ -1274,13 +1357,43 @@ handle_image_mode() {
     rm -f "/tmp/ntt-image-diag-$$"
   fi
 
-  # Check if raw file already exists
+  check_duplicate "$medium_hash" "$force"
+
+  # Check for incomplete attempts and clean up if necessary (BEFORE raw file check)
+  if medium_exists_incomplete "$medium_hash"; then
+    if [[ "$FLOPPY_MODE" == "true" ]]; then
+      # Floppy mode: auto-cleanup (this is a one-time migration)
+      echo "[$(date -Iseconds)] Found incomplete attempt, auto-cleaning (floppy mode)..." >&2
+      cleanup_incomplete_attempt "$medium_hash"
+    else
+      # Normal mode: require explicit --force
+      if ! "$force"; then
+        echo "ERROR: Previous attempt left incomplete state for $medium_hash" >&2
+        echo "  - Raw file exists but enum/copy incomplete" >&2
+        echo "  - Use --force to cleanup and retry" >&2
+        echo "  - Or run: bin/ntt-cleanup $medium_hash" >&2
+        fail "Incomplete state detected (use --force)"
+      else
+        echo "[$(date -Iseconds)] Found incomplete attempt, cleaning up (--force)..." >&2
+        cleanup_incomplete_attempt "$medium_hash"
+      fi
+    fi
+  fi
+
+  # Check if raw file already exists (after cleanup)
   RAW="$RAW_ROOT/${medium_hash}.raw"
   if [[ -f "$RAW" ]] && ! "$force"; then
     fail "Raw file already exists: $RAW (use --force to overwrite)"
   fi
 
-  check_duplicate "$medium_hash" "$force"
+  # If floppy mode, create symlink before mounting
+  if [[ "$FLOPPY_MODE" == "true" ]]; then
+    FLOPPY_SYMLINK_PATH="$IMAGE_ROOT/${medium_hash}.img"
+    echo "[$(date -Iseconds)] FLOPPY MODE: Creating symlink $FLOPPY_SYMLINK_PATH → $image_path" >&2
+    ln -sf "$image_path" "$FLOPPY_SYMLINK_PATH"
+    # Use symlink path for mounting (stage_mount will use this from database)
+    image_path="$FLOPPY_SYMLINK_PATH"
+  fi
 
   # Insert medium record NOW with image_path (so stage_mount can find it)
   echo "[$(date -Iseconds)] Inserting medium record to database..." >&2
@@ -1302,8 +1415,53 @@ handle_image_mode() {
       echo "[$(date -Iseconds)] Mount stage: SKIPPED (already mounted)" >&2
     else
       echo "[$(date -Iseconds)] Mount stage: FAILED (cannot continue)" >&2
-      log pipeline_abort "{\"medium_hash\": \"$medium_hash\", \"failed_stage\": \"mount\"}"
-      return 1
+
+      # Floppy mode: archive flux/metadata even if mount fails
+      if [[ "$FLOPPY_MODE" == "true" ]]; then
+        echo "[$(date -Iseconds)] FLOPPY MODE: Mount failed, archiving flux/metadata without enum/copy" >&2
+
+        # Update medium record
+        psql_as_user "$DB_URL" -c "
+          UPDATE medium
+          SET health = 'failed',
+              message = 'Mount failed - disk corrupted, archiving flux/metadata only'
+          WHERE medium_hash = '$medium_hash';
+        " 2>/dev/null || true
+
+        log floppy_mount_failed "{\"medium_hash\": \"$medium_hash\", \"action\": \"archive_flux_only\"}"
+
+        # Run archiver to preserve flux/metadata
+        echo "[$(date -Iseconds)] Running archiver for failed disk..." >&2
+        archiver_cmd="$NTT_BIN/ntt-archiver --floppy"
+        if $force; then
+          archiver_cmd="$archiver_cmd --force"
+        fi
+        archiver_cmd="$archiver_cmd $medium_hash"
+
+        if $archiver_cmd; then
+          log archive_success "{\"medium_hash\": \"$medium_hash\", \"floppy\": true, \"mount_failed\": true}"
+          echo "[$(date -Iseconds)] Archive stage: SUCCESS (flux/metadata only)" >&2
+
+          # Remove symlink
+          if [[ -n "$FLOPPY_SYMLINK_PATH" ]]; then
+            echo "[$(date -Iseconds)] FLOPPY MODE: Removing symlink $FLOPPY_SYMLINK_PATH" >&2
+            rm -f "$FLOPPY_SYMLINK_PATH"
+            FLOPPY_SYMLINK_PATH=""
+          fi
+
+          echo "[$(date -Iseconds)] === PIPELINE COMPLETE (mount failed, archived flux) ===" >&2
+          log pipeline_complete "{\"medium_hash\": \"$medium_hash\", \"mode\": \"floppy_failed_mount\"}"
+          return 0
+        else
+          echo "[$(date -Iseconds)] Archive stage: FAILED" >&2
+          log archive_error "{\"medium_hash\": \"$medium_hash\", \"floppy\": true}"
+          return 1
+        fi
+      else
+        # Normal mode: mount failure is fatal
+        log pipeline_abort "{\"medium_hash\": \"$medium_hash\", \"failed_stage\": \"mount\"}"
+        return 1
+      fi
     fi
   fi
 
@@ -1368,15 +1526,26 @@ handle_image_mode() {
             log archive_start "{\"medium_hash\": \"$medium_hash\"}"
             echo "[$(date -Iseconds)] Running archiver..." >&2
 
+            # Build archiver command with optional --floppy flag
+            archiver_cmd="$NTT_BIN/ntt-archiver"
             if $force; then
-              archiver_cmd="$NTT_BIN/ntt-archiver --force $medium_hash"
-            else
-              archiver_cmd="$NTT_BIN/ntt-archiver $medium_hash"
+              archiver_cmd="$archiver_cmd --force"
             fi
+            if [[ "$FLOPPY_MODE" == "true" ]]; then
+              archiver_cmd="$archiver_cmd --floppy"
+            fi
+            archiver_cmd="$archiver_cmd $medium_hash"
 
             if $archiver_cmd; then
               log archive_success "{\"medium_hash\": \"$medium_hash\"}"
               echo "[$(date -Iseconds)] Archive stage: SUCCESS" >&2
+
+              # If floppy mode and symlink was created, remove it
+              if [[ "$FLOPPY_MODE" == "true" ]] && [[ "$symlink_created" == "true" ]]; then
+                local symlink_path="$IMAGE_ROOT/${medium_hash}.img"
+                echo "[$(date -Iseconds)] FLOPPY MODE: Removing symlink $symlink_path" >&2
+                rm -f "$symlink_path"
+              fi
             else
               echo "[$(date -Iseconds)] Archive stage: FAILED" >&2
               log archive_error "{\"medium_hash\": \"$medium_hash\"}"
@@ -1394,6 +1563,33 @@ handle_image_mode() {
     fi
   else
     echo "[$(date -Iseconds)] Copy stage: SKIPPED (no inodes to copy)" >&2
+
+    # Floppy mode: archive even if there are no inodes (load failed)
+    if [[ "$FLOPPY_MODE" == "true" ]]; then
+      echo "[$(date -Iseconds)] FLOPPY MODE: No inodes to copy, archiving flux/metadata anyway" >&2
+      psql_as_user "$DB_URL" -c "UPDATE medium SET health = 'failed', message = 'Load failed - no inodes, archiving flux/metadata only' WHERE medium_hash = '$medium_hash';" 2>/dev/null || true
+
+      # Run archiver
+      echo "[$(date -Iseconds)] Running archiver..." >&2
+      archiver_cmd="$NTT_BIN/ntt-archiver --floppy"
+      if $force; then archiver_cmd="$archiver_cmd --force"; fi
+      archiver_cmd="$archiver_cmd $medium_hash"
+
+      if $archiver_cmd; then
+        log archive_success "{\"medium_hash\": \"$medium_hash\", \"floppy\": true, \"no_inodes\": true}"
+        echo "[$(date -Iseconds)] Archive stage: SUCCESS (flux/metadata only)" >&2
+
+        # Remove symlink
+        if [[ -n "$FLOPPY_SYMLINK_PATH" ]]; then
+          echo "[$(date -Iseconds)] FLOPPY MODE: Removing symlink $FLOPPY_SYMLINK_PATH" >&2
+          rm -f "$FLOPPY_SYMLINK_PATH"
+          FLOPPY_SYMLINK_PATH=""
+        fi
+      else
+        echo "[$(date -Iseconds)] Archive stage: FAILED" >&2
+        log archive_error "{\"medium_hash\": \"$medium_hash\", \"floppy\": true}"
+      fi
+    fi
   fi
 
   echo "[$(date -Iseconds)] === PIPELINE COMPLETE ===" >&2
@@ -1476,9 +1672,11 @@ IMAGE_MODE=false
 IMAGE_FIRST=false
 FORCE=false
 ENUM_ONLY=false
+FLOPPY_MODE=false
 TARGET=""
 LOAD_ONLY_FILE=""
 IMAGE_FILE=""
+IMAGE_HASH=""
 USER_MESSAGE=""
 
 # Parse options first
@@ -1506,6 +1704,21 @@ while [[ $# -gt 0 ]]; do
         echo "Error: --image requires an image file path" >&2
         usage
       fi
+      ;;
+    --hash)
+      shift
+      # Next argument should be the hash
+      if [[ $# -ge 1 && "$1" != -* ]]; then
+        IMAGE_HASH="$1"
+        shift
+      else
+        echo "Error: --hash requires a hash value" >&2
+        usage
+      fi
+      ;;
+    --floppy)
+      FLOPPY_MODE=true
+      shift
       ;;
     --image-first)
       IMAGE_FIRST=true
@@ -1551,6 +1764,18 @@ done
 if [[ $# -gt 0 ]]; then
   echo "Extra arguments not allowed after target: $@" >&2
   usage
+fi
+
+# Handle --hash with --floppy
+if [[ -n "$IMAGE_HASH" ]]; then
+  if [[ "$FLOPPY_MODE" == true ]]; then
+    # Construct floppy image path from hash
+    IMAGE_FILE="/data/fast/floppies/disks/${IMAGE_HASH}/${IMAGE_HASH}.img"
+    IMAGE_MODE=true
+  else
+    echo "Error: --hash requires --floppy flag" >&2
+    usage
+  fi
 fi
 
 # Validate arguments
