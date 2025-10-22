@@ -178,6 +178,7 @@ stage_flux_capture() {
   # Single flux capture with multiple revolutions
   if gw read --drive="$drive" --revs="$FLUX_REVS" "$flux_path" 2>&1 | tee -a "$LOG_FILE" >&2; then
     log "Flux capture completed successfully"
+    log "Saved to: $flux_path"
   else
     log "WARNING: Flux capture failed"
   fi

@@ -1179,6 +1179,16 @@ handle_device_mode() {
   # Update health based on ddrescue results
   update_health_from_mapfile "$medium_hash" "$MAP"
 
+  # Eject Zip drives after imaging complete
+  if [[ "$MODEL" =~ ZIP ]]; then
+    echo "[$(date -Iseconds)] Detected Zip drive, ejecting $dev" >&2
+    if eject "$dev" >&2; then
+      log zip_eject "{\"medium_hash\":\"$medium_hash\",\"device\":\"$dev\",\"model\":\"$MODEL\"}"
+    else
+      echo "[$(date -Iseconds)] WARNING: Eject failed" >&2
+    fi
+  fi
+
   # Run state-based pipeline stages
   echo "[$(date -Iseconds)] === STATE-BASED PIPELINE START ===" >&2
   log pipeline_start "{\"medium_hash\": \"$medium_hash\"}"
