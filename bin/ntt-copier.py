@@ -937,13 +937,28 @@ class CopyWorker:
                     cur.execute("""
                         UPDATE inode SET copied = true, blobid = updates.blob_id,
                                          mime_type = COALESCE(updates.mime_type, inode.mime_type),
-                                         status = 'success'
+                                         status = 'success',
+                                         processed_at = NOW()
                         FROM unnest(%s::bigint[], %s::text[], %s::text[]) AS updates(id, blob_id, mime_type)
                         WHERE inode.id = updates.id
                           AND inode.medium_hash = %s
                     """, (success_ids, success_blob_ids, success_mime_types, self.medium_hash))
                     t3 = time.time()
                     logger.debug(f"TIMING: UPDATE inode (success): {t3-t2:.3f}s for {len(success_ids)} inodes")
+
+                    # Insert/update blobs table (grouped to handle duplicate blobids in batch)
+                    t_blobs_start = time.time()
+                    cur.execute("""
+                        INSERT INTO blobs (blobid, n_hardlinks)
+                        SELECT blobid, COUNT(*) as n_hardlinks
+                        FROM unnest(%s::text[]) AS t(blobid)
+                        WHERE blobid IS NOT NULL
+                        GROUP BY blobid
+                        ON CONFLICT (blobid) DO UPDATE
+                        SET n_hardlinks = blobs.n_hardlinks + EXCLUDED.n_hardlinks
+                    """, (success_blob_ids,))
+                    t_blobs_end = time.time()
+                    logger.debug(f"TIMING: INSERT blobs: {t_blobs_end-t_blobs_start:.3f}s for {len(success_blob_ids)} blobids")
 
                 # BUG-007: Update permanent failures with status and error_type
                 if permanent_failures:
