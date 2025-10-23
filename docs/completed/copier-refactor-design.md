@@ -471,7 +471,7 @@ sudo -E ntt-copier.py --limit=100 --workers=5
 ./setup_test_env.sh
 export PGPASSWORD='insecure_test_password'
 NTT_DB_URL='postgresql://copyjob_test_user@localhost/copyjob?options=-c search_path=copyjob_test' \
-NTT_ARCHIVE_ROOT=/tmp/copyjob_test/archive \
+NTT_ARCHIVED_ROOT=/tmp/copyjob_test/archive \
 NTT_BY_HASH_ROOT=/tmp/copyjob_test/by-hash \
 python ntt-copier.py --dry-run --limit=10 --workers=1
 ```

@@ -65,7 +65,7 @@ def construct_byhash_path(blobid: str, by_hash_root: Path) -> Path:
     """
     Construct by-hash path from blobid.
 
-    Structure: /data/cold/by-hash/XX/YY/FULLHASH
+    Structure: /data/fast/ntt/by-hash/XX/YY/FULLHASH
 
     Args:
         blobid: 64-char hex hash
@@ -126,7 +126,7 @@ def main(
     batch_size: int = typer.Option(10000, "--batch-size", "-b", help="Number of blobids to process per batch"),
     limit: int = typer.Option(0, "--limit", "-l", help="Limit total blobids to process (0 = unlimited)"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Detect MIME types but don't update database"),
-    by_hash_root: str = typer.Option("/data/cold/by-hash", "--by-hash-root", help="Root of by-hash directory"),
+    by_hash_root: str = typer.Option("/data/fast/ntt/by-hash", "--by-hash-root", help="Root of by-hash directory"),
     db_url: str = typer.Option("postgresql:///copyjob", "--db-url", help="Database connection URL"),
     workers: int = typer.Option(8, "--workers", "-w", help="Number of parallel workers for MIME detection"),
     profile: bool = typer.Option(False, "--profile", help="Enable cProfile profiling to /tmp/mime-backfill.prof"),

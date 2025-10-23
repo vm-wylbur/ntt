@@ -424,7 +424,7 @@ ntt-raw-tail file.raw [N]
 **Purpose:** One-off script to count hardlinks in by-hash storage
 **Usage:**
 ```bash
-oneoff-count-hardlinks.py /data/cold/by-hash
+oneoff-count-hardlinks.py /data/fast/ntt/by-hash
 ```
 
 **What it does:**
@@ -495,9 +495,9 @@ Most scripts use these environment variables:
 - `NTT_DB_URL` - PostgreSQL connection (default: `postgresql:///copyjob`)
 - `IMAGE_ROOT` - Disk image storage (default: `/data/fast/img`)
 - `RAW_ROOT` - .raw file storage (default: `/data/fast/raw`)
-- `BYHASH_ROOT` - By-hash storage (default: `/data/cold/by-hash`)
+- `BYHASH_ROOT` - By-hash storage (default: `/data/fast/ntt/by-hash`)
 - `ARCHIVE_ROOT` - Archive storage (default: `/data/cold/archives`)
-- `ARCHIVED_ROOT` - Hardlink archive storage (default: `/data/cold/archived`)
+- `ARCHIVED_ROOT` - Hardlink archive storage (default: `/data/fast/ntt/archived`)
 - `NTT_IGNORE_PATTERNS` - Path to ignore patterns file
 
 ---

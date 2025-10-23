@@ -106,7 +106,7 @@ class BackupWorker:
         self.db_url = db_url or os.environ.get('NTT_DB_URL', 'postgres:///copyjob')
 
         # Fixed paths
-        self.source_root = Path('/data/cold/by-hash')
+        self.source_root = Path('/data/fast/ntt/by-hash')
         self.dest_root = self.backup_root / 'by-hash'
 
         self.conn = None

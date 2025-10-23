@@ -110,7 +110,7 @@ class BackupWorker:
         self.hex_start, self.hex_end = self._calculate_hex_range()
 
         # Fixed paths for remote
-        self.source_root = Path('/data/cold/by-hash')
+        self.source_root = Path('/data/fast/ntt/by-hash')
         self.remote_host = REMOTE_HOST
         self.remote_path = REMOTE_PATH
         self.ssh_key = SSH_KEY

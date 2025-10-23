@@ -6,7 +6,7 @@
 --
 -- CONTEXT:
 -- Investigation on 2025-10-13 discovered 1,053,484 blobs (17.1%) present in
--- /data/cold/by-hash/ and in inode table but missing from blobs table.
+-- /data/fast/ntt/by-hash/ and in inode table but missing from blobs table.
 -- All files verified to exist on disk.
 --
 -- Root cause: blobs table is populated by ntt-copier.py during copy operations.

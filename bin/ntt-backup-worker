@@ -19,7 +19,7 @@ from datetime import datetime
 
 class BackupWorker:
     def __init__(self, batch_size=1000, progress_interval=60,
-                 db_url=None, source_root='/data/cold/by-hash',
+                 db_url=None, source_root='/data/fast/ntt/by-hash',
                  dest_root='/mnt/ntt-backup/by-hash',
                  log_file='/var/log/ntt/backup.jsonl'):
         self.batch_size = batch_size
@@ -251,8 +251,8 @@ def main():
                        help='Seconds between progress updates (default: 60)')
     parser.add_argument('--db-url', default=None,
                        help='Database URL (default: from NTT_DB_URL env)')
-    parser.add_argument('--source-root', default='/data/cold/by-hash',
-                       help='Source directory (default: /data/cold/by-hash)')
+    parser.add_argument('--source-root', default='/data/fast/ntt/by-hash',
+                       help='Source directory (default: /data/fast/ntt/by-hash)')
     parser.add_argument('--dest-root', default='/mnt/ntt-backup/by-hash',
                        help='Destination directory (default: /mnt/ntt-backup/by-hash)')
     parser.add_argument('--log-file', default='/var/log/ntt/backup.jsonl',
