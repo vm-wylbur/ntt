@@ -968,6 +968,12 @@ stage_copy() {
         # arch_response=${arch_response:-Y}
 
         # if [[ "$arch_response" =~ ^[Yy] ]]; then
+          # Unmount before archiving in floppy mode to prevent orphaned loop devices
+          if [[ "$FLOPPY_MODE" == "true" ]]; then
+            echo "[$(date -Iseconds)] FLOPPY MODE: Unmounting before archive" >&2
+            "$NTT_BIN/ntt-mount-helper" unmount "$medium_hash" 2>/dev/null || true
+          fi
+
           log archive_start "{\"medium_hash\": \"$medium_hash\"}"
           echo "[$(date -Iseconds)] Running archiver..." >&2
 
@@ -1046,14 +1052,24 @@ stage_copy() {
           # arch_response=${arch_response:-Y}
 
           # if [[ "$arch_response" =~ ^[Yy] ]]; then
+            # Unmount before archiving in floppy mode to prevent orphaned loop devices
+            if [[ "$FLOPPY_MODE" == "true" ]]; then
+              echo "[$(date -Iseconds)] FLOPPY MODE: Unmounting before archive" >&2
+              "$NTT_BIN/ntt-mount-helper" unmount "$medium_hash" 2>/dev/null || true
+            fi
+
             log archive_start "{\"medium_hash\": \"$medium_hash\"}"
             echo "[$(date -Iseconds)] Running archiver..." >&2
 
+            # Build archiver command with optional --floppy flag
+            archiver_cmd="$NTT_BIN/ntt-archiver"
             if $force; then
-              archiver_cmd="$NTT_BIN/ntt-archiver --force $medium_hash"
-            else
-              archiver_cmd="$NTT_BIN/ntt-archiver $medium_hash"
+              archiver_cmd="$archiver_cmd --force"
             fi
+            if [[ "$FLOPPY_MODE" == "true" ]]; then
+              archiver_cmd="$archiver_cmd --floppy"
+            fi
+            archiver_cmd="$archiver_cmd $medium_hash"
 
             if $archiver_cmd; then
               log archive_success "{\"medium_hash\": \"$medium_hash\"}"
@@ -1265,6 +1281,12 @@ handle_device_mode() {
           # arch_response=${arch_response:-Y}
 
           # if [[ "$arch_response" =~ ^[Yy] ]]; then
+            # Unmount before archiving in floppy mode to prevent orphaned loop devices
+            if [[ "$FLOPPY_MODE" == "true" ]]; then
+              echo "[$(date -Iseconds)] FLOPPY MODE: Unmounting before archive" >&2
+              "$NTT_BIN/ntt-mount-helper" unmount "$medium_hash" 2>/dev/null || true
+            fi
+
             log archive_start "{\"medium_hash\": \"$medium_hash\"}"
             echo "[$(date -Iseconds)] Running archiver..." >&2
 
@@ -1446,6 +1468,10 @@ handle_image_mode() {
 
         log floppy_mount_failed "{\"medium_hash\": \"$medium_hash\", \"action\": \"archive_flux_only\"}"
 
+        # Unmount before archiving (noop if mount failed, but ensures cleanup)
+        echo "[$(date -Iseconds)] FLOPPY MODE: Unmounting before archive" >&2
+        "$NTT_BIN/ntt-mount-helper" unmount "$medium_hash" 2>/dev/null || true
+
         # Run archiver to preserve flux/metadata
         echo "[$(date -Iseconds)] Running archiver for failed disk..." >&2
         archiver_cmd="$NTT_BIN/ntt-archiver --floppy"
@@ -1539,6 +1565,12 @@ handle_image_mode() {
           # arch_response=${arch_response:-Y}
 
           # if [[ "$arch_response" =~ ^[Yy] ]]; then
+            # Unmount before archiving in floppy mode to prevent orphaned loop devices
+            if [[ "$FLOPPY_MODE" == "true" ]]; then
+              echo "[$(date -Iseconds)] FLOPPY MODE: Unmounting before archive" >&2
+              "$NTT_BIN/ntt-mount-helper" unmount "$medium_hash" 2>/dev/null || true
+            fi
+
             log archive_start "{\"medium_hash\": \"$medium_hash\"}"
             echo "[$(date -Iseconds)] Running archiver..." >&2
 
@@ -1584,6 +1616,10 @@ handle_image_mode() {
     if [[ "$FLOPPY_MODE" == "true" ]]; then
       echo "[$(date -Iseconds)] FLOPPY MODE: No inodes to copy, archiving flux/metadata anyway" >&2
       psql_as_user "$DB_URL" -c "UPDATE medium SET health = 'failed', message = 'Load failed - no inodes, archiving flux/metadata only' WHERE medium_hash = '$medium_hash';" 2>/dev/null || true
+
+      # Unmount before archiving to prevent orphaned loop devices
+      echo "[$(date -Iseconds)] FLOPPY MODE: Unmounting before archive" >&2
+      "$NTT_BIN/ntt-mount-helper" unmount "$medium_hash" 2>/dev/null || true
 
       # Run archiver
       echo "[$(date -Iseconds)] Running archiver..." >&2
