@@ -37,7 +37,7 @@ fi
 DB_URL="${NTT_DB_URL:-postgres:///copyjob}"
 DB_USER="${PGUSER:-${SUDO_USER:-$USER}}"
 IMAGE_ROOT="${NTT_IMAGE_ROOT:-/data/fast/img}"
-ARCHIVE_ROOT="${NTT_ARCHIVE_ROOT:-/data/cold/img-read}"
+ARCHIVE_ROOT="${NTT_IMAGES_ROOT:-/data/cold/img-read}"
 LOG_JSON="${NTT_ARCHIVER_LOG:-/var/log/ntt/archiver.jsonl}"
 mkdir -p "$(dirname "$LOG_JSON")"
 chmod 755 "$(dirname "$LOG_JSON")" 2>/dev/null || true

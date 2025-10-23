@@ -97,7 +97,7 @@ def validate_destination_filesystem():
     try:
         # Run df -h and parse output
         result = subprocess.run(
-            ['df', '-h', '/data/cold'],
+            ['df', '-h', '/data/fast'],
             capture_output=True,
             text=True,
             check=True
@@ -120,12 +120,12 @@ def validate_destination_filesystem():
         avail_str = parts[3]
         mounted_on = parts[5]
 
-        # Validation 1: Filesystem must be 'coldpool'
-        if filesystem != 'coldpool':
-            logger.error(f"Wrong filesystem: expected 'coldpool', got '{filesystem}'")
+        # Validation 1: Filesystem must be 'fastpool'
+        if filesystem != 'fastpool':
+            logger.error(f"Wrong filesystem: expected 'fastpool', got '{filesystem}'")
             raise typer.Exit(code=1)
 
-        # Validation 2: Available space > 5TB
+        # Validation 2: Available space > 1TB
         try:
             # df -h uses shorthand: K, M, G, T, P (need to convert to bitmath format)
             # bitmath expects: KiB, MiB, GiB, TiB, PiB
@@ -136,16 +136,16 @@ def validate_destination_filesystem():
             avail_size = bitmath.parse_string(size_normalized)
             avail_tb = float(avail_size.TB)  # Convert to TB
 
-            if avail_tb <= 5.0:
-                logger.error(f"Insufficient space: {avail_str} available (need > 5T)")
+            if avail_tb <= 1.0:
+                logger.error(f"Insufficient space: {avail_str} available (need > 1T)")
                 raise typer.Exit(code=1)
         except (ValueError, AttributeError) as e:
             logger.error(f"Could not parse available space '{avail_str}': {e}")
             raise typer.Exit(code=1)
 
-        # Validation 3: Mount point must be /data/cold
-        if mounted_on != '/data/cold':
-            logger.error(f"Wrong mount point: expected '/data/cold', got '{mounted_on}'")
+        # Validation 3: Mount point must be /data/fast
+        if mounted_on != '/data/fast':
+            logger.error(f"Wrong mount point: expected '/data/fast', got '{mounted_on}'")
             raise typer.Exit(code=1)
 
         logger.info(f"Filesystem validation passed: {filesystem} with {avail_str} available at {mounted_on}")
@@ -183,8 +183,8 @@ class CopyWorker:
         # Environment configuration
         self.RAMDISK = Path(os.environ.get('NTT_RAMDISK', '/tmp/ram'))
         self.NVME_TMP = Path(os.environ.get('NTT_NVME_TMP', '/data/fast/tmp'))
-        self.BY_HASH_ROOT = Path(os.environ.get('NTT_BY_HASH_ROOT', '/data/cold/by-hash'))
-        self.ARCHIVE_ROOT = Path(os.environ.get('NTT_ARCHIVE_ROOT', '/data/cold/archived'))
+        self.BY_HASH_ROOT = Path(os.environ.get('NTT_BY_HASH_ROOT', '/data/fast/ntt/by-hash'))
+        self.ARCHIVE_ROOT = Path(os.environ.get('NTT_ARCHIVED_ROOT', '/data/fast/ntt/archived'))
 
         logger.info(f"Worker {self.worker_id} paths: by-hash={self.BY_HASH_ROOT}, archive={self.ARCHIVE_ROOT}")
 

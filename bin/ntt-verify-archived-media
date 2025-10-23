@@ -72,7 +72,7 @@ for hash in $archived_hashes; do
 
   while IFS= read -r blobid; do
     [[ -z "$blobid" ]] && continue
-    path="/data/cold/by-hash/${blobid:0:2}/${blobid:2:2}/$blobid"
+    path="/data/fast/ntt/by-hash/${blobid:0:2}/${blobid:2:2}/$blobid"
     if [[ -f "$path" ]]; then
       verified=$((verified + 1))
     else

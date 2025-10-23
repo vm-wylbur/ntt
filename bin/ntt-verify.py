@@ -36,8 +36,8 @@ from psycopg.rows import dict_row
 from loguru import logger
 
 # Configuration from environment
-BY_HASH_ROOT = Path(os.environ.get('NTT_BY_HASH_ROOT', '/data/cold/by-hash'))
-ARCHIVE_ROOT = Path(os.environ.get('NTT_ARCHIVE_ROOT', '/data/cold/archived'))
+BY_HASH_ROOT = Path(os.environ.get('NTT_BY_HASH_ROOT', '/data/fast/ntt/by-hash'))
+ARCHIVE_ROOT = Path(os.environ.get('NTT_ARCHIVED_ROOT', '/data/fast/ntt/archived'))
 LOG_JSON = Path(os.environ.get('NTT_LOG_JSON', '/var/log/ntt/verify.jsonl'))
 IGNORE_PATTERNS_FILE = os.environ.get('NTT_IGNORE_PATTERNS', '')
 
@@ -372,7 +372,7 @@ class BlobVerifier:
         by_hash_path = self.by_hash_root / hex_hash[:2] / hex_hash[2:4] / hex_hash
 
         # Paths in database are absolute source paths, reconstruct archived locations
-        # e.g., /data/staging/foo → /data/cold/archived/data/staging/foo
+        # e.g., /data/staging/foo → /data/fast/ntt/archived/data/staging/foo
         archived_paths = [
             self.archive_root / path.lstrip('/')
             for path in paths
