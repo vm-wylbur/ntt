@@ -184,9 +184,8 @@ class CopyWorker:
         self.RAMDISK = Path(os.environ.get('NTT_RAMDISK', '/tmp/ram'))
         self.NVME_TMP = Path(os.environ.get('NTT_NVME_TMP', '/data/fast/tmp'))
         self.BY_HASH_ROOT = Path(os.environ.get('NTT_BY_HASH_ROOT', '/data/fast/ntt/by-hash'))
-        self.ARCHIVE_ROOT = Path(os.environ.get('NTT_ARCHIVED_ROOT', '/data/fast/ntt/archived'))
 
-        logger.info(f"Worker {self.worker_id} paths: by-hash={self.BY_HASH_ROOT}, archive={self.ARCHIVE_ROOT}")
+        logger.info(f"Worker {self.worker_id} paths: by-hash={self.BY_HASH_ROOT}")
 
         # Stats
         self.stats = {
@@ -946,16 +945,14 @@ class CopyWorker:
                     t3 = time.time()
                     logger.debug(f"TIMING: UPDATE inode (success): {t3-t2:.3f}s for {len(success_ids)} inodes")
 
-                    # Insert/update blobs table (grouped to handle duplicate blobids in batch)
+                    # Insert into blobs table to record blob existence
                     t_blobs_start = time.time()
                     cur.execute("""
-                        INSERT INTO blobs (blobid, n_hardlinks)
-                        SELECT blobid, COUNT(*) as n_hardlinks
+                        INSERT INTO blobs (blobid)
+                        SELECT DISTINCT blobid
                         FROM unnest(%s::text[]) AS t(blobid)
                         WHERE blobid IS NOT NULL
-                        GROUP BY blobid
-                        ON CONFLICT (blobid) DO UPDATE
-                        SET n_hardlinks = blobs.n_hardlinks + EXCLUDED.n_hardlinks
+                        ON CONFLICT (blobid) DO NOTHING
                     """, (success_blob_ids,))
                     t_blobs_end = time.time()
                     logger.debug(f"TIMING: INSERT blobs: {t_blobs_end-t_blobs_start:.3f}s for {len(success_blob_ids)} blobids")
@@ -1608,31 +1605,12 @@ class CopyWorker:
             logger.error(f"Failed to move {temp_file} to {hash_path}: {e}")
             raise
 
-        # Create hardlinks (idempotent)
-        strategies.create_hardlinks_idempotent(
-            hash_path,
-            plan['paths_to_link'],
-            self.ARCHIVE_ROOT
-        )
-
         return by_hash_created
 
     def execute_link_existing_file_fs(self, plan: dict):
         """Filesystem operations for deduplicated file."""
-        import time
-        t0 = time.time()
-
-        hash_val = plan['blobid']
-        hash_path = self.BY_HASH_ROOT / hash_val[:2] / hash_val[2:4] / hash_val
-
-        strategies.create_hardlinks_idempotent(
-            hash_path,
-            plan['paths_to_link'],
-            self.ARCHIVE_ROOT
-        )
-
-        t1 = time.time()
-        logger.debug(f"TIMING: create_hardlinks n_paths={len(plan['paths_to_link'])} time={t1-t0:.3f}s")
+        # No filesystem operations needed - blob already exists in by-hash
+        pass
 
     def execute_empty_file_fs(self, plan: dict):
         """Filesystem operations for empty file."""
@@ -1640,35 +1618,15 @@ class CopyWorker:
         hash_path.parent.mkdir(parents=True, exist_ok=True)
         hash_path.touch(exist_ok=True)
 
-        strategies.create_hardlinks_idempotent(
-            hash_path,
-            plan['paths_to_link'],
-            self.ARCHIVE_ROOT
-        )
-
     def execute_directory_fs(self, plan: dict):
         """Filesystem operations for directory."""
-        for path_bytes in plan['paths']:
-            # Decode bytes to str (paths are stored as bytea in database)
-            path_str = path_bytes.decode('utf-8', errors='replace') if isinstance(path_bytes, bytes) else path_bytes
-            archive_path = self.ARCHIVE_ROOT / path_str.lstrip('/')
-            if not archive_path.exists():
-                archive_path.mkdir(parents=True, exist_ok=True, mode=0o755)
-                strategies.ensure_directory_ownership(archive_path, self.ARCHIVE_ROOT)
+        # No filesystem operations needed - directories not recreated in archive
+        pass
 
     def execute_symlink_fs(self, plan: dict):
         """Filesystem operations for symlink."""
-        target = plan['target']
-        for path_bytes in plan['paths']:
-            # Decode bytes to str (paths are stored as bytea in database)
-            path_str = path_bytes.decode('utf-8', errors='replace') if isinstance(path_bytes, bytes) else path_bytes
-            archive_path = self.ARCHIVE_ROOT / path_str.lstrip('/')
-            if not archive_path.exists() and not archive_path.is_symlink():
-                archive_path.parent.mkdir(parents=True, exist_ok=True)
-                try:
-                    archive_path.symlink_to(target)
-                except FileExistsError:
-                    pass  # Race with another worker
+        # No filesystem operations needed - symlinks not recreated in archive
+        pass
 
     # ========================================
     # DATABASE UPDATE FUNCTIONS
@@ -1698,13 +1656,12 @@ class CopyWorker:
                 WHERE medium_hash = %s AND ino = %s
             """, (hash_val, inode_row['medium_hash'], inode_row['ino']))
 
-            # Upsert blob (atomic increment)
+            # Upsert blob to record existence
             cur.execute("""
-                INSERT INTO blobs (blobid, n_hardlinks)
-                VALUES (%s, %s)
-                ON CONFLICT (blobid) DO UPDATE
-                SET n_hardlinks = blobs.n_hardlinks + EXCLUDED.n_hardlinks
-            """, (hash_val, num_links))
+                INSERT INTO blobs (blobid)
+                VALUES (%s)
+                ON CONFLICT (blobid) DO NOTHING
+            """, (hash_val,))
 
     def update_db_for_directory(self, inode_row):
         """Update DB for directory."""
