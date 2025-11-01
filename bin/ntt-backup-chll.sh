@@ -7,8 +7,27 @@
 # ntt/bin/ntt-backup-chll.sh
 #
 # Backup by-hash to remote server (chll) using find-diff approach
+#
+# Usage: ntt-backup-chll.sh [--force]
+#   --force: Overwrite files with size mismatches (use when recovering from corruption)
 
 set -euo pipefail
+
+# Parse arguments
+FORCE_OVERWRITE=false
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --force)
+            FORCE_OVERWRITE=true
+            shift
+            ;;
+        *)
+            echo "Unknown option: $1"
+            echo "Usage: $0 [--force]"
+            exit 1
+            ;;
+    esac
+done
 
 # Configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -35,6 +54,9 @@ if ! get_lock "$LOCK_FILE"; then
 fi
 
 log "INFO: Starting remote backup job to $REMOTE_HOST"
+if [[ "$FORCE_OVERWRITE" == "true" ]]; then
+    log "WARNING: Force mode enabled - will overwrite files with size mismatches"
+fi
 
 # REMOTE-SPECIFIC: Validate remote ZFS pool is mounted
 log "INFO: Checking remote pool $REMOTE_POOL..."
@@ -79,7 +101,7 @@ if ! capture_remote_file_list "$REMOTE_HOST" "$REMOTE_PATH" "$DEST_LIST"; then
 fi
 
 # Find files that need copying (with corruption detection)
-if ! diff_and_validate_lists "$SOURCE_LIST" "$DEST_LIST" "$MISSING_LIST"; then
+if ! diff_and_validate_lists "$SOURCE_LIST" "$DEST_LIST" "$MISSING_LIST" "$FORCE_OVERWRITE"; then
     exit 1
 fi
 

@@ -586,7 +586,7 @@ main() {
   log "======================================"
   log "Floppy Orchestrator Starting"
   log "======================================"
-  log "Session hash: $session_hash"
+  log "Session ID (for files/tracking): $session_hash"
   log "Message: $MESSAGE"
   log "Sequence: $SEQUENCE"
   log "Timestamp: $timestamp"
@@ -627,7 +627,7 @@ main() {
     img_path="$img_file"
     log "Computing content hash..."
     content_hash=$(compute_content_hash "$img_file")
-    log "Content hash: $content_hash"
+    log "Content checksum (disk image): $content_hash"
   fi
 
   # For partial or failed reads, also capture flux
@@ -658,7 +658,7 @@ main() {
     "$sectors_total"
 
   log "======================================"
-  log "COMPLETE: Status = $read_status"
+  log "COMPLETE: Session $session_hash, Status = $read_status"
   log "======================================"
   log_event done "{\"session_hash\": \"$session_hash\", \"read_status\": \"$read_status\", \"exit\": $exit_code}"
 

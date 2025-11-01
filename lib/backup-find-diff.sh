@@ -20,7 +20,8 @@ capture_file_list() {
     # Use find to get relative paths with sizes, sorted
     # -type f: only files
     # -printf '%P\t%s\n': relative path <TAB> size in bytes
-    if find "$root_dir" -type f -printf '%P\t%s\n' 2>/dev/null | sort > "$output_file"; then
+    # LC_ALL=C ensures consistent byte-order sorting for join compatibility
+    if find "$root_dir" -type f -printf '%P\t%s\n' 2>/dev/null | LC_ALL=C sort > "$output_file"; then
         local count=$(wc -l < "$output_file")
         log "INFO: Captured $count files from $root_dir"
         return 0
@@ -42,7 +43,8 @@ capture_remote_file_list() {
 
     # Stream through SSH - find and sort on remote, stream results back
     # Single SSH command is much faster than multiple round-trips
-    if ssh "$ssh_host" "find '$remote_dir' -type f -printf '%P\t%s\n' 2>/dev/null | sort" > "$output_file"; then
+    # LC_ALL=C ensures consistent byte-order sorting for join compatibility
+    if ssh "$ssh_host" "LC_ALL=C find '$remote_dir' -type f -printf '%P\t%s\n' 2>/dev/null | LC_ALL=C sort" > "$output_file"; then
         local count=$(wc -l < "$output_file")
         log "INFO: Captured $count files from remote"
         return 0
@@ -53,32 +55,49 @@ capture_remote_file_list() {
 }
 
 # Diff two sorted file lists and validate sizes
-# Args: source_list, dest_list, missing_list
+# Args: source_list, dest_list, missing_list, [force_overwrite]
 # Output: List of files to copy (path<TAB>size)
 # CRITICAL: Fails immediately if same file has different sizes (corruption!)
+#   unless force_overwrite=true, in which case corrupted files are added to missing_list
 diff_and_validate_lists() {
     local source_list="$1"
     local dest_list="$2"
     local missing_list="$3"
+    local force_overwrite="${4:-false}"
 
     log "INFO: Computing diff between source and destination..."
 
     # First, check for files in both locations with size mismatches (CORRUPTION!)
     # join on first field (path), compare sizes
-    local corrupted=$(join -t $'\t' "$source_list" "$dest_list" | awk -F'\t' '$2 != $3 {print}')
+    # LC_ALL=C ensures consistent collation order
+    local corrupted=$(LC_ALL=C join -t $'\t' "$source_list" "$dest_list" | awk -F'\t' '$2 != $3 {print}')
 
     if [ -n "$corrupted" ]; then
-        log "ERROR: CORRUPTION DETECTED - same files have different sizes!"
-        log "ERROR: Corrupted files:"
+        local corrupt_count=$(echo "$corrupted" | wc -l)
+        log "WARNING: SIZE MISMATCH DETECTED - $corrupt_count files have different sizes"
+        log "WARNING: Mismatched files:"
         echo "$corrupted" | while IFS=$'\t' read -r path src_size dst_size; do
-            log "ERROR:   $path: source=$src_size bytes, dest=$dst_size bytes"
+            log "WARNING:   $path: source=$src_size bytes, dest=$dst_size bytes"
         done
-        return 1
+
+        if [[ "$force_overwrite" != "true" ]]; then
+            log "ERROR: Refusing to continue - use --force to overwrite mismatched files"
+            return 1
+        fi
+
+        log "WARNING: Force mode enabled - adding mismatched files to copy list"
+        # Extract just the path and source size from corrupted files
+        echo "$corrupted" | awk -F'\t' '{print $1 "\t" $2}' > "$missing_list"
+    else
+        # No corrupted files, start with empty missing list
+        > "$missing_list"
     fi
 
     # Find files only in source (missing from destination)
     # join -v1: only lines from file 1 (source) with no match in file 2 (dest)
-    if join -t $'\t' -v1 "$source_list" "$dest_list" > "$missing_list"; then
+    # Append to missing_list (which may already have corrupted files)
+    # LC_ALL=C ensures consistent collation order
+    if LC_ALL=C join -t $'\t' -v1 "$source_list" "$dest_list" >> "$missing_list"; then
         local count=$(wc -l < "$missing_list")
         log "INFO: Found $count files to copy"
         return 0

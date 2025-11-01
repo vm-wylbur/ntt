@@ -80,7 +80,7 @@ if ! capture_file_list "$TARGET" "$DEST_LIST"; then
 fi
 
 # Find files that need copying (with corruption detection)
-if ! diff_and_validate_lists "$SOURCE_LIST" "$DEST_LIST" "$MISSING_LIST"; then
+if ! diff_and_validate_lists "$SOURCE_LIST" "$DEST_LIST" "$MISSING_LIST" "false"; then
     exit 1
 fi
 
