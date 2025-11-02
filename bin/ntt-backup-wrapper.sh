@@ -7,6 +7,11 @@
 # ntt/bin/ntt-backup-wrapper.sh
 #
 # Wrapper for ntt-backup with mount validation and auto-recovery
+#
+# TODO: Migrate to bash-logger.sh (see ntt-backup-usb.sh for pattern)
+#       1. Add LOG_FILE variable with .jsonl extension
+#       2. Source bash-logger.sh and call log_init
+#       3. Replace log() calls with log_info/log_warn/log_error
 
 set -euo pipefail
 

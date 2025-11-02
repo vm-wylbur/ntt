@@ -7,6 +7,8 @@
 # ntt/bin/ntt-backup-usb.sh
 #
 # Backup by-hash from fastpool to USB drive using find-diff approach
+#
+# bash-logger: INTEGRATED (2025-11-02)
 
 set -euo pipefail
 

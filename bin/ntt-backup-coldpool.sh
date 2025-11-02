@@ -7,6 +7,8 @@
 # ntt/bin/ntt-backup-coldpool.sh
 #
 # Backup by-hash from fastpool to coldpool using find-diff approach
+#
+# bash-logger: INTEGRATED (2025-11-02)
 
 set -euo pipefail
 

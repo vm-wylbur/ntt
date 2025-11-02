@@ -10,6 +10,9 @@
 #
 # Usage: ntt-backup-chll.sh [--force]
 #   --force: Overwrite files with size mismatches (use when recovering from corruption)
+#
+# TODO: Migrate to bash-logger.sh (DEFERRED: waiting for current 36h+ run to complete)
+#       See ntt-backup-usb.sh for migration pattern
 
 set -euo pipefail
 

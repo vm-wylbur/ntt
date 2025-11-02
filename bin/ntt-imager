@@ -7,6 +7,12 @@
 # ntt/bin/ntt-imager
 #
 # Progressive 7-phase ddrescue imaging - never give up until 100% or exhausted
+#
+# TODO: Migrate to bash-logger.sh (see ntt-backup-usb.sh for pattern)
+#       1. Change LOGFILE to LOG_FILE with .jsonl extension
+#       2. Source bash-logger.sh and call log_init
+#       3. Replace log() calls with log_info/log_warn/log_error
+
 set -euo pipefail
 
 # ---------- Arguments ----------

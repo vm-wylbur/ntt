@@ -7,6 +7,12 @@
 # ntt/bin/ntt-enum
 #
 # NTT raw enumerator – outputs one NUL-rec per dirent
+#
+# TODO: Migrate to bash-logger.sh (see ntt-backup-usb.sh for pattern)
+#       1. Change LOG_JSON to LOG_FILE with .jsonl extension
+#       2. Source bash-logger.sh and call log_init
+#       3. Replace log() calls with log_info/log_warn/log_error
+
 set -euo pipefail
 
 # ---------- argparse ----------
