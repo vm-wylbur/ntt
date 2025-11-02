@@ -14,11 +14,16 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIB_DIR="$(cd "$SCRIPT_DIR/../lib" && pwd)"
 
-LOG_FILE="/var/log/ntt/backup-coldpool.log"
+LOG_FILE="/var/log/ntt/backup-coldpool.jsonl"
 LOCK_FILE="/tmp/ntt-backup-coldpool.lock"
 
 SOURCE="/data/fast/ntt/by-hash"
 TARGET="/data/cold/ntt-backup/by-hash"
+
+# Initialize logging
+# shellcheck source=../lib/bash-logger.sh
+source "$LIB_DIR/bash-logger.sh"
+log_init || exit 1  # TODO: Add fallback to stderr-only logging if init fails
 
 # Source common libraries
 # shellcheck source=../lib/backup-rsync-common.sh
@@ -31,7 +36,7 @@ if ! get_lock "$LOCK_FILE"; then
     exit 1
 fi
 
-log "INFO: Starting coldpool backup job"
+log_info "Starting coldpool backup job"
 
 # Validate coldpool is properly mounted
 if ! validate_zfs_pool "coldpool" "/data/cold"; then
@@ -48,12 +53,12 @@ PGDUMP_DIR="/data/cold/ntt-backup/pgdump"
 STATE_FILE="$PGDUMP_DIR/.last_dump_state"
 
 # Get current database state
-log "INFO: Checking database state for pg_dump decision..."
+log_info "Checking database state for pg_dump decision..."
 CURRENT_XACT=$(sudo -u postgres psql -tAc "SELECT xact_commit FROM pg_stat_database WHERE datname='copyjob'" 2>/dev/null || echo "0")
 CURRENT_MODS=$(sudo -u postgres psql -tAc "SELECT tup_inserted + tup_updated + tup_deleted FROM pg_stat_database WHERE datname='copyjob'" 2>/dev/null || echo "0")
 
 if [ "$CURRENT_XACT" = "0" ] || [ "$CURRENT_MODS" = "0" ]; then
-    log "WARNING: Could not query database state, will skip pg_dump this run"
+    log_warn "Could not query database state, will skip pg_dump this run"
     DO_PGDUMP=false
     PGDUMP_REASON="Database query failed"
 elif [ ! -f "$STATE_FILE" ]; then
@@ -89,7 +94,7 @@ else
     fi
 fi
 
-log "INFO: pg_dump decision: $DO_PGDUMP - $PGDUMP_REASON"
+log_info "pg_dump decision: $DO_PGDUMP - $PGDUMP_REASON"
 
 # Start pg_dump in background if needed
 PGDUMP_PID=""
@@ -100,28 +105,28 @@ if [ "$DO_PGDUMP" = "true" ]; then
     TIMESTAMP=$(date -Iseconds)
     DUMP_FILE="$PGDUMP_DIR/copyjob-$TIMESTAMP.pgdump"
 
-    log "INFO: Starting pg_dump in background to: $DUMP_FILE"
+    log_info "Starting pg_dump in background to: $DUMP_FILE"
     mkdir -p "$PGDUMP_DIR"
 
     # Start dump in background
     sudo -u postgres pg_dump -Fc copyjob > "$DUMP_FILE" 2>&1 &
     PGDUMP_PID=$!
-    log "INFO: pg_dump started (PID: $PGDUMP_PID)"
+    log_info "pg_dump started (PID: $PGDUMP_PID)"
 fi
 
 # COLDPOOL-SPECIFIC: Fix ownership (fast on NVMe-backed metadata, ~2-3 minutes)
 # This is needed because some processes create files with wrong ownership
-log "INFO: Fixing ownership of /data/cold..."
+log_info "Fixing ownership of /data/cold..."
 if sudo chown -R pball:pball /data/cold; then
-    log "INFO: Ownership fix completed"
+    log_info "Ownership fix completed"
 else
-    log "ERROR: chown failed with exit code $?"
+    log_error "chown failed with exit code $?"
     exit 1
 fi
 
 # Ensure target directory exists
 mkdir -p "$TARGET"
-log "INFO: Target directory verified: $TARGET"
+log_info "Target directory verified: $TARGET"
 
 # Create temp directory for file lists
 TEMP_DIR=$(mktemp -d /tmp/ntt-backup-coldpool.XXXXXX)
@@ -132,7 +137,7 @@ cleanup_backup() {
 
     # Clean up incomplete dump if script fails
     if [ "$DUMP_COMPLETE" = "false" ] && [ -n "$DUMP_FILE" ] && [ -f "$DUMP_FILE" ]; then
-        log "WARNING: Cleaning up incomplete dump: $DUMP_FILE"
+        log_warn "Cleaning up incomplete dump: $DUMP_FILE"
         rm -f "$DUMP_FILE"
     fi
 }
@@ -166,16 +171,16 @@ fi
 # =============================================================================
 
 if [ -n "$PGDUMP_PID" ]; then
-    log "INFO: Waiting for pg_dump to complete (PID: $PGDUMP_PID)..."
+    log_info "Waiting for pg_dump to complete (PID: $PGDUMP_PID)..."
 
     if wait $PGDUMP_PID; then
         DUMP_COMPLETE=true
         DUMP_SIZE=$(stat -c %s "$DUMP_FILE" 2>/dev/null || echo "0")
         DUMP_SIZE_GB=$(awk "BEGIN {printf \"%.2f\", $DUMP_SIZE / 1024 / 1024 / 1024}")
-        log "INFO: pg_dump completed successfully (${DUMP_SIZE_GB} GB)"
+        log_info "pg_dump completed successfully (${DUMP_SIZE_GB} GB)"
 
         # Save state for next run
-        log "INFO: Saving dump state to: $STATE_FILE"
+        log_info "Saving dump state to: $STATE_FILE"
         cat > "$STATE_FILE" <<EOF
 # Last successful pg_dump state
 DUMP_TIMESTAMP=$TIMESTAMP
@@ -186,12 +191,12 @@ DUMP_SIZE=$DUMP_SIZE
 EOF
     else
         DUMP_EXIT=$?
-        log "WARNING: pg_dump failed with exit code $DUMP_EXIT"
-        log "WARNING: File backup succeeded but database dump failed"
+        log_warn "pg_dump failed with exit code $DUMP_EXIT"
+        log_warn "File backup succeeded but database dump failed"
         # Don't exit 1 - file backup is more critical
     fi
 else
-    log "INFO: pg_dump was skipped this run"
+    log_info "pg_dump was skipped this run"
 fi
 
-log "INFO: Coldpool backup completed successfully"
+log_info "Coldpool backup completed successfully"
