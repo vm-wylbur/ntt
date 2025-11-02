@@ -9,10 +9,7 @@
 # NTT ingest dispatcher – supports both device and directory modes
 # Note: Must be run with sudo/root privileges for device operations
 #
-# TODO: Migrate to bash-logger.sh (see ntt-backup-usb.sh for pattern)
-#       1. Change LOG_JSON to LOG_FILE with .jsonl extension
-#       2. Source bash-logger.sh and call log_init
-#       3. Replace log() calls with log_info/log_warn/log_error
+# bash-logger: INTEGRATED (2025-11-02)
 
 set -eo pipefail
 PATH="/home/pball/projects/ntt/bin:$PATH"
@@ -75,10 +72,18 @@ DB_USER="${PGUSER:-${SUDO_USER:-$USER}}"
 IMAGE_ROOT="${NTT_IMAGE_ROOT:-/data/fast/img}"
 RAW_ROOT="${NTT_RAW_ROOT:-/data/fast/raw}"
 DST_ROOT="${NTT_DST_ROOT:-/data/cold/dst}"
-LOG_JSON="${NTT_ORCHESTRATOR_LOG:-/var/log/ntt/orchestrator.jsonl}"
+LOG_FILE="${NTT_ORCHESTRATOR_LOG:-/var/log/ntt/orchestrator.jsonl}"
 DIAGNOSTICS=""  # Global variable for storing device/image diagnostics
-mkdir -p "$(dirname "$LOG_JSON")"
-chmod 755 "$(dirname "$LOG_JSON")" 2>/dev/null || true
+mkdir -p "$(dirname "$LOG_FILE")"
+chmod 755 "$(dirname "$LOG_FILE")" 2>/dev/null || true
+
+# Source bash-logger
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(cd "$SCRIPT_DIR/../lib" && pwd)"
+source "$LIB_DIR/bash-logger.sh"
+
+# Initialize logging (must be after LOG_FILE is set)
+log_init || exit 1
 
 # Wrapper for psql that handles running as root
 psql_as_user() {
@@ -90,18 +95,15 @@ psql_as_user() {
 }
 
 # ---------- logging functions ----------
+# NOTE: log_info/log_warn/log_error provided by bash-logger.sh
+
+# Dummy log() function for legacy structured event calls (deprecated, kept for compatibility)
 log() {
-  jq -cn --arg ts "$(date -Iseconds)" \
-        --arg stage "$1" \
-        --argjson extra "$2" \
-        '$extra + {ts: $ts, stage: $stage}' \
-  >> "$LOG_JSON"
-  chmod 644 "$LOG_JSON" 2>/dev/null || true
+  :  # No-op
 }
 
 fail() {
-  echo "Error: $1" >&2
-  log error "{\"msg\": \"$1\"}"
+  log_error "Error: $1"
   exit 1
 }
 

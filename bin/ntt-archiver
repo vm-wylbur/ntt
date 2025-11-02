@@ -8,10 +8,7 @@
 #
 # Archive disk images to cold storage after copying completes
 #
-# TODO: Migrate to bash-logger.sh (see ntt-backup-usb.sh for pattern)
-#       1. Change LOG_JSON to LOG_FILE with .jsonl extension
-#       2. Source bash-logger.sh and call log_init
-#       3. Replace log() calls with log_info/log_warn/log_error
+# bash-logger: INTEGRATED (2025-11-02)
 
 set -eo pipefail
 
@@ -43,9 +40,17 @@ DB_URL="${NTT_DB_URL:-postgres:///copyjob}"
 DB_USER="${PGUSER:-${SUDO_USER:-$USER}}"
 IMAGE_ROOT="${NTT_IMAGE_ROOT:-/data/fast/img}"
 ARCHIVE_ROOT="${NTT_IMAGES_ROOT:-/data/cold/img-read}"
-LOG_JSON="${NTT_ARCHIVER_LOG:-/var/log/ntt/archiver.jsonl}"
-mkdir -p "$(dirname "$LOG_JSON")"
-chmod 755 "$(dirname "$LOG_JSON")" 2>/dev/null || true
+LOG_FILE="${NTT_ARCHIVER_LOG:-/var/log/ntt/archiver.jsonl}"
+mkdir -p "$(dirname "$LOG_FILE")"
+chmod 755 "$(dirname "$LOG_FILE")" 2>/dev/null || true
+
+# Source bash-logger
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(cd "$SCRIPT_DIR/../lib" && pwd)"
+source "$LIB_DIR/bash-logger.sh"
+
+# Initialize logging (must be after LOG_FILE is set)
+log_init || exit 1
 
 # Wrapper for psql that handles running as root
 psql_as_user() {
@@ -57,18 +62,10 @@ psql_as_user() {
 }
 
 # ---------- logging functions ----------
-log() {
-  jq -cn --arg ts "$(date -Iseconds)" \
-        --arg stage "$1" \
-        --argjson extra "$2" \
-        '$extra + {ts: $ts, stage: $stage}' \
-  >> "$LOG_JSON"
-  chmod 644 "$LOG_JSON" 2>/dev/null || true
-}
+# NOTE: log_info/log_warn/log_error provided by bash-logger.sh
 
 fail() {
-  echo "Error: $1" >&2
-  log error "{\"msg\": \"$1\"}"
+  log_error "Error: $1"
   exit 1
 }
 
@@ -160,8 +157,7 @@ if [[ ! "$MEDIUM_HASH" =~ ^[a-f0-9]{16,64}$ ]]; then
 fi
 
 # ---------- main ----------
-echo "[$(date -Iseconds)] Starting archive process for $MEDIUM_HASH" >&2
-log archive_start "{\"medium_hash\": \"$MEDIUM_HASH\", \"force\": $FORCE, \"verbose\": $VERBOSE, \"floppy\": $FLOPPY_MODE}"
+log_info "Starting archive process for $MEDIUM_HASH (force=$FORCE verbose=$VERBOSE floppy=$FLOPPY_MODE)"
 
 # Check if source files exist
 if [[ "$FLOPPY_MODE" == "true" ]]; then
@@ -179,10 +175,10 @@ if [[ "$FLOPPY_MODE" == "true" ]]; then
   fi
 
   FOUND_IN="$(dirname "$FLOPPY_SOURCE_DIR")"
-  echo "[$(date -Iseconds)] Found floppy directory: $FLOPPY_SOURCE_DIR" >&2
+  log_info "Found floppy directory: $FLOPPY_SOURCE_DIR"
 
   if [[ "$VERBOSE" == "true" ]]; then
-    echo "[$(date -Iseconds)] Found files:" >&2
+    log_info "Found files:"
     for f in "${SOURCE_FILES[@]}"; do
       ls -lh "$f" >&2
     done
@@ -206,10 +202,10 @@ else
     fail "No source files found in: ${SEARCH_PATHS[*]} (pattern: ${MEDIUM_HASH}*)"
   fi
 
-  echo "[$(date -Iseconds)] Found source files in: $FOUND_IN" >&2
+  log_info "Found source files in: $FOUND_IN"
 
   if [[ "$VERBOSE" == "true" ]]; then
-    echo "[$(date -Iseconds)] Found source files:" >&2
+    log_info "Found source files:"
     for f in "${SOURCE_FILES[@]}"; do
       ls -lh "$f" >&2
     done
@@ -225,18 +221,16 @@ else
 fi
 if [[ -f "$ARCHIVE_FILE" ]]; then
   if [[ "$FORCE" == "true" ]]; then
-    echo "[$(date -Iseconds)] WARNING: Archive already exists, overwriting (--force)" >&2
-    log archive_overwrite "{\"medium_hash\": \"$MEDIUM_HASH\", \"archive\": \"$ARCHIVE_FILE\"}"
+    log_warn "Archive already exists, overwriting (--force): $ARCHIVE_FILE"
   else
-    echo "[$(date -Iseconds)] Archive already exists: $ARCHIVE_FILE" >&2
-    log archive_exists "{\"medium_hash\": \"$MEDIUM_HASH\", \"archive\": \"$ARCHIVE_FILE\"}"
+    log_info "Archive already exists (skipping): $ARCHIVE_FILE"
     exit 2
   fi
 fi
 
 # Safety check: Verify all inodes are copied (unless --force or floppy mode)
 if [[ "$FORCE" == "false" ]] && [[ "$FLOPPY_MODE" == "false" ]]; then
-  echo "[$(date -Iseconds)] Checking copy completion..." >&2
+  log_info "Checking copy completion..."
 
   COPY_STATUS=$(psql_as_user "$DB_URL" -tAc "
     SELECT
@@ -252,21 +246,18 @@ if [[ "$FORCE" == "false" ]] && [[ "$FLOPPY_MODE" == "false" ]]; then
   TOTAL=$(echo "$COPY_STATUS" | cut -d'|' -f3)
 
   if [[ $TOTAL -eq 0 ]]; then
-    echo "[$(date -Iseconds)] WARNING: No inodes found for this medium (empty filesystem?)" >&2
-    log archive_no_inodes "{\"medium_hash\": \"$MEDIUM_HASH\"}"
+    log_warn "No inodes found for this medium (empty filesystem?)"
   elif [[ $PENDING -gt 0 ]]; then
     fail "Copy incomplete: $PENDING of $TOTAL inodes not copied (use --force to skip)"
   else
-    echo "[$(date -Iseconds)] Copy complete: $COPIED of $TOTAL inodes copied" >&2
-    log copy_verified "{\"medium_hash\": \"$MEDIUM_HASH\", \"copied\": $COPIED, \"total\": $TOTAL, \"floppy\": false}"
+    log_info "Copy complete: $COPIED of $TOTAL inodes copied"
   fi
 elif [[ "$FLOPPY_MODE" == "true" ]]; then
-  echo "[$(date -Iseconds)] Floppy mode: skipping inode copy verification" >&2
+  log_info "Floppy mode: skipping inode copy verification"
 fi
 
 # Create archive
-echo "[$(date -Iseconds)] Creating archive: $ARCHIVE_FILE" >&2
-log archive_create_start "{\"medium_hash\": \"$MEDIUM_HASH\", \"archive\": \"$ARCHIVE_FILE\", \"floppy\": $FLOPPY_MODE}"
+log_info "Creating archive: $ARCHIVE_FILE"
 
 if [[ "$FLOPPY_MODE" == "true" ]]; then
   # Floppy mode: archive entire directory
@@ -291,7 +282,7 @@ fi
 
 # Create archive with zstd compression
 if tar $TAR_OPTS "${FILE_PATTERNS[@]}" | zstd > "$ARCHIVE_FILE"; then
-  echo "[$(date -Iseconds)] Archive created successfully" >&2
+  log_info "Archive created successfully"
 else
   fail "Archive creation failed (tar exit code: ${PIPESTATUS[0]}, zstd exit code: ${PIPESTATUS[1]})"
 fi
@@ -300,7 +291,7 @@ fi
 if [[ -n "$SUDO_USER" ]]; then
   chown "$SUDO_USER:$SUDO_USER" "$ARCHIVE_FILE"
   chmod 644 "$ARCHIVE_FILE"
-  echo "[$(date -Iseconds)] Archive ownership: $SUDO_USER:$SUDO_USER 644" >&2
+  log_info "Archive ownership: $SUDO_USER:$SUDO_USER 644"
 fi
 
 # Verify archive exists and has size > 0
@@ -314,14 +305,12 @@ if [[ $ARCHIVE_SIZE -eq 0 ]]; then
 fi
 
 ARCHIVE_SIZE_HUMAN=$(stat -c%s "$ARCHIVE_FILE" | numfmt --to=iec-i --suffix=B 2>/dev/null || echo "${ARCHIVE_SIZE} bytes")
-echo "[$(date -Iseconds)] Archive verified: $ARCHIVE_SIZE_HUMAN" >&2
-log archive_verified "{\"medium_hash\": \"$MEDIUM_HASH\", \"archive\": \"$ARCHIVE_FILE\", \"size\": $ARCHIVE_SIZE, \"floppy\": $FLOPPY_MODE}"
+log_info "Archive verified: $ARCHIVE_SIZE_HUMAN"
 
 # Remove source files
 if [[ "$FLOPPY_MODE" == "true" ]]; then
   # Floppy mode: remove entire directory
-  echo "[$(date -Iseconds)] Removing floppy directory: $FLOPPY_SOURCE_DIR" >&2
-  log source_remove_start "{\"medium_hash\": \"$MEDIUM_HASH\", \"floppy\": true, \"directory\": \"$FLOPPY_SOURCE_DIR\"}"
+  log_info "Removing floppy directory: $FLOPPY_SOURCE_DIR"
 
   rm -rf "$FLOPPY_SOURCE_DIR"
 
@@ -330,16 +319,14 @@ if [[ "$FLOPPY_MODE" == "true" ]]; then
     fail "Floppy directory removal failed: $FLOPPY_SOURCE_DIR still exists"
   fi
 
-  echo "[$(date -Iseconds)] Floppy directory removed successfully" >&2
-  log source_removed "{\"medium_hash\": \"$MEDIUM_HASH\", \"floppy\": true}"
+  log_info "Floppy directory removed successfully"
 else
   # Normal mode: remove individual files
-  echo "[$(date -Iseconds)] Removing source files..." >&2
-  log source_remove_start "{\"medium_hash\": \"$MEDIUM_HASH\", \"count\": ${#SOURCE_FILES[@]}, \"floppy\": false}"
+  log_info "Removing source files (${#SOURCE_FILES[@]} files)..."
 
   for f in "${SOURCE_FILES[@]}"; do
     if [[ "$VERBOSE" == "true" ]]; then
-      echo "[$(date -Iseconds)]   Removing: $f" >&2
+      log_info "  Removing: $f"
     fi
     rm -f "$f"
   done
@@ -347,19 +334,17 @@ else
   # Verify source files are gone
   REMAINING_FILES=("$FOUND_IN/${MEDIUM_HASH}"*)
   if [[ -e "${REMAINING_FILES[0]}" ]]; then
-    echo "[$(date -Iseconds)] WARNING: Some source files still exist:" >&2
+    log_warn "Some source files still exist:"
     for f in "${REMAINING_FILES[@]}"; do
       ls -lh "$f" >&2
     done
     fail "Source file removal verification failed"
   fi
 
-  echo "[$(date -Iseconds)] Source files removed successfully" >&2
-  log source_removed "{\"medium_hash\": \"$MEDIUM_HASH\", \"floppy\": false}"
+  log_info "Source files removed successfully"
 fi
 
 # Success
-echo "[$(date -Iseconds)] Archive complete: $ARCHIVE_FILE ($ARCHIVE_SIZE_HUMAN)" >&2
-log archive_done "{\"medium_hash\": \"$MEDIUM_HASH\", \"archive\": \"$ARCHIVE_FILE\", \"size\": $ARCHIVE_SIZE, \"floppy\": $FLOPPY_MODE, \"exit\": 0}"
+log_info "Archive complete: $ARCHIVE_FILE ($ARCHIVE_SIZE_HUMAN)"
 
 exit 0
