@@ -7,13 +7,21 @@
 # floppy-orchestrator
 #
 # Floppy disk reading orchestrator using Greaseweazle
+#
+# bash-logger: INTEGRATED (2025-11-02)
+
 set -euo pipefail
 
 # ---------- config ----------
 FLOPPY_ROOT="${FLOPPY_ROOT:-/data/fast/floppies}"
 DISK_ROOT="$FLOPPY_ROOT/disks"
 EVENT_LOG="$FLOPPY_ROOT/floppy-orchestrator.jsonl"
-LOG_FILE=""  # Set per-disk in main()
+LOG_FILE=""  # Set per-disk in main(), then log_init called
+
+# Source bash-logger (init happens in main() after LOG_FILE is set)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(cd "$SCRIPT_DIR/../lib" && pwd)"
+source "$LIB_DIR/bash-logger.sh"
 
 # Default gw settings
 DEFAULT_DRIVE="B"
@@ -21,14 +29,7 @@ DEFAULT_FORMAT="ibm.1440"
 FLUX_REVS=5
 
 # ---------- logging functions ----------
-log() {
-  local msg="[$(date -Iseconds)] $*"
-  if [[ -n "$LOG_FILE" ]]; then
-    echo "$msg" | tee -a "$LOG_FILE" >&2
-  else
-    echo "$msg" >&2
-  fi
-}
+# NOTE: log_info/log_warn/log_error provided by bash-logger.sh
 
 log_event() {
   jq -cn --arg ts "$(date -Iseconds)" \
@@ -40,7 +41,7 @@ log_event() {
 }
 
 fail() {
-  log "Error: $1"
+  log_error "Error: $1"
   log_event error "{\"msg\": \"$1\"}"
   exit 1
 }
@@ -108,18 +109,18 @@ stage_read() {
   local format="$3"
   local img_path="$4"
 
-  log "======================================"
-  log "STAGE: Read Floppy"
-  log "======================================"
-  log "Drive: $drive"
-  log "Format: $format"
-  log "Output: $img_path"
+  log_info "======================================"
+  log_info "STAGE: Read Floppy"
+  log_info "======================================"
+  log_info "Drive: $drive"
+  log_info "Format: $format"
+  log_info "Output: $img_path"
 
   log_event read_start "{\"session_hash\": \"$session_hash\", \"drive\": \"$drive\", \"format\": \"$format\"}"
 
   # Run gw read and capture output
   local gw_cmd="gw read --drive=$drive --format=$format \"$img_path\""
-  log "Running: $gw_cmd"
+  log_info "Running: $gw_cmd"
 
   local gw_output_file="/tmp/gw-output-$$"
   local exit_code=0
@@ -142,17 +143,17 @@ stage_read() {
   local sectors_total="${temp%%:*}"
   local read_status="${temp#*:}"
 
-  log "Sector stats: $sectors_found/$sectors_total ($read_status)"
+  log_info "Sector stats: $sectors_found/$sectors_total ($read_status)"
 
   # Log event based on status
   if [[ "$read_status" == "success" ]]; then
-    log "Read complete: 100% recovered"
+    log_info "Read complete: 100% recovered"
     log_event read_success "{\"session_hash\": \"$session_hash\", \"sectors\": \"$sectors_found/$sectors_total\"}"
   elif [[ "$read_status" == "partial" ]]; then
-    log "Read partial: some sectors missing (95-99% recovered)"
+    log_warn "Read partial: some sectors missing (95-99% recovered)"
     log_event read_partial "{\"session_hash\": \"$session_hash\", \"sectors\": \"$sectors_found/$sectors_total\"}"
   else
-    log "Read failed: significant data loss (<95% recovered)"
+    log_error "Read failed: significant data loss (<95% recovered)"
     log_event read_failed "{\"session_hash\": \"$session_hash\", \"sectors\": \"$sectors_found/$sectors_total\", \"exit_code\": $exit_code}"
   fi
 
@@ -166,21 +167,21 @@ stage_flux_capture() {
   local drive="$2"
   local flux_path="$3"
 
-  log "======================================"
-  log "STAGE: Flux Capture (fallback)"
-  log "======================================"
-  log "Drive: $drive"
-  log "Revolutions: $FLUX_REVS"
-  log "Output: $flux_path"
+  log_info "======================================"
+  log_info "STAGE: Flux Capture (fallback)"
+  log_info "======================================"
+  log_info "Drive: $drive"
+  log_info "Revolutions: $FLUX_REVS"
+  log_info "Output: $flux_path"
 
   log_event flux_start "{\"session_hash\": \"$session_hash\", \"revs\": $FLUX_REVS}"
 
   # Single flux capture with multiple revolutions
   if gw read --drive="$drive" --revs="$FLUX_REVS" "$flux_path" 2>&1 | tee -a "$LOG_FILE" >&2; then
-    log "Flux capture completed successfully"
-    log "Saved to: $flux_path"
+    log_info "Flux capture completed successfully"
+    log_info "Saved to: $flux_path"
   else
-    log "WARNING: Flux capture failed"
+    log_warn "Flux capture failed"
   fi
 
   log_event flux_complete "{\"session_hash\": \"$session_hash\"}"
@@ -204,7 +205,7 @@ write_metadata() {
 
   local metadata_file="metadata.json"
 
-  log "Writing metadata to $metadata_file"
+  log_info "Writing metadata to $metadata_file"
 
   # Compute diagnostics
   local img_size=0
@@ -231,7 +232,7 @@ write_metadata() {
     --argjson exit_code "$exit_code" \
     --arg img_file "$img_file" \
     --argjson scp_files "$scp_files" \
-    --arg log_file "${session_hash}.log" \
+    --arg log_file "${session_hash}.jsonl" \
     --argjson img_size "$img_size" \
     --argjson flux_revs "$FLUX_REVS" \
     --argjson sectors_found "$sectors_found" \
@@ -262,7 +263,7 @@ write_metadata() {
     }' > "$metadata_file"
 
   chmod 644 "$metadata_file" 2>/dev/null || true
-  log "Metadata written successfully"
+  log_info "Metadata written successfully"
 }
 
 show_disks() {
@@ -583,26 +584,27 @@ main() {
   local timestamp=$(date -Iseconds)
   local session_hash=$(generate_session_hash "$timestamp" "$MESSAGE" "$SEQUENCE")
 
-  log "======================================"
-  log "Floppy Orchestrator Starting"
-  log "======================================"
-  log "Session ID (for files/tracking): $session_hash"
-  log "Message: $MESSAGE"
-  log "Sequence: $SEQUENCE"
-  log "Timestamp: $timestamp"
-
-  log_event start "{\"session_hash\": \"$session_hash\", \"message\": \"$MESSAGE\", \"sequence\": $SEQUENCE}"
-
   # Create work directory
   local work_dir="$DISK_ROOT/$session_hash"
   mkdir -p "$work_dir"
   cd "$work_dir"
 
-  log "Work directory: $work_dir"
+  # Set up per-disk log file and initialize bash-logger
+  LOG_FILE="$work_dir/${session_hash}.jsonl"
+  log_init || exit 1  # TODO: Add fallback to stderr-only logging if init fails
 
-  # Set up per-disk log file
-  LOG_FILE="${session_hash}.log"
-  log "Log file: $LOG_FILE"
+  log_info "======================================"
+  log_info "Floppy Orchestrator Starting"
+  log_info "======================================"
+  log_info "Session ID (for files/tracking): $session_hash"
+  log_info "Message: $MESSAGE"
+  log_info "Sequence: $SEQUENCE"
+  log_info "Timestamp: $timestamp"
+
+  log_event start "{\"session_hash\": \"$session_hash\", \"message\": \"$MESSAGE\", \"sequence\": $SEQUENCE}"
+
+  log_info "Work directory: $work_dir"
+  log_info "Log file: $LOG_FILE"
 
   # Define file paths
   local img_file="${session_hash}.img"
@@ -625,14 +627,14 @@ main() {
   # Always compute content hash if .img exists
   if [[ -f "$img_file" ]]; then
     img_path="$img_file"
-    log "Computing content hash..."
+    log_info "Computing content hash..."
     content_hash=$(compute_content_hash "$img_file")
-    log "Content checksum (disk image): $content_hash"
+    log_info "Content checksum (disk image): $content_hash"
   fi
 
   # For partial or failed reads, also capture flux
   if [[ "$read_status" == "partial" || "$read_status" == "failed" ]]; then
-    log "Capturing flux for partial/failed read..."
+    log_info "Capturing flux for partial/failed read..."
     stage_flux_capture "$session_hash" "$DRIVE" "$flux_file"
 
     # Build SCP file list
@@ -657,9 +659,9 @@ main() {
     "$sectors_found" \
     "$sectors_total"
 
-  log "======================================"
-  log "COMPLETE: Session $session_hash, Status = $read_status"
-  log "======================================"
+  log_info "======================================"
+  log_info "COMPLETE: Session $session_hash, Status = $read_status"
+  log_info "======================================"
   log_event done "{\"session_hash\": \"$session_hash\", \"read_status\": \"$read_status\", \"exit\": $exit_code}"
 
   return $exit_code
