@@ -16,20 +16,20 @@ docs/archive-extraction-plan.md
 
 ## Overview
 
-Extract and decompress all archive/compressed files in the NTT collection, creating virtual media for their contents. Mark decompression intermediates (e.g., `.tar` from `.tar.gz`) for potential future cleanup. Preserve everything initially, optimize later with data.
+Extract and decompress all archive/compressed files in the NTT collection, creating extracted media for their contents. Mark decompression intermediates (e.g., `.tar` from `.tar.gz`) for potential future cleanup. Preserve everything initially, optimize later with data.
 
 ### Goals
 
 1. Extract all compressed files (.gz, .bz2, .xz) to uncompressed blobs
 2. Extract all archives (.tar, .zip, .7z) to individual file blobs
 3. Handle nested archives recursively (e.g., .tar.gz → .tar → files)
-4. Create virtual media for extracted contents with proper path/inode entries
+4. Create extracted media for extracted contents with proper path/inode entries
 5. Enable deduplication across archive contents
 6. Mark intermediates for optional future cleanup
 
 ### Key Design Decisions
 
-- **Virtual medium per archive** - Each archive/compressed file becomes a virtual medium
+- **Extracted medium per archive** - Each archive/compressed file becomes a extracted medium
 - **Use archive blobid as medium_hash** - Natural 1:1 mapping
 - **One extraction per unique blob** - Same archive on multiple disks → extract once, unique index enforces this
 - **Provenance via path table** - Query joins reveal all original locations of any blob
@@ -75,7 +75,7 @@ Extract and decompress all archive/compressed files in the NTT collection, creat
 ### Schema: Medium Table Extensions
 
 ```sql
--- Track virtual media and extraction metadata
+-- Track extracted media and extraction metadata
 ALTER TABLE medium
   ADD COLUMN medium_type TEXT DEFAULT 'physical',
   ADD COLUMN source_blobid TEXT,
@@ -85,7 +85,7 @@ ALTER TABLE medium
 -- Constraints
 ALTER TABLE medium
   ADD CONSTRAINT medium_type_check
-  CHECK (medium_type IN ('physical', 'virtual', 'carved'));
+  CHECK (medium_type IN ('physical', 'extracted', 'carved'));
 
 -- Indexes
 CREATE INDEX idx_medium_type ON medium(medium_type);
@@ -95,11 +95,11 @@ CREATE INDEX idx_medium_source_blobid ON medium(source_blobid)
 -- One extraction per blob (deduplication)
 CREATE UNIQUE INDEX idx_medium_one_extraction_per_blob
   ON medium(source_blobid)
-  WHERE medium_type = 'virtual';
+  WHERE medium_type = 'extracted';
 ```
 
 **Column semantics:**
-- `medium_type`: 'physical' (disk), 'virtual' (extracted/decompressed), 'carved'
+- `medium_type`: 'physical' (disk), 'extracted' (from archives/compression), 'carved' (PhotoRec)
 - `source_blobid`: The archive blob that was extracted (NULL for physical media)
 - `extraction_method`: 'gzip', 'bzip2', 'tar', 'zip', '7z', etc.
 - `extracted_at`: When extraction completed
@@ -187,7 +187,7 @@ SELECT extraction_status, COUNT(*) FROM blobs GROUP BY extraction_status;
 
 - [ ] Create `bin/ntt-extractor.py` skeleton
 - [ ] Implement ExtractionQueue class (depth-first LIFO)
-- [ ] Implement VirtualMediumManager
+- [ ] Implement ExtractedMediumManager
 - [ ] Implement ProgressLogger with stats/ETA
 - [ ] Add CLI argument parsing
 - [ ] Add structured JSON logging to `/var/log/ntt/extractor.jsonl`
@@ -216,8 +216,8 @@ Options:
 - Sort by size ASC for quick wins
 - Track processed count and stats
 
-**VirtualMediumManager:**
-- Create virtual medium records
+**ExtractedMediumManager:**
+- Create extracted medium records
 - Create partitions (inode_p_*, path_p_*)
 - Generate synthetic inodes: `ino = hash(medium_hash || path)`
 - Bulk insert inode/path entries
@@ -234,7 +234,7 @@ def already_extracted(blobid):
     result = db.query("""
         SELECT medium_hash FROM medium
         WHERE source_blobid = %s
-          AND medium_type = 'virtual'
+          AND medium_type = 'extracted'
     """, (blobid,))
     return result[0] if result else None
 ```
@@ -280,14 +280,14 @@ def decompress_blob(blobid, mime_type):
     """
     Decompress single-file compression formats.
 
-    Creates virtual medium containing decompressed file.
+    Creates extracted medium containing decompressed file.
     Marks decompressed blob as intermediate.
     """
     # 1. Check if already extracted (dedup)
     existing = db.query("""
         SELECT medium_hash FROM medium
         WHERE source_blobid = %s
-          AND medium_type = 'virtual'
+          AND medium_type = 'extracted'
     """, (blobid,))
 
     if existing:
@@ -321,15 +321,15 @@ def decompress_blob(blobid, mime_type):
             intermediate_of=blobid
         )
 
-    # 7. Create virtual medium
-    create_virtual_medium(
+    # 7. Create extracted medium
+    create_extracted_medium(
         medium_hash=blobid,
         source_blobid=blobid,
-        medium_type='virtual',
+        medium_type='extracted',
         extraction_method=mime_to_method(mime_type)
     )
 
-    # 8. Add file to virtual medium
+    # 8. Add file to extracted medium
     original_filename = get_original_filename(blobid)
     decompressed_filename = strip_extension(original_filename, mime_type)
 
@@ -391,14 +391,14 @@ def extract_archive(blobid, mime_type):
     """
     Extract multi-file archives.
 
-    Creates virtual medium containing all extracted files.
+    Creates extracted medium containing all extracted files.
     Marks extracted files as NOT intermediate (they're real files).
     """
     # 1. Check if already extracted (dedup)
     existing = db.query("""
         SELECT medium_hash FROM medium
         WHERE source_blobid = %s
-          AND medium_type = 'virtual'
+          AND medium_type = 'extracted'
     """, (blobid,))
 
     if existing:
@@ -414,11 +414,11 @@ def extract_archive(blobid, mime_type):
         # 4. Extract archive
         extract_to_dir(blob_path, temp_dir, mime_type)
 
-        # 5. Create virtual medium
-        create_virtual_medium(
+        # 5. Create extracted medium
+        create_extracted_medium(
             medium_hash=blobid,
             source_blobid=blobid,
-            medium_type='virtual',
+            medium_type='extracted',
             extraction_method=mime_to_method(mime_type)
         )
 
@@ -510,7 +510,7 @@ FROM blobs b
 JOIN inode i ON i.blobid = b.blobid
 WHERE b.is_intermediate;
 
--- Check virtual media created
+-- Check extracted media created
 SELECT medium_type, extraction_method, COUNT(*)
 FROM medium
 GROUP BY medium_type, extraction_method;
@@ -542,10 +542,10 @@ WHERE tablename LIKE 'inode_p_%'
     FROM medium
   );
 
--- Check source_blobid populated for virtual media
+-- Check source_blobid populated for extracted media
 SELECT COUNT(*)
 FROM medium
-WHERE medium_type = 'virtual'
+WHERE medium_type = 'extracted'
   AND source_blobid IS NULL;
 -- Should be 0
 
@@ -559,7 +559,7 @@ FROM path extracted
 JOIN medium vm ON vm.medium_hash = extracted.medium_hash
 JOIN path archive_paths ON archive_paths.blobid = vm.source_blobid
 WHERE extracted.blobid = 'some_target_file_blob'
-  AND vm.medium_type = 'virtual'
+  AND vm.medium_type = 'extracted'
 LIMIT 10;
 ```
 
@@ -764,10 +764,10 @@ Set up alerts for:
 Run all validation queries from Phase 5, plus:
 
 ```sql
--- Check all virtual media have source_blobid
+-- Check all extracted media have source_blobid
 SELECT COUNT(*)
 FROM medium
-WHERE medium_type = 'virtual'
+WHERE medium_type = 'extracted'
   AND source_blobid IS NULL;
 -- Expected: 0
 
@@ -812,7 +812,7 @@ for i in {1..100}; do
     FROM inode i
     JOIN path p USING (medium_hash, ino)
     JOIN medium m USING (medium_hash)
-    WHERE m.medium_type = 'virtual'
+    WHERE m.medium_type = 'extracted'
       AND i.fs_type = 'f'
     ORDER BY RANDOM()
     LIMIT 1
@@ -844,8 +844,8 @@ UNION ALL
 SELECT 'Files extracted', SUM(files_extracted)
 FROM blobs WHERE extraction_status = 'complete'
 UNION ALL
-SELECT 'Virtual media created', COUNT(*)
-FROM medium WHERE medium_type = 'virtual'
+SELECT 'Extracted media created', COUNT(*)
+FROM medium WHERE medium_type = 'extracted'
 UNION ALL
 SELECT 'Partitions created', COUNT(*) / 2
 FROM pg_tables WHERE tablename LIKE 'inode_p_%' OR tablename LIKE 'path_p_%';
@@ -938,7 +938,7 @@ Delete intermediate blobs to reclaim storage if space becomes constrained.
 
 - [ ] All extractable blobs processed (extraction_status != 'pending')
 - [ ] Intermediate files marked correctly (is_intermediate flag accurate)
-- [ ] Virtual media created with correct parent relationships
+- [ ] Extracted media created with source_blobid populated
 - [ ] All integrity checks pass (see Phase 8)
 - [ ] Storage increase < 1.2 TB
 - [ ] Failure rate < 10%
@@ -983,7 +983,7 @@ Delete intermediate blobs to reclaim storage if space becomes constrained.
 
 **Contingency:**
 - Consolidate small partitions if needed
-- Use single partition for all virtual media (architectural change)
+- Use single partition for all extracted media (architectural change)
 
 ### Risk 3: Processing Too Slow
 
@@ -1042,7 +1042,7 @@ Delete intermediate blobs to reclaim storage if space becomes constrained.
 - Reversible decision (can cleanup later)
 - Measured overhead: ~440 GB (10% of total expansion)
 
-**Why virtual media model?**
+**Why extracted media model?**
 - Clean schema (no path syntax hacks)
 - One extraction per unique blob (enforced by unique index)
 - Provenance preserved via path table joins
