@@ -47,7 +47,13 @@ REMOTE_MOUNTPOINT="/storage"
 # Initialize logging
 # shellcheck source=../lib/bash-logger.sh
 source "$LIB_DIR/bash-logger.sh"
-log_init || exit 1  # TODO: Add fallback to stderr-only logging if init fails
+if ! log_init; then
+  # Fallback to stderr-only logging if JSONL init fails
+  echo "[$(date -Iseconds)] WARNING: JSONL logging unavailable, falling back to stderr" >&2
+  log_info() { echo "[$(date -Iseconds)] INFO: $*" >&2; }
+  log_warn() { echo "[$(date -Iseconds)] WARN: $*" >&2; }
+  log_error() { echo "[$(date -Iseconds)] ERROR: $*" >&2; }
+fi
 
 # Source common libraries
 # shellcheck source=../lib/backup-rsync-common.sh

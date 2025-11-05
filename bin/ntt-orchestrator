@@ -261,10 +261,16 @@ identify_device() {
       echo "Skipped for small/removable device"
       echo ""
     else
-      # NOTE: For partitions (e.g., /dev/sdc1), USB bridges may block SMART access.
+      # Auto-detect partition and query parent device for SMART
+      # For partitions (e.g., /dev/sdc1), USB bridges may block SMART access.
       # Always check parent device (e.g., /dev/sdc) for real disk SMART data.
-      # TODO: Auto-detect partition and query parent device for SMART
-      sudo smartctl -a "$dev" 2>&1 || echo "smartctl failed or not available"
+      smart_dev="$dev"
+      if [[ "$dev" =~ ^/dev/[a-z]+[0-9]+$ || "$dev" =~ ^/dev/nvme[0-9]+n[0-9]+p[0-9]+$ ]]; then
+        # Device is a partition, extract parent
+        smart_dev=$(echo "$dev" | sed -E 's/[0-9]+$//' | sed -E 's/p[0-9]+$//')
+        echo "NOTE: Detected partition $dev, querying parent device $smart_dev for SMART data"
+      fi
+      sudo smartctl -a "$smart_dev" 2>&1 || echo "smartctl failed or not available"
       echo ""
     fi
 
