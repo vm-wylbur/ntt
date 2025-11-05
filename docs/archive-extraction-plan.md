@@ -31,9 +31,10 @@ Extract and decompress all archive/compressed files in the NTT collection, creat
 
 - **Virtual medium per archive** - Each archive/compressed file becomes a virtual medium
 - **Use archive blobid as medium_hash** - Natural 1:1 mapping
+- **One extraction per unique blob** - Same archive on multiple disks → extract once, unique index enforces this
+- **Provenance via path table** - Query joins reveal all original locations of any blob
 - **Keep intermediates initially** - Simpler code, measure impact, cleanup later if needed
-- **Depth-first processing** - Process nested archives immediately
-- **Cycle detection** - Prevent infinite loops from pathological archives
+- **Queue-based processing** - Process nested archives as they're discovered
 
 ---
 
@@ -77,38 +78,36 @@ Extract and decompress all archive/compressed files in the NTT collection, creat
 -- Track virtual media and extraction metadata
 ALTER TABLE medium
   ADD COLUMN medium_type TEXT DEFAULT 'physical',
-  ADD COLUMN parent_medium_hash TEXT,
+  ADD COLUMN source_blobid TEXT,
   ADD COLUMN extraction_method TEXT,
-  ADD COLUMN extraction_depth INTEGER DEFAULT 0,
-  ADD COLUMN extracted_at TIMESTAMP WITH TIME ZONE,
-  ADD COLUMN extraction_status TEXT DEFAULT 'pending';
+  ADD COLUMN extracted_at TIMESTAMP WITH TIME ZONE;
 
 -- Constraints
 ALTER TABLE medium
   ADD CONSTRAINT medium_type_check
   CHECK (medium_type IN ('physical', 'virtual', 'carved'));
 
-ALTER TABLE medium
-  ADD CONSTRAINT fk_parent_medium
-  FOREIGN KEY (parent_medium_hash)
-  REFERENCES medium(medium_hash)
-  ON DELETE CASCADE;
-
 -- Indexes
 CREATE INDEX idx_medium_type ON medium(medium_type);
-CREATE INDEX idx_medium_parent ON medium(parent_medium_hash)
-  WHERE parent_medium_hash IS NOT NULL;
-CREATE INDEX idx_medium_extraction_pending ON medium(medium_hash)
-  WHERE extraction_status = 'pending';
+CREATE INDEX idx_medium_source_blobid ON medium(source_blobid)
+  WHERE source_blobid IS NOT NULL;
+
+-- One extraction per blob (deduplication)
+CREATE UNIQUE INDEX idx_medium_one_extraction_per_blob
+  ON medium(source_blobid)
+  WHERE medium_type = 'virtual';
 ```
 
 **Column semantics:**
 - `medium_type`: 'physical' (disk), 'virtual' (extracted/decompressed), 'carved'
-- `parent_medium_hash`: Points to containing medium (NULL for physical media)
+- `source_blobid`: The archive blob that was extracted (NULL for physical media)
 - `extraction_method`: 'gzip', 'bzip2', 'tar', 'zip', '7z', etc.
-- `extraction_depth`: Distance from physical medium (0=physical, 1+=nested)
 - `extracted_at`: When extraction completed
-- `extraction_status`: 'pending', 'in_progress', 'complete', 'failed'
+
+**Provenance tracking:**
+- Each unique blob is extracted once (enforced by unique index)
+- To find all original locations of extracted content, join back through path table
+- Example: `backup.tar.gz` appears on 3 disks → extracted once, but path table shows all 3 original locations
 
 ### Schema: Blobs Table Extensions
 
@@ -159,12 +158,17 @@ CREATE INDEX idx_blobs_extraction_failed ON blobs(blobid)
 SELECT column_name, data_type
 FROM information_schema.columns
 WHERE table_name = 'medium'
-  AND column_name IN ('medium_type', 'parent_medium_hash', 'extraction_method');
+  AND column_name IN ('medium_type', 'source_blobid', 'extraction_method');
 
 SELECT column_name, data_type
 FROM information_schema.columns
 WHERE table_name = 'blobs'
   AND column_name IN ('is_intermediate', 'extraction_status');
+
+-- Check indexes created
+SELECT indexname FROM pg_indexes
+WHERE tablename = 'medium'
+  AND indexname LIKE '%extraction%';
 
 -- Check backfill
 SELECT medium_type, COUNT(*) FROM medium GROUP BY medium_type;
@@ -187,8 +191,7 @@ SELECT extraction_status, COUNT(*) FROM blobs GROUP BY extraction_status;
 - [ ] Implement ProgressLogger with stats/ETA
 - [ ] Add CLI argument parsing
 - [ ] Add structured JSON logging to `/var/log/ntt/extractor.jsonl`
-- [ ] Implement cycle detection algorithm
-- [ ] Add max depth checking (limit: 20)
+- [ ] Implement deduplication check (skip already-extracted blobs)
 - [ ] Implement resumability (reset in_progress to pending)
 - [ ] Test with mock extractors
 
@@ -201,7 +204,6 @@ Options:
   --limit N           Process only N blobs
   --format TYPE       Only process format (gzip/bzip2/tar/zip/all)
   --batch-size N      Batch size for DB inserts (default: 1000)
-  --max-depth N       Max extraction depth (default: 20)
   --dry-run           Show what would be extracted
   --resume            Resume from previous run (default: true)
 ```
@@ -225,22 +227,16 @@ Options:
 - Track: blobs processed, files extracted, bytes added, rate, ETA
 - Output format: `[timestamp] Progress: 1,234 blobs | 56,789 files | 45 GB | 123 blobs/hr | ETA: 5.2d`
 
-**CycleDetector:**
+**DeduplicationChecker:**
 ```python
-def would_create_cycle(blob_medium_hash, parent_medium_hash):
-    """Traverse parent chain to detect cycles."""
-    visited = set()
-    current = parent_medium_hash
-
-    while current:
-        if current == blob_medium_hash:
-            return True  # Cycle!
-        if current in visited:
-            return True  # Loop in chain
-        visited.add(current)
-        current = db.get_parent_medium(current)
-
-    return False
+def already_extracted(blobid):
+    """Check if this blob has already been extracted."""
+    result = db.query("""
+        SELECT medium_hash FROM medium
+        WHERE source_blobid = %s
+          AND medium_type = 'virtual'
+    """, (blobid,))
+    return result[0] if result else None
 ```
 
 ### Validation
@@ -249,8 +245,9 @@ def would_create_cycle(blob_medium_hash, parent_medium_hash):
 # Test dry-run
 ntt-extractor.py --dry-run --limit 10
 
-# Test depth limiting
-ntt-extractor.py --max-depth 3 --limit 5
+# Test deduplication (extract same blob twice)
+ntt-extractor.py --limit 5
+ntt-extractor.py --limit 5  # Should skip all 5
 
 # Check logging
 tail -f /var/log/ntt/extractor.jsonl
@@ -279,17 +276,29 @@ tail -f /var/log/ntt/extractor.jsonl
 ### Algorithm
 
 ```python
-def decompress_blob(blobid, mime_type, parent_medium, depth):
+def decompress_blob(blobid, mime_type):
     """
     Decompress single-file compression formats.
 
     Creates virtual medium containing decompressed file.
     Marks decompressed blob as intermediate.
     """
-    # 1. Load blob from by-hash
+    # 1. Check if already extracted (dedup)
+    existing = db.query("""
+        SELECT medium_hash FROM medium
+        WHERE source_blobid = %s
+          AND medium_type = 'virtual'
+    """, (blobid,))
+
+    if existing:
+        log.info(f"Blob {blobid} already extracted, skipping")
+        update_blob(blobid, extraction_status='complete')
+        return existing[0]
+
+    # 2. Load blob from by-hash
     blob_path = get_byhash_path(blobid)
 
-    # 2. Decompress streaming with hash computation
+    # 3. Decompress streaming with hash computation
     with tempfile.NamedTemporaryFile() as temp:
         decompressed_hash = decompress_and_hash(
             blob_path,
@@ -297,30 +306,30 @@ def decompress_blob(blobid, mime_type, parent_medium, depth):
             algorithm=mime_to_algorithm(mime_type)
         )
 
-        # 3. Detect MIME type of result
+        # 4. Detect MIME type of result
         decompressed_mime = detect_mime(temp.name)
 
-        # 4. Copy to by-hash (with dedup check)
+        # 5. Copy to by-hash (with dedup check)
         if not blob_exists(decompressed_hash):
             copy_to_byhash(temp.name, decompressed_hash)
             insert_blob(decompressed_hash, mime=decompressed_mime)
 
-        # 5. Mark as intermediate
+        # 6. Mark as intermediate
         update_blob(
             decompressed_hash,
             is_intermediate=True,
             intermediate_of=blobid
         )
 
-    # 6. Create virtual medium
+    # 7. Create virtual medium
     create_virtual_medium(
         medium_hash=blobid,
-        parent_medium_hash=parent_medium,
-        extraction_method=mime_to_method(mime_type),
-        extraction_depth=depth
+        source_blobid=blobid,
+        medium_type='virtual',
+        extraction_method=mime_to_method(mime_type)
     )
 
-    # 7. Add file to virtual medium
+    # 8. Add file to virtual medium
     original_filename = get_original_filename(blobid)
     decompressed_filename = strip_extension(original_filename, mime_type)
 
@@ -332,11 +341,11 @@ def decompress_blob(blobid, mime_type, parent_medium, depth):
         size=get_file_size(decompressed_hash)
     )
 
-    # 8. If decompressed content is extractable, queue it
+    # 9. If decompressed content is extractable, queue it
     if decompressed_mime in EXTRACTABLE_MIMES:
-        queue.push((decompressed_hash, decompressed_mime, blobid, depth+1))
+        queue.push((decompressed_hash, decompressed_mime))
 
-    # 9. Mark original blob as complete
+    # 10. Mark original blob as complete
     update_blob(blobid, extraction_status='complete', files_extracted=1)
 ```
 
@@ -378,30 +387,42 @@ psql -c "SELECT blobid, is_intermediate, intermediate_of FROM blobs WHERE is_int
 ### Algorithm
 
 ```python
-def extract_archive(blobid, mime_type, parent_medium, depth):
+def extract_archive(blobid, mime_type):
     """
     Extract multi-file archives.
 
     Creates virtual medium containing all extracted files.
     Marks extracted files as NOT intermediate (they're real files).
     """
-    # 1. Load blob from by-hash
+    # 1. Check if already extracted (dedup)
+    existing = db.query("""
+        SELECT medium_hash FROM medium
+        WHERE source_blobid = %s
+          AND medium_type = 'virtual'
+    """, (blobid,))
+
+    if existing:
+        log.info(f"Blob {blobid} already extracted, skipping")
+        update_blob(blobid, extraction_status='complete')
+        return existing[0]
+
+    # 2. Load blob from by-hash
     blob_path = get_byhash_path(blobid)
 
-    # 2. Create temp extraction directory
+    # 3. Create temp extraction directory
     with tempfile.TemporaryDirectory() as temp_dir:
-        # 3. Extract archive
+        # 4. Extract archive
         extract_to_dir(blob_path, temp_dir, mime_type)
 
-        # 4. Create virtual medium
+        # 5. Create virtual medium
         create_virtual_medium(
             medium_hash=blobid,
-            parent_medium_hash=parent_medium,
-            extraction_method=mime_to_method(mime_type),
-            extraction_depth=depth
+            source_blobid=blobid,
+            medium_type='virtual',
+            extraction_method=mime_to_method(mime_type)
         )
 
-        # 5. Walk extracted filesystem
+        # 6. Walk extracted filesystem
         extracted_files = []
         for root, dirs, files in os.walk(temp_dir):
             for filename in files:
@@ -429,12 +450,12 @@ def extract_archive(blobid, mime_type, parent_medium, depth):
 
                 # Queue if extractable
                 if file_mime in EXTRACTABLE_MIMES:
-                    queue.push((file_hash, file_mime, blobid, depth+1))
+                    queue.push((file_hash, file_mime))
 
-        # 6. Bulk insert inode/path entries
+        # 7. Bulk insert inode/path entries
         batch_insert_inodes_and_paths(blobid, extracted_files, batch_size=1000)
 
-        # 7. Mark complete
+        # 8. Mark complete
         update_blob(
             blobid,
             extraction_status='complete',
@@ -472,9 +493,8 @@ psql -c "\dt inode_p_*" | tail -20
 - [ ] **Simple archive:** `backup.tar` → 100 files
 - [ ] **Compressed archive:** `backup.tar.gz` → .tar (intermediate) → 100 files
 - [ ] **Nested archives:** `outer.zip` → `inner.tar.gz` → .tar → files
-- [ ] **Deep nesting:** 10 levels deep (test max depth)
-- [ ] **Cycle detection:** Crafted archive containing itself
-- [ ] **Deduplication:** Two archives with shared files
+- [ ] **Duplicate blob deduplication:** Same archive on multiple disks → extracted once
+- [ ] **Content deduplication:** Two archives with shared files → blobs stored once
 - [ ] **Corrupted file:** Incomplete .gz (test error handling)
 - [ ] **Password-protected:** Encrypted .zip (test graceful failure)
 - [ ] **Interruption:** Kill process mid-extraction, verify resume works
@@ -522,12 +542,25 @@ WHERE tablename LIKE 'inode_p_%'
     FROM medium
   );
 
--- Check parent relationships valid
+-- Check source_blobid populated for virtual media
 SELECT COUNT(*)
 FROM medium
 WHERE medium_type = 'virtual'
-  AND parent_medium_hash IS NULL;
+  AND source_blobid IS NULL;
 -- Should be 0
+
+-- Test provenance query: find all original locations of an extracted file
+SELECT
+  extracted.path as extracted_path,
+  vm.source_blobid as archive_blobid,
+  archive_paths.path as archive_original_path,
+  archive_paths.medium_hash as original_disk_hash
+FROM path extracted
+JOIN medium vm ON vm.medium_hash = extracted.medium_hash
+JOIN path archive_paths ON archive_paths.blobid = vm.source_blobid
+WHERE extracted.blobid = 'some_target_file_blob'
+  AND vm.medium_type = 'virtual'
+LIMIT 10;
 ```
 
 ---
@@ -731,11 +764,11 @@ Set up alerts for:
 Run all validation queries from Phase 5, plus:
 
 ```sql
--- Check all virtual media have parents
+-- Check all virtual media have source_blobid
 SELECT COUNT(*)
 FROM medium
 WHERE medium_type = 'virtual'
-  AND parent_medium_hash IS NULL;
+  AND source_blobid IS NULL;
 -- Expected: 0
 
 -- Check intermediate relationships valid
@@ -1011,16 +1044,17 @@ Delete intermediate blobs to reclaim storage if space becomes constrained.
 
 **Why virtual media model?**
 - Clean schema (no path syntax hacks)
-- Natural parent relationships (graph traversal)
-- Supports arbitrary nesting
+- One extraction per unique blob (enforced by unique index)
+- Provenance preserved via path table joins
 - Consistent with current architecture
 - Scales to millions of archives
 
-**Why depth-first processing?**
-- More coherent (fully process each archive tree)
-- Better for debugging (clear lineage)
-- Natural recursion model
-- Cache-friendly (parent context hot)
+**Why one-extraction-per-blob?**
+- Eliminates redundant extraction work
+- Same blob on 10 disks → extract once, reference everywhere
+- Provenance fully preserved (query path table for all original locations)
+- Simple deduplication logic (single unique index)
+- Natural extension of content-addressable storage model
 
 ### Open Questions
 
