@@ -27,7 +27,7 @@ Performance testing shows **tar streaming with parallel workers achieves 5.2x sp
 ### Infrastructure
 - **Source:** `/data/cold/by-hash` on snowball
 - **Destination:** `pball@chll-direct:/storage/pball/by-hash`
-- **Connection:** SSH over Tailscale (direct IP 209.121.245.6:1222)
+- **Connection:** SSH to direct public IP (209.121.245.6:1222)
 - **SSH Baseline:** 66.6 MB/s throughput ceiling
 
 ### Workload Characteristics
@@ -451,7 +451,7 @@ dd if=/dev/zero bs=1M count=1000 | ssh -C chll-direct 'cat > /dev/null'
 ### Network Characteristics
 
 **Connection details:**
-- Host: 209.121.245.6:1222 (chll via Tailscale)
+- Host: 209.121.245.6:1222 (chll direct public IP)
 - RTT: 28ms average
 - Cipher: chacha20-poly1305@openssh.com
 - Throughput: ~12 MB/s for real data
