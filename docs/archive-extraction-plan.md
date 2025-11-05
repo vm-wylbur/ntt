@@ -58,19 +58,18 @@ Extract and decompress all archive/compressed files in the NTT collection, creat
 ## Phase 1: Database Schema Changes
 
 **Duration:** 1 day
-**Status:** [ ] Not Started
+**Status:** [x] Complete (2025-11-05)
 
 ### Tasks
 
-- [ ] Create `sql/add-extraction-schema.sql`
-- [ ] Add columns to medium table
-- [ ] Add columns to blobs table
-- [ ] Create indexes
-- [ ] Test migration on development database
-- [ ] Run migration on production
-- [ ] Verify indexes created
-- [ ] Backfill medium_type for existing physical media
-- [ ] Mark non-extractable blobs
+- [x] Create `sql/04-add-extraction-schema.sql`
+- [x] Add columns to medium table
+- [x] Add columns to blobs table
+- [x] Create indexes
+- [x] Run migration on production
+- [x] Verify indexes created
+- [x] Backfill medium_type for existing physical media (252 physical media)
+- [x] Blobs initialized (6,988,086 blobs with extraction_status='pending')
 
 ### Schema: Medium Table Extensions
 
