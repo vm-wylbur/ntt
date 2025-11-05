@@ -1697,11 +1697,11 @@ Usage:
   sudo $0 --load-only /path/to/file.raw                   # Load .raw into database
 
 Current implementation status:
-  ❌ TODO: Device imaging, mounting, health checks
+  ✅ WORKING: Disk image processing (imaging, mounting, health checks via ntt-mount-helper)
   ✅ WORKING: Directory enumeration → .raw files → PostgreSQL loading
-  ✅ WORKING: Disk image processing (content-based hash, auto mount/unmount)
+  ✅ WORKING: Copy workers (file copying/deduplication via ntt-copier.py)
   ✅ WORKING: .raw file loading into database
-  ❌ TODO: Copy workers (file copying/deduplication)
+  ⚠️  PARTIAL: Raw device /dev/sdX (basic enumeration only, no ddrescue integration yet)
 
 Modes:
   /path/to/dir    Enumerate directory, optionally load to database

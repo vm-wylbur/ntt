@@ -8,12 +8,15 @@
 #
 # Progressive 7-phase ddrescue imaging - never give up until 100% or exhausted
 #
-# TODO: Migrate to bash-logger.sh (see ntt-backup-usb.sh for pattern)
-#       1. Change LOGFILE to LOG_FILE with .jsonl extension
-#       2. Source bash-logger.sh and call log_init
-#       3. Replace log() calls with log_info/log_warn/log_error
+# bash-logger: INTEGRATED (2025-11-05)
 
 set -euo pipefail
+
+# Configuration
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(cd "$SCRIPT_DIR/../lib" && pwd)"
+
+LOG_FILE="/var/log/ntt/imager.jsonl"
 
 # ---------- Arguments ----------
 if [[ $# -lt 3 ]]; then
@@ -46,7 +49,12 @@ fi
 DEVICE="$1"
 OUTPUT="$2"
 MAPFILE="$3"
-LOGFILE="${OUTPUT%.img}-ddrescue.log"
+DDRESCUE_LOG="${OUTPUT%.img}-ddrescue.log"
+
+# Initialize logging
+# shellcheck source=../lib/bash-logger.sh
+source "$LIB_DIR/bash-logger.sh"
+log_init || exit 1
 
 # ---------- Validation ----------
 if [[ ! -e "$DEVICE" ]]; then
@@ -80,7 +88,9 @@ fi
 START_TIME=$(date +%s)
 
 log() {
-  echo "[$(date -Iseconds)] $*" | tee -a "$LOGFILE"
+  # Dual logging: JSON via bash-logger + text to ddrescue log
+  log_info "$*"
+  echo "[$(date -Iseconds)] $*" >> "$DDRESCUE_LOG"
 }
 
 cleanup_and_exit() {
@@ -89,7 +99,7 @@ cleanup_and_exit() {
   # Eject CD/DVD if device is optical drive
   if [[ "$DEVICE" == "/dev/sr0" ]] || [[ "$DEVICE" == "/dev/cdrom" ]]; then
     log "Ejecting optical drive: $DEVICE"
-    eject "$DEVICE" 2>&1 | tee -a "$LOGFILE" || log "Warning: Failed to eject $DEVICE"
+    eject "$DEVICE" 2>&1 | tee -a "$DDRESCUE_LOG" || log "Warning: Failed to eject $DEVICE"
   fi
 
   exit "$exit_code"
@@ -171,7 +181,7 @@ run_phase() {
   log "======================================"
 
   # Run ddrescue with given arguments
-  ddrescue "$@" "$DEVICE" "$OUTPUT" "$MAPFILE" 2>&1 | tee -a "$LOGFILE" || true
+  ddrescue "$@" "$DEVICE" "$OUTPUT" "$MAPFILE" 2>&1 | tee -a "$DDRESCUE_LOG" || true
 
   local unfinished=$(count_unfinished_sectors "$MAPFILE")
   local pct=$(parse_mapfile_percentage "$MAPFILE")
@@ -194,7 +204,8 @@ log "======================================"
 log "Device: $DEVICE"
 log "Output: $OUTPUT"
 log "Mapfile: $MAPFILE"
-log "Log: $LOGFILE"
+log "DDrescue log: $DDRESCUE_LOG"
+log "JSON log: $LOG_FILE"
 
 if [[ -f "$MAPFILE" ]]; then
   log "Existing mapfile found - will resume"

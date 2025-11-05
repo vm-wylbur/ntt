@@ -41,12 +41,15 @@
 # SEE ALSO:
 #   docs/carved-ingestion-workflow.md - Full workflow documentation
 #
-# TODO: Migrate to bash-logger.sh (see ntt-backup-usb.sh for pattern)
-#       1. Change LOG_JSON to LOG_FILE with .jsonl extension
-#       2. Source bash-logger.sh and call log_init
-#       3. Replace log() calls with log_info/log_warn/log_error
+# bash-logger: INTEGRATED (2025-11-05)
 
 set -euo pipefail
+
+# Configuration
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(cd "$SCRIPT_DIR/../lib" && pwd)"
+
+LOG_FILE="${NTT_ENUM_LOG:-/var/log/ntt/enum.jsonl}"
 
 # ---------- argparse ----------
 usage() {
@@ -61,19 +64,20 @@ usage() {
 [[ $# -eq 3 ]] || usage
 CARVED_ROOT="$1"; MEDIUM_HASH="$2"; OUT="$3"
 
-# ---------- env / config ----------
-LOG_JSON="${NTT_ENUM_LOG:-/var/log/ntt/enum.jsonl}"
-mkdir -p "$(dirname "$LOG_JSON")"
+# Initialize logging
+# shellcheck source=../lib/bash-logger.sh
+source "$LIB_DIR/bash-logger.sh"
+log_init || exit 1
+
+mkdir -p "$(dirname "$LOG_FILE")"
 mkdir -p "$(dirname "$OUT")"
-chmod 755 "$(dirname "$LOG_JSON")" 2>/dev/null || true
+chmod 755 "$(dirname "$LOG_FILE")" 2>/dev/null || true
 chmod 755 "$(dirname "$OUT")" 2>/dev/null || true
 
 # ---------- JSON helper ----------
-log() {
-  jq -cn --arg ts "$(date -Iseconds)" \
-        --arg stage "$1" \
-        --argjson extra "$2" \
-  >> "$LOG_JSON"
+log_stage() {
+  # Structured stage logging via bash-logger
+  log_info "$1" "$2"
 }
 
 # ---------- sanity checks ----------
@@ -97,7 +101,7 @@ RECUP_COUNT=$(echo "$CARVED_DIRS" | grep -c 'recup_dir\.' || true)
 echo "[$(date -Iseconds)] Found $DIR_COUNT PhotoRec directories ($CARVED_COUNT carved.*, $RECUP_COUNT recup_dir.*)" >&2
 
 # ---------- enumerate ----------
-log start "{\"root\": \"$CARVED_ROOT\", \"medium_hash\": \"$MEDIUM_HASH\", \"out\": \"$OUT\", \"dir_count\": $DIR_COUNT}"
+log_stage start "{\"root\": \"$CARVED_ROOT\", \"medium_hash\": \"$MEDIUM_HASH\", \"out\": \"$OUT\", \"dir_count\": $DIR_COUNT}"
 
 # Temporary file for building output
 TMP_OUT="${OUT}.tmp.$$"
@@ -147,8 +151,8 @@ mv "$TMP_OUT" "$OUT"
 chmod 644 "$OUT" 2>/dev/null || true
 
 echo "[$(date -Iseconds)] ✓ Enumeration complete: $TOTAL_FILES files from $DIR_COUNT directories" >&2
-log enum_complete "{\"rows\": $TOTAL_FILES, \"out\": \"$OUT\", \"dir_count\": $DIR_COUNT}"
-log done "{\"rows\": $TOTAL_FILES, \"exit\": 0}"
+log_stage enum_complete "{\"rows\": $TOTAL_FILES, \"out\": \"$OUT\", \"dir_count\": $DIR_COUNT}"
+log_stage done "{\"rows\": $TOTAL_FILES, \"exit\": 0}"
 
-chmod 644 "$LOG_JSON" 2>/dev/null || true
+chmod 644 "$LOG_FILE" 2>/dev/null || true
 exit 0

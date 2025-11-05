@@ -14,21 +14,27 @@
 #
 # Expected performance: bb22 (11.2M paths) ~5min COPY + ~30sec dedupe = ~6min total
 #
-# TODO: Migrate to bash-logger.sh (see ntt-backup-usb.sh for pattern)
-#       1. Change LOG_JSON to LOG_FILE with .jsonl extension
-#       2. Source bash-logger.sh and call log_init
-#       3. Replace log() calls with log_info/log_warn/log_error
+# bash-logger: INTEGRATED (2025-11-05)
 
 set -euo pipefail
+
+# Configuration
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(cd "$SCRIPT_DIR/../lib" && pwd)"
 
 FILE=${1:?file.raw required}
 MEDIUM_HASH=${2:?medium_hash required}
 DB_URL=${NTT_DB_URL:-postgres:///copyjob}
-LOG_JSON=${NTT_LOADER_LOG:-/var/log/ntt/loader.jsonl}
+LOG_FILE=${NTT_LOADER_LOG:-/var/log/ntt/loader.jsonl}
 ENUM_LOG=${NTT_ENUM_LOG:-/var/log/ntt/enum.jsonl}
 
-mkdir -p "$(dirname "$LOG_JSON")"
-chmod 755 "$(dirname "$LOG_JSON")" 2>/dev/null || true
+# Initialize logging
+# shellcheck source=../lib/bash-logger.sh
+source "$LIB_DIR/bash-logger.sh"
+log_init || exit 1
+
+mkdir -p "$(dirname "$LOG_FILE")"
+chmod 755 "$(dirname "$LOG_FILE")" 2>/dev/null || true
 
 # Validate ignore patterns file exists
 IGNORE_PATTERNS="${NTT_IGNORE_PATTERNS:-/home/pball/.config/ntt/ignore-patterns.txt}"
@@ -39,24 +45,20 @@ if [[ ! -f "$IGNORE_PATTERNS" ]]; then
 fi
 
 # ---------- logging functions ----------
-log() {
-  jq -cn --arg ts "$(date -Iseconds)" \
-        --arg stage "$1" \
-        --argjson extra "$2" \
-        '$extra + {ts: $ts, stage: $stage}' \
-  >> "$LOG_JSON"
-  chmod 644 "$LOG_JSON" 2>/dev/null || true
+log_stage() {
+  # Structured stage logging via bash-logger
+  log_info "$1" "$2"
 }
 
 fail() {
   echo "Error: $1" >&2
-  log error "{\"msg\": \"$1\"}"
+  log_error "$1"
   exit 1
 }
 
 # ---------- 0. auto-create partition for this medium ----------
 echo "[$(date -Iseconds)] Creating partition for medium $MEDIUM_HASH..." >&2
-log partition_check "{\"medium_hash\": \"$MEDIUM_HASH\"}"
+log_stage partition_check "{\"medium_hash\": \"$MEDIUM_HASH\"}"
 
 # Use first 8 chars of medium_hash for partition name
 PARTITION_SUFFIX="${MEDIUM_HASH:0:8}"
@@ -75,7 +77,7 @@ echo "[$(date -Iseconds)] Partition ready (inode_p_${PARTITION_SUFFIX}, path_p_$
 # ---------- 1. create working table ----------
 TABLE_NAME="tmp_path_$$"
 echo "[$(date -Iseconds)] Creating working table..." >&2
-log start "{\"file\": \"$FILE\", \"medium_hash\": \"$MEDIUM_HASH\"}"
+log_stage start "{\"file\": \"$FILE\", \"medium_hash\": \"$MEDIUM_HASH\"}"
 
 # Create temp table that matches raw file format
 TEMP_TABLE="raw_$$"
@@ -105,7 +107,7 @@ CREATE TABLE $TABLE_NAME (
 
 # ---------- 2. raw → working table (034 delimiter) ----------
 echo "[$(date -Iseconds)] Loading raw data into working table..." >&2
-log load_start "{\"file\": \"$FILE\"}"
+log_stage load_start "{\"file\": \"$FILE\"}"
 
 # Get expected record count from enum log instead of re-counting
 EXPECTED_RECORDS=$(jq -rs --arg file "$FILE" '
@@ -182,7 +184,7 @@ EXCLUDED_COUNT=$(sudo -u "${SUDO_USER:-$USER}" psql "$DB_URL" -t -A -c "
 " | tail -1)
 
 echo "[$(date -Iseconds)] Marked $EXCLUDED_COUNT paths as excluded" >&2
-log exclusions "{\"excluded\": \"$EXCLUDED_COUNT\", \"medium_hash\": \"$MEDIUM_HASH\"}"
+log_stage exclusions "{\"excluded\": \"$EXCLUDED_COUNT\", \"medium_hash\": \"$MEDIUM_HASH\"}"
 
 # Create indexes on working table for fast deduplication operations
 echo "[$(date -Iseconds)] Creating indexes on working table..." >&2
@@ -193,7 +195,7 @@ CREATE INDEX idx_${TABLE_NAME}_ino_path ON $TABLE_NAME(ino, path);
 
 # ---------- 3. dedupe into real tables ----------
 echo "[$(date -Iseconds)] Deduplicating into final tables..." >&2
-log dedupe_start "{\"medium_hash\": \"$MEDIUM_HASH\"}"
+log_stage dedupe_start "{\"medium_hash\": \"$MEDIUM_HASH\"}"
 
 # Capture start time for performance monitoring
 DEDUPE_START=$(date +%s)
@@ -295,7 +297,7 @@ ANALYZE path_p_${PARTITION_SUFFIX};
 DEDUPE_END=$(date +%s)
 DEDUPE_DURATION=$((DEDUPE_END - DEDUPE_START))
 echo "[$(date -Iseconds)] Deduplication completed in ${DEDUPE_DURATION}s" >&2
-log dedupe_complete "{\"duration_sec\": $DEDUPE_DURATION, \"medium_hash\": \"$MEDIUM_HASH\"}"
+log_stage dedupe_complete "{\"duration_sec\": $DEDUPE_DURATION, \"medium_hash\": \"$MEDIUM_HASH\"}"
 
 # Count excluded inodes (those with ALL paths excluded)
 EXCLUDED_INODES=$(sudo -u "${SUDO_USER:-$USER}" psql "$DB_URL" -t -A -c "
@@ -306,7 +308,7 @@ EXCLUDED_INODES=$(sudo -u "${SUDO_USER:-$USER}" psql "$DB_URL" -t -A -c "
 " 2>/dev/null | grep -o '[0-9]*' | head -1 || echo "0")
 
 echo "[$(date -Iseconds)] Marked $EXCLUDED_INODES inodes as EXCLUDED (all paths excluded)" >&2
-log excluded_inodes "{\"count\": \"$EXCLUDED_INODES\", \"medium_hash\": \"$MEDIUM_HASH\"}"
+log_stage excluded_inodes "{\"count\": \"$EXCLUDED_INODES\", \"medium_hash\": \"$MEDIUM_HASH\"}"
 
 # Count non-file inodes (directories, symlinks, special files)
 NON_FILE_INODES=$(sudo -u "${SUDO_USER:-$USER}" psql "$DB_URL" -t -A -c "
@@ -317,7 +319,7 @@ NON_FILE_INODES=$(sudo -u "${SUDO_USER:-$USER}" psql "$DB_URL" -t -A -c "
 " 2>/dev/null | grep -o '[0-9]*' | head -1 || echo "0")
 
 echo "[$(date -Iseconds)] Marked $NON_FILE_INODES inodes as NON_FILE (directories, symlinks, special files)" >&2
-log non_file_inodes "{\"count\": \"$NON_FILE_INODES\", \"medium_hash\": \"$MEDIUM_HASH\"}"
+log_stage non_file_inodes "{\"count\": \"$NON_FILE_INODES\", \"medium_hash\": \"$MEDIUM_HASH\"}"
 
 # ---------- 4. cleanup and summary ----------
 ROWS=$(sudo -u "${SUDO_USER:-$USER}" psql "$DB_URL" -t -A -c "SELECT count(*) FROM path WHERE medium_hash='$MEDIUM_HASH'" 2>/dev/null | grep -o '[0-9]*' | head -1 || echo "unknown")
@@ -329,6 +331,6 @@ if [[ "$ACTUAL_RECORDS" == "0" ]]; then
 else
   echo "[$(date -Iseconds)] ✓ Loading complete: $ROWS paths loaded for medium $MEDIUM_HASH" >&2
 fi
-log done "{\"rows\": \"$ROWS\", \"exit\": 0}"
+log_stage done "{\"rows\": \"$ROWS\", \"exit\": 0}"
 
 exit 0

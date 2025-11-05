@@ -8,12 +8,15 @@
 #
 # NTT raw enumerator – outputs one NUL-rec per dirent
 #
-# TODO: Migrate to bash-logger.sh (see ntt-backup-usb.sh for pattern)
-#       1. Change LOG_JSON to LOG_FILE with .jsonl extension
-#       2. Source bash-logger.sh and call log_init
-#       3. Replace log() calls with log_info/log_warn/log_error
+# bash-logger: INTEGRATED (2025-11-05)
 
 set -euo pipefail
+
+# Configuration
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(cd "$SCRIPT_DIR/../lib" && pwd)"
+
+LOG_FILE="${NTT_ENUM_LOG:-/var/log/ntt/enum.jsonl}"
 
 # ---------- argparse ----------
 usage() {
@@ -23,33 +26,34 @@ usage() {
 [[ $# -eq 3 ]] || usage
 MNT="$1"; MEDIUM_HASH="$2"; OUT="$3"
 
+# Initialize logging
+# shellcheck source=../lib/bash-logger.sh
+source "$LIB_DIR/bash-logger.sh"
+log_init || exit 1
+
 # ---------- env / config ----------
-LOG_JSON="${NTT_ENUM_LOG:-/var/log/ntt/enum.jsonl}"
 IGNORE_PATTERNS="${NTT_IGNORE_PATTERNS:-}"
-mkdir -p "$(dirname "$LOG_JSON")"
+mkdir -p "$(dirname "$LOG_FILE")"
 mkdir -p "$(dirname "$OUT")"
 
 # Make directories world readable
-chmod 755 "$(dirname "$LOG_JSON")" 2>/dev/null || true
+chmod 755 "$(dirname "$LOG_FILE")" 2>/dev/null || true
 chmod 755 "$(dirname "$OUT")" 2>/dev/null || true
 
 # ---------- JSON helper ----------
-log() {
-  jq -cn --arg ts "$(date -Iseconds)" \
-        --arg stage "$1" \
-        --argjson extra "$2" \
-        '$extra + {ts: $ts, stage: $stage}' \
-  >> "$LOG_JSON"
+log_stage() {
+  # Structured stage logging via bash-logger
+  log_info "$1" "$2"
 }
 
 # ---------- sanity checks ----------
 if [[ ! -d "$MNT" ]]; then
-  log error "{\"msg\": \"mount point not found\", \"mnt\": \"$MNT\"}"
+  log_stage error "{\"msg\": \"mount point not found\", \"mnt\": \"$MNT\"}"
   exit 1
 fi
 
 # ---------- enumerate ----------
-log start "{\"mnt\": \"$MNT\", \"medium_hash\": \"$MEDIUM_HASH\", \"out\": \"$OUT\"}"
+log_stage start "{\"mnt\": \"$MNT\", \"medium_hash\": \"$MEDIUM_HASH\", \"out\": \"$OUT\"}"
 
 # Build grep filter for ignore patterns if configured
 FILTER_CMD="cat"
@@ -57,7 +61,7 @@ if [[ -n "$IGNORE_PATTERNS" && -f "$IGNORE_PATTERNS" ]]; then
   # Build extended regex from patterns file (skip comments and empty lines)
   PATTERNS=$(grep -v '^#' "$IGNORE_PATTERNS" | grep -v '^[[:space:]]*$' | paste -sd '|')
   if [[ -n "$PATTERNS" ]]; then
-    log filter_enabled "{\"patterns_file\": \"$IGNORE_PATTERNS\"}"
+    log_stage filter_enabled "{\"patterns_file\": \"$IGNORE_PATTERNS\"}"
     # Filter out paths matching any pattern (grep -v inverts, -z for null-terminated)
     FILTER_CMD="grep -zv -E '$PATTERNS'"
   fi
@@ -88,16 +92,16 @@ if [ "$ROWS" -gt 0 ] && [ -f "$OUT" ]; then
   # Success - we got records and the output file exists
   chmod 644 "$OUT" 2>/dev/null || true
 
-  log enum_complete "{\"rows\": $ROWS, \"out\": \"$OUT\"}"
+  log_stage enum_complete "{\"rows\": $ROWS, \"out\": \"$OUT\"}"
   echo "[$(date -Iseconds)] ✓ Enumeration complete: $ROWS records written to $(basename "$OUT")" >&2
-  log done "{\"rows\": $ROWS, \"exit\": 0}"
+  log_stage done "{\"rows\": $ROWS, \"exit\": 0}"
 
-  chmod 644 "$LOG_JSON" 2>/dev/null || true
-  echo "[$(date -Iseconds)] ✓ Logged success to $LOG_JSON" >&2
+  chmod 644 "$LOG_FILE" 2>/dev/null || true
+  echo "[$(date -Iseconds)] ✓ Logged success to $LOG_FILE" >&2
   exit 0
 else
   # Error - no records or no output file
-  log error "{\"msg\": \"enumeration failed - no records or output file\", \"rows\": $ROWS, \"out\": \"$OUT\"}"
+  log_stage error "{\"msg\": \"enumeration failed - no records or output file\", \"rows\": $ROWS, \"out\": \"$OUT\"}"
   echo "[$(date -Iseconds)] ✗ Enumeration failed: $ROWS records, output exists: $([ -f "$OUT" ] && echo yes || echo no)" >&2
   exit 1
 fi
