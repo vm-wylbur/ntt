@@ -20,10 +20,7 @@ import psycopg
 
 from ntt_extractor_medium import ExtractionMediumManager
 
-# Import common pipeline functions from lib/
-PROJECT_ROOT = Path(__file__).parent.parent
-sys.path.insert(0, str(PROJECT_ROOT / 'lib'))
-
+# Import common pipeline functions
 from ntt_pipeline_common import (
     hash_file_and_detect_mime,
     get_byhash_path,
