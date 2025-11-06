@@ -635,20 +635,130 @@ GROUP BY extraction_error
 ORDER BY COUNT(*) DESC;
 ```
 
-### Decision Gate
+---
 
-**Proceed to full run if:**
+## Phase 6: Pilot Validation
+
+**Duration:** 0.5 days
+**Status:** [ ] Not Started
+**Depends on:** Phase 5
+
+### Purpose
+
+Validate pilot run before proceeding to full production. This is a **decision gate** - only proceed if validation passes.
+
+### Integrity Checks
+
+```sql
+-- Check all pilot blobs processed
+SELECT extraction_status, COUNT(*)
+FROM blobs
+WHERE extraction_status IN ('pilot', 'complete', 'failed')
+GROUP BY extraction_status;
+-- Expect: 1000 total (complete + failed)
+
+-- Check extracted media have source_blobid
+SELECT COUNT(*)
+FROM medium
+WHERE medium_type = 'extracted'
+  AND source_blobid IS NULL
+  AND extracted_at > (SELECT MIN(extracted_at) FROM blobs WHERE extraction_status = 'complete');
+-- Expected: 0
+
+-- Check intermediate relationships
+SELECT COUNT(*)
+FROM blobs b1
+WHERE b1.is_intermediate
+  AND b1.extracted_at > (SELECT MIN(extracted_at) FROM blobs WHERE extraction_status = 'complete')
+  AND NOT EXISTS (
+    SELECT 1 FROM blobs b2
+    WHERE b2.blobid = b1.intermediate_of
+  );
+-- Expected: 0
+
+-- Check extraction counts match inode counts
+SELECT COUNT(*)
+FROM blobs b
+WHERE b.extraction_status = 'complete'
+  AND b.extracted_at > (SELECT MIN(extracted_at) FROM blobs WHERE extraction_status = 'complete')
+  AND b.files_extracted != (
+    SELECT COUNT(*)
+    FROM inode
+    WHERE medium_hash = b.blobid
+  );
+-- Expected: 0
+
+-- Check no orphaned partitions
+SELECT tablename
+FROM pg_tables
+WHERE tablename LIKE 'inode_p_%'
+  AND SUBSTRING(tablename, 9) NOT IN (
+    SELECT LEFT(medium_hash, 8) FROM medium
+  );
+-- Expected: 0 rows
+```
+
+### Sample Verification
+
+```bash
+# Verify 20 random extracted files exist in by-hash
+for i in {1..20}; do
+  psql -t -c "
+    SELECT i.blobid, p.path, m.medium_hash
+    FROM inode i
+    JOIN path p USING (medium_hash, ino)
+    JOIN medium m USING (medium_hash)
+    WHERE m.medium_type = 'extracted'
+      AND m.extracted_at > (SELECT MIN(extracted_at) FROM blobs WHERE extraction_status = 'complete')
+      AND i.fs_type = 'f'
+    ORDER BY RANDOM()
+    LIMIT 1
+  " | while read blobid path medium; do
+    blob_path="/data/fast/ntt/by-hash/${blobid:0:2}/${blobid:2:2}/$blobid"
+    if [ ! -f "$blob_path" ]; then
+      echo "ERROR: Missing blob $blobid for $medium:$path"
+    else
+      echo "OK: $blobid"
+    fi
+  done
+done
+```
+
+### Provenance Verification
+
+```sql
+-- Test provenance query: can we find original locations?
+SELECT
+  extracted.path as extracted_path,
+  vm.source_blobid as archive_blobid,
+  COUNT(DISTINCT archive_paths.path) as original_locations
+FROM path extracted
+JOIN medium vm ON vm.medium_hash = extracted.medium_hash
+JOIN path archive_paths ON archive_paths.blobid = vm.source_blobid
+WHERE vm.medium_type = 'extracted'
+  AND vm.extracted_at > (SELECT MIN(extracted_at) FROM blobs WHERE extraction_status = 'complete')
+GROUP BY extracted.path, vm.source_blobid
+LIMIT 10;
+-- Should show files with their archive source and original location count
+```
+
+### Decision Gate Criteria
+
+**Proceed to full run if ALL pass:**
 - [ ] Failure rate < 10%
 - [ ] Deduplication rate > 20% OR intermediate overhead < 50%
-- [ ] Storage estimate validated (within 20% of projection)
+- [ ] Storage estimate within 20% of projection
 - [ ] Processing rate > 200 blobs/hour
+- [ ] All integrity checks pass (0 errors)
+- [ ] Sample verification: 20/20 files exist
+- [ ] Provenance queries work correctly
 - [ ] No critical bugs found
 
-**If not, investigate and iterate.**
+**If any fail:** Investigate, fix, reset pilot, re-run.
 
 ---
 
-## Phase 6: Full Production Run
+## Phase 7: Full Production Run
 
 **Duration:** 7-14 days
 **Status:** [ ] Not Started
@@ -720,15 +830,19 @@ Set up alerts for:
 
 ---
 
-## Phase 7: Validation and Quality Checks
+## Phase 8: Final Quality Checks
 
 **Duration:** 1 day
 **Status:** [ ] Not Started
 **Depends on:** Phase 7
 
+### Purpose
+
+Comprehensive quality checks after full production run completes. This validates the **entire extraction campaign** (all 239K blobs), not just a sample.
+
 ### Integrity Checks
 
-Run all validation queries from Phase 4, plus:
+All checks from Phase 6 (Pilot Validation), applied to full dataset:
 
 ```sql
 -- Check all extracted media have source_blobid
@@ -846,7 +960,7 @@ FROM extraction_stats;
 
 ---
 
-## Phase 8: Future Cleanup Tool (Optional)
+## Phase 9: Future Cleanup Tool (Optional)
 
 **Duration:** 2-3 days (when needed)
 **Status:** [ ] Not Started
@@ -891,10 +1005,11 @@ Delete intermediate blobs to reclaim storage if space becomes constrained.
 | 3. Extraction handlers | 4-5 days | Phase 2 | [ ] |
 | 4. Integration testing | 2 days | Phase 3 | [ ] |
 | 5. Pilot run | 3-5 days | Phase 4 | [ ] |
-| 6. Full production | 7-14 days | Phase 5 | [ ] |
-| 7. Validation | 1 day | Phase 6 | [ ] |
-| 8. Cleanup tool (future) | 2-3 days | - | [ ] |
-| **Total** | **24-36 days** | | **3% complete** |
+| 6. Pilot validation | 0.5 days | Phase 5 | [ ] |
+| 7. Full production | 7-14 days | Phase 6 | [ ] |
+| 8. Final quality checks | 1 day | Phase 7 | [ ] |
+| 9. Cleanup tool (future) | 2-3 days | - | [ ] |
+| **Total** | **24.5-36.5 days** | | **3% complete** |
 
 ---
 
