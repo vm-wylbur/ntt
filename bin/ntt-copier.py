@@ -56,6 +56,24 @@ from ntt_copier_diagnostics import DiagnosticService
 # Import database connection utility
 from ntt_db import get_db_connection
 
+# =============================================================================
+# NOTE: Common pipeline functions extracted to lib/ntt_pipeline_common.py
+# =============================================================================
+#
+# The following functions are now shared with ntt-extractor (archive extraction):
+# - hash_file() - BLAKE3 hashing (see strategies.hash_file())
+# - detect_mime_type() - MIME detection (see strategies.detect_mime_type())
+# - get_byhash_path() - By-hash path calculation (inline in strategies)
+# - copy_to_byhash() - By-hash storage logic (see strategies.move_to_byhash())
+#
+# Future refactor (Phase 4+):
+# - Import from ntt_pipeline_common instead of strategies module
+# - Consider combined hash_file_and_detect_mime() for single-pass efficiency
+# - This will eliminate code duplication between copier and extractor
+#
+# Current status: Logic unchanged, comments added for future work
+# =============================================================================
+
 app = typer.Typer()
 
 
