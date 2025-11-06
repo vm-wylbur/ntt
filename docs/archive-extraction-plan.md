@@ -38,20 +38,31 @@ Extract and decompress all archive/compressed files in the NTT collection, creat
 
 ---
 
-## Current State Analysis
+## Current State Analysis (2025-11-05)
 
 **Compressed/Archive Files:**
-- **Total:** 184,040 unique blobs (305 GB compressed)
-- **gzip:** 149,670 blobs (101 GB) - avg 4.36x expansion
-- **zip:** 6,804 blobs (94 GB) - avg 2.45x expansion
-- **bzip2:** 21,320 blobs (67 GB) - avg 5.66x expansion
-- **tar:** 306 blobs (35 GB) - minimal expansion
-- **other:** 5,940 blobs (8 GB)
+- **Total:** 239,183 unique blobs (1,983 GB compressed)
 
-**Storage Capacity:**
+**Major formats by size:**
+- **gzip:** 200,839 blobs (537 GB) - avg 4.36x expansion = ~2,341 GB
+- **bzip2:** 21,668 blobs (444 GB) - avg 5.66x expansion = ~2,513 GB
+- **zip:** 7,179 blobs (456 GB) - avg 2.45x expansion = ~1,117 GB
+- **tar:** 343 blobs (328 GB) - minimal expansion = ~328 GB
+- **xz:** 1,895 blobs (190 GB) - avg 6.0x expansion = ~1,140 GB
+- **ar archives:** 4,773 blobs (11 GB)
+- **JAR files:** 2,201 blobs (9.5 GB)
+- **RAR:** 20 blobs (1.7 GB)
+- **CAB:** 108 blobs (2.7 GB)
+- **7z:** 5 blobs (55 MB)
+- **Unix compress:** 30 blobs (701 MB)
+- **Other:** ~320 blobs (3 GB)
+
+**Storage Estimates:**
 - **Current:** 8.4 TB free on fastpool
-- **Estimated expansion:** 800-900 GB (with 50% deduplication)
-- **Remaining after:** 7.5-7.6 TB free
+- **Conservative expansion:** ~7,500 GB uncompressed (no deduplication)
+- **With 50% deduplication:** ~3,750 GB
+- **With intermediates (~10%):** ~4,125 GB total
+- **Remaining after:** 4.3 TB free (sufficient)
 
 ---
 
@@ -184,15 +195,16 @@ SELECT extraction_status, COUNT(*) FROM blobs GROUP BY extraction_status;
 
 ### Tasks
 
-- [ ] Create `bin/ntt-extractor.py` skeleton
-- [ ] Implement ExtractionQueue class (depth-first LIFO)
-- [ ] Implement ExtractedMediumManager
-- [ ] Implement ProgressLogger with stats/ETA
-- [ ] Add CLI argument parsing
-- [ ] Add structured JSON logging to `/var/log/ntt/extractor.jsonl`
-- [ ] Implement deduplication check (skip already-extracted blobs)
-- [ ] Implement resumability (reset in_progress to pending)
-- [ ] Test with mock extractors
+- [ ] Create `bin/ntt-extractor.py` main CLI (uv shebang, Typer, loguru)
+- [ ] Create `bin/ntt_extractor_queue.py` Redis queue module
+- [ ] Create `bin/ntt_extractor_medium.py` medium/partition manager
+- [ ] Create `bin/ntt_extractor_handlers.py` handler registry stub
+- [ ] Implement CLI commands: init, run, status, reset
+- [ ] Implement Redis queue: priority queue, nested LIFO, deduplication
+- [ ] Implement medium manager: partitions, COPY bulk inserts, synthetic inodes
+- [ ] Add multi-worker support (fork-based parallelism)
+- [ ] Add graceful shutdown (SIGINT/SIGTERM handling)
+- [ ] Test with mock handlers (no real extraction)
 
 ### CLI Interface
 
@@ -209,11 +221,13 @@ Options:
 
 ### Components
 
-**ExtractionQueue:**
-- Depth-first (LIFO) queue implementation
-- Query pending extractable blobs
-- Sort by size ASC for quick wins
-- Track processed count and stats
+**ExtractionQueue (Redis-backed):**
+- Use Redis LPUSH/RPOP for LIFO (depth-first) queue
+- Persistent across crashes/restarts
+- Enables parallel workers pulling from same queue
+- Query pending extractable blobs from PostgreSQL
+- Use Redis sorted set for size-based prioritization
+- Track processed count and stats in Redis
 
 **ExtractedMediumManager:**
 - Create extracted medium records
@@ -254,28 +268,96 @@ tail -f /var/log/ntt/extractor.jsonl
 
 ---
 
-## Phase 3: Decompressor Implementation
+## Phase 3: Extraction Handlers Implementation
 
-**Duration:** 2 days
+**Duration:** 4-5 days
 **Status:** [ ] Not Started
 **Depends on:** Phase 2
 
+### Overview
+
+Implement all extraction handlers using handler registry pattern. Each MIME type maps to a handler function. Handlers fall into two categories:
+
+1. **Decompressors** (single-file): gzip, bzip2, xz, compress, lzip
+2. **Archive extractors** (multi-file): tar, zip, rar, 7z, cab, ar
+
 ### Tasks
 
-- [ ] Implement Decompressor class
-- [ ] Support gzip format (gunzip)
-- [ ] Support bzip2 format (bunzip2)
-- [ ] Support xz format (unxz)
-- [ ] Implement filename extension stripping (.gz → '', .tar.gz → .tar)
-- [ ] Add MIME detection of decompressed content
-- [ ] Mark intermediate files correctly
-- [ ] Test with sample compressed files
-- [ ] Validate intermediate marking
+**Handler Registry:**
+- [ ] Create `MIME_HANDLERS` dict mapping MIME → handler function
+- [ ] Implement `get_extractable_mime_types()` for query filtering
+- [ ] Implement `extract_blob()` router that dispatches to handlers
 
-### Algorithm
+**Decompression Handlers (200K+ blobs, 1.2 TB):**
+- [ ] `decompress_gzip()` - gzip (200K blobs, 537 GB)
+- [ ] `decompress_bzip2()` - bzip2 (21K blobs, 444 GB)
+- [ ] `decompress_xz()` - xz (1.9K blobs, 190 GB)
+- [ ] `decompress_unix_compress()` - Unix .Z (30 blobs, 701 MB)
+- [ ] `decompress_lzip()` - lzip (2 blobs, 163 KB)
+
+**Archive Handlers (38K+ blobs, 800 GB):**
+- [ ] `extract_tar()` - tar archives (343 blobs, 328 GB)
+- [ ] `extract_zip()` - zip, JAR, APK, EPUB (9.5K blobs, 465 GB)
+- [ ] `extract_ar()` - ar/static libraries (4.7K blobs, 11 GB)
+- [ ] `extract_rar()` - RAR (20 blobs, 1.7 GB)
+- [ ] `extract_cab()` - CAB (108 blobs, 2.7 GB)
+- [ ] `extract_7z()` - 7zip (5 blobs, 55 MB)
+
+**Common Infrastructure:**
+- [ ] Implement `get_byhash_path()` - locate blob in by-hash storage
+- [ ] Implement `copy_to_byhash()` - copy extracted file to by-hash with dedup
+- [ ] Implement MIME detection with `python-magic`
+- [ ] Mark intermediates correctly (decompressed .tar from .tar.gz)
+- [ ] Handle nested archives (queue for recursive extraction)
+- [ ] Error handling and logging for corrupt/password-protected files
+
+### Handler Registry Pattern
 
 ```python
-def decompress_blob(blobid, mime_type):
+# MIME type → handler function mapping
+MIME_HANDLERS = {
+    # Compression (single-file, creates intermediates)
+    'application/gzip': decompress_gzip,
+    'application/x-bzip2': decompress_bzip2,
+    'application/x-xz': decompress_xz,
+    'application/x-compress': decompress_unix_compress,
+    'application/x-lzip': decompress_lzip,
+
+    # Archives (multi-file, creates extracted media)
+    'application/x-tar': extract_tar,
+    'application/zip': extract_zip,
+    'application/java-archive': extract_zip,  # JAR = ZIP
+    'application/epub+zip': extract_zip,      # EPUB = ZIP
+    'application/vnd.android.package-archive': extract_zip,  # APK = ZIP
+    'application/x-7z-compressed': extract_7z,
+    'application/vnd.rar': extract_rar,
+    'application/vnd.ms-cab-compressed': extract_cab,
+    'application/x-archive': extract_ar,
+}
+
+def get_extractable_mime_types() -> list:
+    """Get list of supported MIME types for query filtering."""
+    return list(MIME_HANDLERS.keys())
+
+def extract_blob(blobid: str, mime_type: str, db) -> Tuple[List[Dict], List[Tuple]]:
+    """
+    Route to appropriate handler.
+
+    Returns:
+        extracted_files: List of {path, blobid, size, mtime}
+        nested_archives: List of (blobid, mime_type) to queue
+    """
+    handler = MIME_HANDLERS.get(mime_type)
+    if not handler:
+        raise ValueError(f"No handler for MIME type: {mime_type}")
+
+    return handler(blobid, db)
+```
+
+### Decompression Handler Template
+
+```python
+def decompress_gzip(blobid: str, db):
     """
     Decompress single-file compression formats.
 
@@ -365,122 +447,8 @@ psql -c "SELECT blobid, is_intermediate, intermediate_of FROM blobs WHERE is_int
 
 ---
 
-## Phase 4: Archive Extractor Implementation
 
-**Duration:** 3 days
-**Status:** [ ] Not Started
-**Depends on:** Phase 2
-
-### Tasks
-
-- [ ] Implement ArchiveExtractor class
-- [ ] Support tar format
-- [ ] Support zip format
-- [ ] Support 7z format (if available)
-- [ ] Implement temp directory management with cleanup
-- [ ] Add bulk inode/path insertion (batches of 1000)
-- [ ] Handle special files (symlinks → skip, directories → mark type='d')
-- [ ] Test with sample archives
-- [ ] Validate partition creation
-
-### Algorithm
-
-```python
-def extract_archive(blobid, mime_type):
-    """
-    Extract multi-file archives.
-
-    Creates extracted medium containing all extracted files.
-    Marks extracted files as NOT intermediate (they're real files).
-    """
-    # 1. Check if already extracted (dedup)
-    existing = db.query("""
-        SELECT medium_hash FROM medium
-        WHERE source_blobid = %s
-          AND medium_type = 'extracted'
-    """, (blobid,))
-
-    if existing:
-        log.info(f"Blob {blobid} already extracted, skipping")
-        update_blob(blobid, extraction_status='complete')
-        return existing[0]
-
-    # 2. Load blob from by-hash
-    blob_path = get_byhash_path(blobid)
-
-    # 3. Create temp extraction directory
-    with tempfile.TemporaryDirectory() as temp_dir:
-        # 4. Extract archive
-        extract_to_dir(blob_path, temp_dir, mime_type)
-
-        # 5. Create extracted medium
-        create_extracted_medium(
-            medium_hash=blobid,
-            source_blobid=blobid,
-            medium_type='extracted',
-            extraction_method=mime_to_method(mime_type)
-        )
-
-        # 6. Walk extracted filesystem
-        extracted_files = []
-        for root, dirs, files in os.walk(temp_dir):
-            for filename in files:
-                filepath = os.path.join(root, filename)
-                relative_path = os.path.relpath(filepath, temp_dir)
-
-                # Compute hash
-                file_hash = compute_blake3(filepath)
-                file_mime = detect_mime(filepath)
-                file_size = os.path.getsize(filepath)
-
-                # Copy to by-hash (with dedup)
-                if not blob_exists(file_hash):
-                    copy_to_byhash(filepath, file_hash)
-                    insert_blob(file_hash, mime=file_mime, is_intermediate=False)
-
-                # Track for batch insert
-                extracted_files.append({
-                    'path': f'/{relative_path}',
-                    'ino': generate_synthetic_ino(blobid, relative_path),
-                    'blobid': file_hash,
-                    'size': file_size,
-                    'mime': file_mime
-                })
-
-                # Queue if extractable
-                if file_mime in EXTRACTABLE_MIMES:
-                    queue.push((file_hash, file_mime))
-
-        # 7. Bulk insert inode/path entries
-        batch_insert_inodes_and_paths(blobid, extracted_files, batch_size=1000)
-
-        # 8. Mark complete
-        update_blob(
-            blobid,
-            extraction_status='complete',
-            files_extracted=len(extracted_files)
-        )
-```
-
-### Test Cases
-
-```bash
-# Test simple tar
-ntt-extractor.py --format tar --limit 1
-
-# Test large archive (10K+ files)
-# Validate batch insertion performance
-
-# Test nested archive
-# Archive containing .zip → verify both extracted
-
-# Check partition creation
-psql -c "\dt inode_p_*" | tail -20
-```
-
----
-
-## Phase 5: Integration Testing
+## Phase 4: Integration Testing
 
 **Duration:** 2 days
 **Status:** [ ] Not Started
@@ -564,7 +532,7 @@ LIMIT 10;
 
 ---
 
-## Phase 6: Pilot Run
+## Phase 5: Pilot Run
 
 **Duration:** 3-5 days
 **Status:** [ ] Not Started
@@ -680,7 +648,7 @@ ORDER BY COUNT(*) DESC;
 
 ---
 
-## Phase 7: Full Production Run
+## Phase 6: Full Production Run
 
 **Duration:** 7-14 days
 **Status:** [ ] Not Started
@@ -752,7 +720,7 @@ Set up alerts for:
 
 ---
 
-## Phase 8: Validation and Quality Checks
+## Phase 7: Validation and Quality Checks
 
 **Duration:** 1 day
 **Status:** [ ] Not Started
@@ -760,7 +728,7 @@ Set up alerts for:
 
 ### Integrity Checks
 
-Run all validation queries from Phase 5, plus:
+Run all validation queries from Phase 4, plus:
 
 ```sql
 -- Check all extracted media have source_blobid
@@ -878,7 +846,7 @@ FROM extraction_stats;
 
 ---
 
-## Phase 9: Future Cleanup Tool (Optional)
+## Phase 8: Future Cleanup Tool (Optional)
 
 **Duration:** 2-3 days (when needed)
 **Status:** [ ] Not Started
@@ -918,16 +886,15 @@ Delete intermediate blobs to reclaim storage if space becomes constrained.
 
 | Phase | Duration | Dependencies | Status |
 |-------|----------|--------------|--------|
-| 1. Schema migration | 1 day | None | [ ] |
+| 1. Schema migration | 1 day | None | [x] Complete |
 | 2. Core framework | 3-4 days | Phase 1 | [ ] |
-| 3. Decompressor | 2 days | Phase 2 | [ ] |
-| 4. Archive extractor | 3 days | Phase 2 | [ ] |
-| 5. Integration testing | 2 days | Phase 3, 4 | [ ] |
-| 6. Pilot run | 3-5 days | Phase 5 | [ ] |
-| 7. Full production | 7-14 days | Phase 6 | [ ] |
-| 8. Validation | 1 day | Phase 7 | [ ] |
-| 9. Cleanup tool (future) | 2-3 days | - | [ ] |
-| **Total** | **22-32 days** | | **0% complete** |
+| 3. Extraction handlers | 4-5 days | Phase 2 | [ ] |
+| 4. Integration testing | 2 days | Phase 3 | [ ] |
+| 5. Pilot run | 3-5 days | Phase 4 | [ ] |
+| 6. Full production | 7-14 days | Phase 5 | [ ] |
+| 7. Validation | 1 day | Phase 6 | [ ] |
+| 8. Cleanup tool (future) | 2-3 days | - | [ ] |
+| **Total** | **24-36 days** | | **3% complete** |
 
 ---
 
