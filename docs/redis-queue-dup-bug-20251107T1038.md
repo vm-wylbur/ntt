@@ -433,6 +433,56 @@ Results:
 - No crash or duplicate key error
 - Worker completed gracefully
 
+**Test 2: 1,000-Archive Stress Test** ✓ PASSED
+
+Setup:
+```bash
+./bin/ntt-extractor.py init --from-file /tmp/pilot-batch-1000.txt --reset
+./bin/ntt-extractor.py run
+```
+
+Results:
+- **Skipped (already extracted)**: 697 archives (69.7%)
+- **Successfully extracted**: 315 new archives (31.5%)
+- **Failed (corrupt/permissions)**: 6 archives (0.6%)
+- **Duplicate key errors**: 0
+- **Worker crashes**: 0
+- Worker completed normally with "Queue empty, exiting"
+
+**Test 3: 10,000-Archive Stress Test** ✓ PASSED
+
+Setup:
+```bash
+psql -d copyjob -t -A -F'|' -c "SELECT b.blobid, i.mime_type, MIN(i.size) as size
+FROM blobs b JOIN inode i ON i.blobid = b.blobid
+WHERE i.mime_type IN ('application/gzip', 'application/x-bzip2', 'application/x-xz',
+    'application/x-tar', 'application/zip', 'application/x-7z-compressed',
+    'application/x-rar', 'application/vnd.ms-cab-compressed')
+GROUP BY b.blobid, i.mime_type ORDER BY RANDOM() LIMIT 10000" > /tmp/pilot-batch-10000.txt
+./bin/ntt-extractor.py init --from-file /tmp/pilot-batch-10000.txt --reset
+./bin/ntt-extractor.py run
+```
+
+Results:
+- **Total operations**: 21,684 extractions (includes nested archives)
+- **Skipped (already extracted)**: 97 archives (0.4%)
+- **Successfully extracted**: 21,494 archives (99.1%)
+- **Failed (corrupt/permissions)**: 93 archives (0.4%)
+- **Duplicate key errors**: 0
+- **Worker crashes**: 0
+- **Duration**: 26 minutes 29 seconds (1,589 seconds)
+- **Throughput**: ~13.6 archives/second
+- **Success rate**: 99.6%
+
+**Scale Validation Summary**
+
+All three test levels passed with zero duplicate key errors and zero crashes:
+- Single blob re-extraction: Graceful skip with informative logging
+- 1,000 archives: 69.7% duplicates detected and handled correctly
+- 10,000 archives: 21,684 operations completed with 99.6% success rate
+
+The fix demonstrates robust duplicate detection, graceful error handling, and stable performance at scale.
+
 ### Verification Commands
 
 Verify the blob is marked complete in Redis:
