@@ -11,7 +11,7 @@ ntt/docs/redis-queue-dup-bug-20251107T1038.md
 
 ## Status
 - **Discovered:** 2025-11-07 12:42:59 UTC
-- **Status:** TO BE FIXED (see Resolution section below)
+- **Status:** RESOLVED (2025-11-07, commit f871278)
 - **Severity:** Critical (worker crash, data inconsistency)
 - **Test:** 1000-archive stress test, blob 712/1000
 
@@ -384,25 +384,71 @@ redis-cli HDEL ntt:extraction:in_progress d5c009f684531003e6307cd67983d5015697fa
 
 ## Resolution
 
-**Status:** TO BE COMPLETED
+**Status:** RESOLVED (2025-11-07)
 
-This section will be filled after implementing and testing the fixes.
+**Commit:** f871278
+
+All three fixes implemented and tested successfully in a single atomic commit.
 
 ### Commits
 
-(To be added)
+- **f871278**: Fix Redis-PostgreSQL state mismatch causing duplicate key errors
+  - Files modified: `bin/ntt-extractor.py`, `bin/ntt_extractor_queue.py`
+  - Documentation added: `docs/redis-queue-dup-bug-20251107T1038.md`
 
 ### Changes Made
 
-(To be added)
+1. **Queue initialization filtering** (`bin/ntt_extractor_queue.py:74-78`)
+   - Added NOT EXISTS check to exclude already-extracted blobs from queue
+   - Query now filters blobs with existing extracted medium records
+
+2. **Pre-extraction duplicate check** (`bin/ntt-extractor.py:212-228`)
+   - Worker now checks database before calling handler (defense in depth)
+   - Gracefully skips already-extracted blobs with informative logging
+   - Marks blob complete and continues processing
+
+3. **Transaction rollback in exception handler** (`bin/ntt-extractor.py:309-321`)
+   - Added db.rollback() before attempting error handling
+   - Wrapped error handling in try-except for graceful degradation
+   - Prevents secondary InFailedSqlTransaction errors
 
 ### Testing Results
 
-(To be added)
+**Test 1: Re-extraction Detection** ✓ PASSED
+
+Setup:
+```bash
+echo "d5c009f684531003e6307cd67983d5015697fa3822a1aceafa792ccd379e5a6e|application/zip|13837" > /tmp/test-reextract.txt
+./bin/ntt-extractor.py init --from-file /tmp/test-reextract.txt
+```
+
+Execution:
+```bash
+./bin/ntt-extractor.py run --max-jobs 1
+```
+
+Results:
+- Worker correctly detected already-extracted blob
+- Logged: `Blob d5c009f6... already extracted to 86bdf2e99302b5b6 at 2025-11-06 20:42:59, skipping`
+- No crash or duplicate key error
+- Worker completed gracefully
 
 ### Verification Commands
 
-(To be added)
+Verify the blob is marked complete in Redis:
+```bash
+redis-cli SISMEMBER ntt:extraction:processed d5c009f684531003e6307cd67983d5015697fa3822a1aceafa792ccd379e5a6e
+# Should return: 1
+```
+
+Verify medium still exists with correct data:
+```bash
+psql -d copyjob -c "SELECT medium_hash, extracted_at, COUNT(*) as inodes
+FROM medium m JOIN inode i ON i.medium_hash = m.medium_hash
+WHERE m.source_blobid = 'd5c009f684531003e6307cd67983d5015697fa3822a1aceafa792ccd379e5a6e'
+GROUP BY m.medium_hash, m.extracted_at"
+# Should show: 86bdf2e99302b5b6 | 2025-11-06 20:42:59 | 6
+```
 
 ---
 
