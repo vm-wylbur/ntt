@@ -71,6 +71,11 @@ class RedisExtractionQueue:
             JOIN inode i ON i.blobid = b.blobid
             WHERE b.extraction_status = 'pending'
               AND i.mime_type = ANY(%s)
+              AND NOT EXISTS (
+                  SELECT 1 FROM medium m
+                  WHERE m.source_blobid = b.blobid
+                    AND m.medium_type = 'extracted'
+              )
         """
 
         params = [mime_types]

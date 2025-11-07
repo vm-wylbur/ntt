@@ -20,14 +20,13 @@
 #
 # Archive/compression extraction tool with Redis queue and multi-worker support
 
+import json
 import os
 import signal
 import sys
-import time
+from pathlib import Path
 from typing import Optional
 
-import psycopg
-import redis
 import typer
 from loguru import logger
 
@@ -78,12 +77,16 @@ def init(
     redis_url: str = typer.Option("redis://localhost:6379/0", help="Redis connection URL"),
     format_filter: Optional[str] = typer.Option(None, help="Filter to specific MIME type"),
     limit: Optional[int] = typer.Option(None, help="Limit number of blobs to queue"),
-    reset: bool = typer.Option(False, help="Clear existing queue first")
+    reset: bool = typer.Option(True, help="Clear existing queue first (default: True)"),
+    from_file: Optional[str] = typer.Option(None, help="Load from file (format: blobid|mime_type|size)")
 ):
     """
-    Initialize extraction queue from database.
+    Initialize extraction queue from database or file.
 
-    Queries PostgreSQL for extractable blobs and pushes to Redis queue.
+    Queries PostgreSQL for extractable blobs and pushes to Redis queue,
+    or loads from file with format: blobid|mime_type|size (one per line).
+
+    By default, clears existing queue data before loading. Use --no-reset to append.
     """
     setup_logging()
 
@@ -96,25 +99,67 @@ def init(
         logger.warning("Clearing existing queue data")
         queue.clear_all()
 
-    # Connect to database
-    db = get_db_connection()
+    if from_file:
+        # Load from file instead of database
+        file_path = Path(from_file)
+        if not file_path.exists():
+            typer.echo(f"✗ File not found: {from_file}", err=True)
+            raise typer.Exit(1)
 
-    # Get supported MIME types from handler registry
-    mime_types = get_supported_mime_types()
-    logger.info(f"Supporting {len(mime_types)} archive/compression formats")
+        logger.info(f"Loading blobs from file: {from_file}")
+        count = 0
 
-    # Seed queue from database
-    count = queue.initialize_from_db(
-        db=db,
-        mime_types=mime_types,
-        format_filter=format_filter,
-        limit=limit
-    )
+        # Batch insert with pipeline
+        pipe = queue.redis.pipeline()
 
-    db.close()
+        with open(file_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
 
-    logger.info(f"Queue initialized with {count:,} blobs")
-    typer.echo(f"✓ Queued {count:,} blobs for extraction")
+                parts = line.split('|')
+                if len(parts) != 3:
+                    logger.warning(f"Skipping malformed line: {line}")
+                    continue
+
+                blobid, mime_type, size_str = parts
+                try:
+                    size = int(size_str)
+                except ValueError:
+                    logger.warning(f"Skipping invalid size: {line}")
+                    continue
+
+                # Add to queue (same format as initialize_from_db)
+                item = json.dumps({'blobid': blobid, 'mime_type': mime_type})
+                pipe.zadd(queue.PRIORITY, {item: size})
+                count += 1
+
+        pipe.execute()
+        queue.redis.hincrby(queue.STATS, 'queued', count)
+
+        logger.info(f"Queue initialized with {count:,} blobs from file")
+        typer.echo(f"✓ Queued {count:,} blobs for extraction")
+    else:
+        # Load from database (original behavior)
+        db = get_db_connection()
+
+        # Get supported MIME types from handler registry
+        mime_types = get_supported_mime_types()
+        logger.info(f"Supporting {len(mime_types)} archive/compression formats")
+
+        # Seed queue from database
+        count = queue.initialize_from_db(
+            db=db,
+            mime_types=mime_types,
+            format_filter=format_filter,
+            limit=limit
+        )
+
+        db.close()
+
+        logger.info(f"Queue initialized with {count:,} blobs")
+        typer.echo(f"✓ Queued {count:,} blobs for extraction")
 
 
 @app.command()
@@ -162,7 +207,25 @@ def run(
 
             blobid, mime_type = item
 
-            logger.info(f"Processing blob", blobid=blobid, mime_type=mime_type)
+            logger.info("Processing blob", blobid=blobid, mime_type=mime_type)
+
+            # Check if already extracted (defense in depth)
+            cursor = db.cursor()
+            cursor.execute("""
+                SELECT medium_hash, extracted_at
+                FROM medium
+                WHERE source_blobid = %s AND medium_type = 'extracted'
+            """, [blobid])
+
+            existing = cursor.fetchone()
+            if existing:
+                logger.info(
+                    f"Blob {blobid[:8]}... already extracted to {existing['medium_hash']} "
+                    f"at {existing['extracted_at']}, skipping"
+                )
+                queue.mark_complete(blobid)
+                jobs_processed += 1
+                continue
 
             try:
                 logger.debug(f"Starting extraction for {blobid[:8]}...")
@@ -175,7 +238,7 @@ def run(
                     raise ValueError(f"No handler for MIME type: {mime_type}")
 
                 logger.debug(f"Selected handler: {handler_name} for {mime_type}")
-                logger.debug(f"Attempting to import handlers...")
+                logger.debug("Attempting to import handlers...")
 
                 # Import handler function (Phase 3 will implement these)
                 from ntt_extractor_handlers import (
@@ -185,7 +248,7 @@ def run(
                     extract_rar, extract_cab, extract_7z,
                     extract_tar_gz, extract_tar_bz2, extract_tar_xz
                 )
-                logger.debug(f"Import successful")
+                logger.debug("Import successful")
 
                 handlers = {
                     'decompress_gzip': decompress_gzip,
@@ -242,12 +305,24 @@ def run(
                     error_type=type(e).__name__,
                     traceback=traceback.format_exc()
                 )
-                medium_manager.mark_extraction_failed(blobid, str(e))
-                queue.mark_failed(blobid, str(e))
+
+                # CRITICAL: Rollback aborted transaction FIRST
+                try:
+                    db.rollback()
+                    logger.debug("Rolled back failed transaction")
+                except Exception as rollback_error:
+                    logger.error(f"Rollback failed: {rollback_error}")
+
+                # NOW we can mark as failed (in new transaction)
+                try:
+                    medium_manager.mark_extraction_failed(blobid, str(e))
+                    queue.mark_failed(blobid, str(e))
+                except Exception as cleanup_error:
+                    logger.error(f"Failed to mark extraction as failed: {cleanup_error}")
 
     finally:
         db.close()
-        logger.info(f"Worker shutdown complete", jobs_processed=jobs_processed)
+        logger.info("Worker shutdown complete", jobs_processed=jobs_processed)
 
 
 @app.command()
@@ -279,6 +354,75 @@ def status(
         typer.echo(f"\nActive workers: {len(workers)}")
         for worker_id, pid in workers.items():
             typer.echo(f"  - {worker_id} (PID: {pid})")
+
+
+@app.command()
+def report(
+    hours: int = typer.Option(24, help="Look back this many hours"),
+    by_method: bool = typer.Option(True, help="Group by extraction method")
+):
+    """
+    Show extraction statistics from database.
+
+    Reports on archives extracted, files produced, and sizes by extraction method.
+    """
+    setup_logging()
+
+    db = get_db_connection()
+
+    typer.echo(f"\n=== NTT Extraction Report (last {hours} hours) ===\n")
+
+    # Get extraction summary by method
+    query = """
+        SELECT
+            m.extraction_method,
+            COUNT(DISTINCT m.medium_hash) as archives_extracted,
+            COUNT(DISTINCT i.blobid) as files_extracted,
+            pg_size_pretty(SUM(i.size)::bigint) as total_size,
+            MIN(m.extracted_at) as first_extraction,
+            MAX(m.extracted_at) as last_extraction
+        FROM medium m
+        LEFT JOIN inode i ON i.medium_hash = m.medium_hash
+        WHERE m.medium_type = 'extracted'
+          AND m.extracted_at > NOW() - INTERVAL '%s hours'
+        GROUP BY m.extraction_method
+        ORDER BY m.extraction_method
+    """
+
+    cursor = db.execute(query, [hours])
+    results = cursor.fetchall()
+
+    if not results:
+        typer.echo(f"No extractions found in the last {hours} hours.")
+        db.close()
+        return
+
+    # Print header
+    typer.echo(f"{'Method':<15} {'Archives':<10} {'Files':<10} {'Size':<12} {'First':<20} {'Last':<20}")
+    typer.echo("-" * 95)
+
+    total_archives = 0
+    total_files = 0
+
+    for row in results:
+        method = row['extraction_method']
+        archives = row['archives_extracted']
+        files = row['files_extracted'] or 0
+        size = row['total_size']
+        first = row['first_extraction'].strftime('%Y-%m-%d %H:%M:%S') if row['first_extraction'] else 'N/A'
+        last = row['last_extraction'].strftime('%Y-%m-%d %H:%M:%S') if row['last_extraction'] else 'N/A'
+
+        typer.echo(f"{method:<15} {archives:<10} {files:<10} {size:<12} {first:<20} {last:<20}")
+
+        total_archives += archives
+        total_files += files
+
+    # Print totals
+    typer.echo("-" * 95)
+    typer.echo(f"{'TOTAL':<15} {total_archives:<10} {total_files:<10}")
+    typer.echo()
+
+    db.close()
 
 
 @app.command()
