@@ -12,6 +12,31 @@
 
 set -euo pipefail
 
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --help|-h)
+            echo "Usage: $0"
+            echo ""
+            echo "Backup by-hash from fastpool to USB drive using find-diff approach"
+            echo ""
+            echo "Features:"
+            echo "  - ZFS pool GUID validation (ensures correct USB drive)"
+            echo "  - Incremental file backup with corruption detection"
+            echo "  - Copies latest pg_dump from coldpool"
+            echo ""
+            echo "Options:"
+            echo "  --help     Show this help message"
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1"
+            echo "Usage: $0"
+            exit 1
+            ;;
+    esac
+done
+
 # Configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIB_DIR="$(cd "$SCRIPT_DIR/../lib" && pwd)"

@@ -20,9 +20,30 @@ LOG_FILE="${NTT_ENUM_LOG:-/var/log/ntt/enum.jsonl}"
 
 # ---------- argparse ----------
 usage() {
-  echo "Usage: $0 MOUNT_POINT MEDIUM_HASH OUT.raw"
+  echo "Usage: $0 [--no-xdev] MOUNT_POINT MEDIUM_HASH OUT.raw"
+  echo ""
+  echo "Options:"
+  echo "  --no-xdev    Allow find to cross filesystem boundaries (for bind mounts)"
   exit 1
 }
+
+# Parse flags
+XDEV_FLAG="-xdev"
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --no-xdev)
+      XDEV_FLAG=""
+      shift
+      ;;
+    -h|--help)
+      usage
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
 [[ $# -eq 3 ]] || usage
 MNT="$1"; MEDIUM_HASH="$2"; OUT="$3"
 
@@ -72,7 +93,7 @@ fi
 # Suppress find errors (inaccessible paths, corrupted filenames) - we skip those files
 # Disable pipefail temporarily because pv can exit non-zero on broken pipe which is normal
 set +e
-find "$MNT" -xdev -printf '%y\034%D\034%i\034%n\034%s\034%Ts\034%p\0' 2>/dev/null \
+find "$MNT" $XDEV_FLAG -printf '%y\034%D\034%i\034%n\034%s\034%Ts\034%p\0' 2>/dev/null \
 | eval "$FILTER_CMD" \
 | tee >(tr -cd '\0' | wc -c > /tmp/ntt-count-$$) \
 | pv -0 -l -f \

@@ -19,6 +19,16 @@ set -euo pipefail
 FORCE_OVERWRITE=false
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --help|-h)
+            echo "Usage: $0 [--force]"
+            echo ""
+            echo "Backup by-hash to remote server (chll) using find-diff approach"
+            echo ""
+            echo "Options:"
+            echo "  --force    Overwrite files with size mismatches (use when recovering from corruption)"
+            echo "  --help     Show this help message"
+            exit 0
+            ;;
         --force)
             FORCE_OVERWRITE=true
             shift

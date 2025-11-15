@@ -12,6 +12,31 @@
 
 set -euo pipefail
 
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --help|-h)
+            echo "Usage: $0"
+            echo ""
+            echo "Backup by-hash from fastpool to coldpool using find-diff approach"
+            echo ""
+            echo "Features:"
+            echo "  - Smart pg_dump (only when database changes or >7 days old)"
+            echo "  - Incremental file backup with corruption detection"
+            echo "  - Background pg_dump while files copy"
+            echo ""
+            echo "Options:"
+            echo "  --help     Show this help message"
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1"
+            echo "Usage: $0"
+            exit 1
+            ;;
+    esac
+done
+
 # Configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIB_DIR="$(cd "$SCRIPT_DIR/../lib" && pwd)"
@@ -76,12 +101,11 @@ else
     # Load previous state
     source "$STATE_FILE"
 
-    # Check if data has changed
-    if [ "$CURRENT_XACT" -ne "${XACT_COMMIT:-0}" ] || [ "$CURRENT_MODS" -ne "${TUP_MODIFIED:-0}" ]; then
-        XACT_DIFF=$((CURRENT_XACT - ${XACT_COMMIT:-0}))
+    # Check if data has changed (only row modifications matter, not background transactions)
+    if [ "$CURRENT_MODS" -ne "${TUP_MODIFIED:-0}" ]; then
         MODS_DIFF=$((CURRENT_MODS - ${TUP_MODIFIED:-0}))
         DO_PGDUMP=true
-        PGDUMP_REASON="Database changed: +$XACT_DIFF transactions, +$MODS_DIFF row modifications"
+        PGDUMP_REASON="Database changed: +$MODS_DIFF row modifications"
     else
         # No changes, but check age as safety fallback
         if [ -n "${DUMP_TIMESTAMP:-}" ]; then
@@ -103,6 +127,12 @@ else
 fi
 
 log_info "pg_dump decision: $DO_PGDUMP - $PGDUMP_REASON"
+
+# Early exit if database unchanged (no need to backup files either)
+if [ "$DO_PGDUMP" = "false" ] && [[ "$PGDUMP_REASON" == "No changes"* ]]; then
+    log_info "Database unchanged, skipping backup run entirely"
+    exit 0
+fi
 
 # Start pg_dump in background if needed
 PGDUMP_PID=""
@@ -193,7 +223,6 @@ if [ -n "$PGDUMP_PID" ]; then
 # Last successful pg_dump state
 DUMP_TIMESTAMP=$TIMESTAMP
 DUMP_FILE=$(basename "$DUMP_FILE")
-XACT_COMMIT=$CURRENT_XACT
 TUP_MODIFIED=$CURRENT_MODS
 DUMP_SIZE=$DUMP_SIZE
 EOF
