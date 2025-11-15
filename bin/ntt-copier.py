@@ -963,15 +963,15 @@ class CopyWorker:
                     t3 = time.time()
                     logger.debug(f"TIMING: UPDATE inode (success): {t3-t2:.3f}s for {len(success_ids)} inodes")
 
-                    # Insert into blobs table to record blob existence
+                    # Insert into blobs table to record blob existence with mime_type
                     t_blobs_start = time.time()
                     cur.execute("""
-                        INSERT INTO blobs (blobid)
-                        SELECT DISTINCT blobid
-                        FROM unnest(%s::text[]) AS t(blobid)
+                        INSERT INTO blobs (blobid, mime_type)
+                        SELECT DISTINCT ON (blobid) blobid, mime_type
+                        FROM unnest(%s::text[], %s::text[]) AS t(blobid, mime_type)
                         WHERE blobid IS NOT NULL
-                        ON CONFLICT (blobid) DO NOTHING
-                    """, (success_blob_ids,))
+                        ON CONFLICT (blobid) DO UPDATE SET mime_type = EXCLUDED.mime_type
+                    """, (success_blob_ids, success_mime_types))
                     t_blobs_end = time.time()
                     logger.debug(f"TIMING: INSERT blobs: {t_blobs_end-t_blobs_start:.3f}s for {len(success_blob_ids)} blobids")
 
@@ -1674,12 +1674,12 @@ class CopyWorker:
                 WHERE medium_hash = %s AND ino = %s
             """, (hash_val, inode_row['medium_hash'], inode_row['ino']))
 
-            # Upsert blob to record existence
+            # Upsert blob to record existence with mime_type
             cur.execute("""
-                INSERT INTO blobs (blobid)
-                VALUES (%s)
-                ON CONFLICT (blobid) DO NOTHING
-            """, (hash_val,))
+                INSERT INTO blobs (blobid, mime_type)
+                VALUES (%s, %s)
+                ON CONFLICT (blobid) DO UPDATE SET mime_type = EXCLUDED.mime_type
+            """, (hash_val, mime_type))
 
     def update_db_for_directory(self, inode_row):
         """Update DB for directory."""

@@ -1,5 +1,7 @@
 # NTT – ingest & copy with hash-based dedupe
 
+`ntt` is always lower case. It is not an acronym, it was an arbitrary sequences of chars I made up after deprecating `n2s`. 
+
 ## Quick start
 1. create DB
 ```

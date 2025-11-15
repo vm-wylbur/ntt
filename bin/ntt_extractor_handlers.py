@@ -71,6 +71,12 @@ def get_supported_mime_types() -> List[str]:
 # - copy_to_byhash() - Copy with hardlink optimization
 # - EXTRACTION_TEMP_DIR - Temp directory on same filesystem as by-hash
 
+# Files to skip during extraction (archive metadata, unreadable files, etc.)
+SKIP_FILES = {
+    '__.SYMDEF',      # ar archive symbol table (ranlib metadata)
+    '__.SYMDEF SORTED',  # sorted variant
+}
+
 
 def walk_and_hash_directory(
     extract_dir: Path,
@@ -90,6 +96,11 @@ def walk_and_hash_directory(
 
     for root, dirs, files in os.walk(extract_dir):
         for filename in files:
+            # Skip archive metadata files
+            if filename in SKIP_FILES:
+                logger.debug(f"Skipping metadata file: {filename}")
+                continue
+
             file_path = Path(root) / filename
 
             # Skip if not a regular file

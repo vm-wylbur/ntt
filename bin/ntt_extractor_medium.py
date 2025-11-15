@@ -61,6 +61,11 @@ class ExtractionMediumManager:
 
         now = datetime.now(timezone.utc)
 
+        # CRITICAL: Create partitions BEFORE inserting into medium table
+        # This prevents deadlock in multi-worker scenarios by ensuring
+        # all workers acquire locks in same order (inode first, then medium)
+        self._create_partitions(medium_hash)
+
         # Insert extracted medium record
         cursor.execute("""
             INSERT INTO medium (
@@ -81,9 +86,6 @@ class ExtractionMediumManager:
 
         result = cursor.fetchone()
         medium_hash = result['medium_hash']  # Dict row, not tuple
-
-        # Create partitioned tables
-        self._create_partitions(medium_hash)
 
         self.db.commit()
 
