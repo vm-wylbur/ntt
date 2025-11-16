@@ -126,12 +126,14 @@ Therefore: metadata belongs with the blob, not the path or inode.
 ```sql
 -- Content-addressed blob storage
 CREATE TABLE blob (
-    hash        bytea PRIMARY KEY,
-    size        bigint NOT NULL,      -- deterministic from hash
-    mime_type   text,                 -- deterministic from hash
-    blobid      text,                 -- storage path in byhash
+    blobid      text PRIMARY KEY,     -- blake3 hash (hex string, unique content identifier)
+    size        bigint NOT NULL,      -- deterministic from blobid
+    mime_type   text,                 -- deterministic from blobid
     first_seen  timestamptz DEFAULT now()
 );
+
+-- Note: storage_path is deterministic from blobid, computed as:
+-- {storage_root}/{blobid[0:2]}/{blobid[2:4]}/{blobid}
 
 -- All paths (no partitioning)
 CREATE TABLE path (
@@ -147,7 +149,7 @@ CREATE TABLE path (
     nlink       int,
 
     -- Link to deduplicated content (NULL until copied):
-    hash        bytea REFERENCES blob(hash),
+    blobid      text REFERENCES blob(blobid),
 
     -- Status (not work queue):
     copied      boolean DEFAULT false,
@@ -156,10 +158,7 @@ CREATE TABLE path (
     PRIMARY KEY (medium_hash, dev, ino, path)
 );
 
--- Simple indexes
-CREATE INDEX idx_path_medium ON path(medium_hash);
-CREATE INDEX idx_path_ino ON path(medium_hash, ino);  -- hardlink lookups
-CREATE INDEX idx_path_copied ON path(medium_hash, copied) WHERE copied = false;
+-- Indexes will be added later based on actual query patterns
 ```
 
 **No inode table. No partitioning. No work queue columns.**
