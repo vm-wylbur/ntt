@@ -211,3 +211,22 @@ Please provide:
 ```
 
 Thank you for running this benchmark!
+
+---
+
+## Benchmark Results
+
+**Status:** ✅ COMPLETED (2025-11-16)
+
+**Executed by:** Web-Claude
+
+**Results:** See `docs/lessons/postgres-insert-vs-update-benchmark-2025-11-16.md`
+
+**Key Findings:**
+- Two-Table INSERT wins by 21-32% across all scales (300K, 1M, 3M rows)
+- UPDATE creates 100% dead tuples (table duplication)
+- INSERT is append-only with zero bloat
+
+**Recommendation:** Use Two-Table INSERT approach (implemented in ntt-loader)
+
+**Applied in:** Commit fa93b4c - ntt-loader refactoring
