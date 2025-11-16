@@ -1,20 +1,22 @@
 #!/usr/bin/env bash
-# Author: PB, Claude, and Kimi
-# Date: 2025-10-05
+# Author: PB and Claude
+# Date: 2025-11-16
 # License: (c) HRDAG, 2025, GPL-2 or newer
 #
 # ------
-# ntt/bin/ntt-loader-partitioned
+# ntt/bin/ntt-loader
 #
-# NTT loader with partition support – streaming .raw (034/NUL) → Postgres partitioned tables
+# NTT loader (unpartitioned) – streaming .raw (034/NUL) → single paths table
 #
-# Key differences from ntt-loader:
-#   - Auto-creates partition for new medium_hash before INSERT
-#   - Dramatically faster dedupe phase (empty partition = zero ON CONFLICT overhead)
+# Key differences from ntt-loader-partitioned:
+#   - No partition creation or management
+#   - DELETE-based reload instead of TRUNCATE
+#   - Single denormalized INSERT into paths table
+#   - Performance logging for DELETE operations
 #
-# Expected performance: bb22 (11.2M paths) ~5min COPY + ~30sec dedupe = ~6min total
+# Expected performance: TBD (testing needed)
 #
-# bash-logger: INTEGRATED (2025-11-05)
+# bash-logger: INTEGRATED (2025-11-16)
 
 set -euo pipefail
 
@@ -45,39 +47,14 @@ if [[ ! -f "$IGNORE_PATTERNS" ]]; then
 fi
 
 # ---------- logging functions ----------
-log_stage() {
-  # Structured stage logging via bash-logger
-  log_info "$1" "$2"
-}
-
 fail() {
-  echo "Error: $1" >&2
   log_error "$1"
   exit 1
 }
 
-# ---------- 0. auto-create partition for this medium ----------
-echo "[$(date -Iseconds)] Creating partition for medium $MEDIUM_HASH..." >&2
-log_stage partition_check "{\"medium_hash\": \"$MEDIUM_HASH\"}"
-
-# Use first 8 chars of medium_hash for partition name
-PARTITION_SUFFIX="${MEDIUM_HASH:0:8}"
-
-# Auto-create partitions (IF NOT EXISTS makes this idempotent)
-sudo -u "${SUDO_USER:-$USER}" psql "$DB_URL" -c "
-CREATE TABLE IF NOT EXISTS inode_p_${PARTITION_SUFFIX}
-    PARTITION OF inode FOR VALUES IN ('$MEDIUM_HASH');
-
-CREATE TABLE IF NOT EXISTS path_p_${PARTITION_SUFFIX}
-    PARTITION OF path FOR VALUES IN ('$MEDIUM_HASH');
-" || fail "Failed to create partitions for medium $MEDIUM_HASH"
-
-echo "[$(date -Iseconds)] Partition ready (inode_p_${PARTITION_SUFFIX}, path_p_${PARTITION_SUFFIX})" >&2
-
 # ---------- 1. create working table ----------
 TABLE_NAME="tmp_path_$$"
-echo "[$(date -Iseconds)] Creating working table..." >&2
-log_stage start "{\"file\": \"$FILE\", \"medium_hash\": \"$MEDIUM_HASH\"}"
+log_info "Creating working table" file="$FILE" medium_hash="$MEDIUM_HASH"
 
 # Create temp table that matches raw file format
 TEMP_TABLE="raw_$$"
@@ -106,19 +83,17 @@ CREATE TABLE $TABLE_NAME (
 " || fail "Failed to create working tables"
 
 # ---------- 2. raw → working table (034 delimiter) ----------
-echo "[$(date -Iseconds)] Loading raw data into working table..." >&2
-log_stage load_start "{\"file\": \"$FILE\"}"
+log_info "Loading raw data into working table" file="$FILE"
 
 # Get expected record count from enum log instead of re-counting
 EXPECTED_RECORDS=$(jq -rs --arg file "$FILE" '
   map(select(.stage == "enum_complete" and .out == $file)) |
   sort_by(.ts) | last | .rows // "unknown"
 ' "$ENUM_LOG")
-echo "[$(date -Iseconds)] Expecting $EXPECTED_RECORDS records (from enum log)..." >&2
+log_info "Expecting records from enum log" expected_records="$EXPECTED_RECORDS"
 
 # Escape literal CR/LF in data, then convert null to LF for PostgreSQL
-echo "[$(date -Iseconds)] Starting data conversion (escape CR/LF, null → LF)..." >&2
-echo "[$(date -Iseconds)] Running PostgreSQL COPY command..." >&2
+log_info "Starting PostgreSQL COPY command"
 
 # Use temporary file to capture both output and exit code
 TEMP_OUTPUT="/tmp/ntt-copy-output-$$"
@@ -135,11 +110,10 @@ COPY $TEMP_TABLE(fs_type,dev,ino,nlink,size,mtime,path)
 FROM STDIN
 WITH (FORMAT text, DELIMITER E'\\034', NULL '');
 " > "$TEMP_OUTPUT" 2>&1; then
-  echo "[$(date -Iseconds)] PostgreSQL COPY command completed" >&2
+  log_info "PostgreSQL COPY command completed"
   COPY_RESULT=$(cat "$TEMP_OUTPUT")
 else
-  echo "[$(date -Iseconds)] PostgreSQL COPY command failed" >&2
-  echo "PostgreSQL COPY error:" >&2
+  log_error "PostgreSQL COPY command failed"
   cat "$TEMP_OUTPUT" >&2
   rm -f "$TEMP_OUTPUT"
   fail "Failed to load raw data into temp table"
@@ -148,12 +122,11 @@ rm -f "$TEMP_OUTPUT"
 
 # Extract actual imported count from PostgreSQL output
 ACTUAL_RECORDS=$(echo "$COPY_RESULT" | grep "COPY" | grep -o '[0-9]*' | tail -1)
-echo "[$(date -Iseconds)] PostgreSQL imported $ACTUAL_RECORDS records" >&2
+log_info "PostgreSQL imported records" actual_records="$ACTUAL_RECORDS"
 
 # Sanity check: compare expected vs actual
 if [[ "$EXPECTED_RECORDS" != "unknown" ]] && [[ "$EXPECTED_RECORDS" != "$ACTUAL_RECORDS" ]]; then
-  echo "WARNING: Record count mismatch! Expected: $EXPECTED_RECORDS, Actual: $ACTUAL_RECORDS" >&2
-  log warning "{\"expected\": $EXPECTED_RECORDS, \"actual\": $ACTUAL_RECORDS, \"msg\": \"record_count_mismatch\"}"
+  log_warn "Record count mismatch" expected="$EXPECTED_RECORDS" actual="$ACTUAL_RECORDS"
 fi
 
 # Transfer data to working table with medium_hash
@@ -165,7 +138,7 @@ FROM $TEMP_TABLE;
 " || fail "Failed to transfer data to working table"
 
 # ---------- 2.5 mark excluded paths ----------
-echo "[$(date -Iseconds)] Marking excluded paths..." >&2
+log_info "Marking excluded paths"
 
 # Load patterns from file, skip comments and empty lines, combine with | for regex alternation
 PATTERNS=$(grep -v '^#' "$IGNORE_PATTERNS" | grep -v '^$' | paste -sd '|' -)
@@ -173,7 +146,8 @@ PATTERNS=$(grep -v '^#' "$IGNORE_PATTERNS" | grep -v '^$' | paste -sd '|' -)
 # Add shell-unsafe characters to exclude list
 PATTERNS="${PATTERNS}|#"
 
-echo "[$(date -Iseconds)] Applying $(grep -cv '^#\|^$' "$IGNORE_PATTERNS") patterns..." >&2
+PATTERN_COUNT=$(grep -cv '^#\|^$' "$IGNORE_PATTERNS")
+log_info "Applying exclusion patterns" pattern_count="$PATTERN_COUNT"
 
 # Mark paths matching patterns (path is text in working table, no conversion needed)
 EXCLUDED_COUNT=$(sudo -u "${SUDO_USER:-$USER}" psql "$DB_URL" -t -A -c "
@@ -183,154 +157,122 @@ EXCLUDED_COUNT=$(sudo -u "${SUDO_USER:-$USER}" psql "$DB_URL" -t -A -c "
   SELECT COUNT(*) FROM $TABLE_NAME WHERE exclude_reason = 'pattern_match';
 " | tail -1)
 
-echo "[$(date -Iseconds)] Marked $EXCLUDED_COUNT paths as excluded" >&2
-log_stage exclusions "{\"excluded\": \"$EXCLUDED_COUNT\", \"medium_hash\": \"$MEDIUM_HASH\"}"
+log_info "Marked paths as excluded" excluded_count="$EXCLUDED_COUNT" medium_hash="$MEDIUM_HASH"
 
 # Create indexes on working table for fast deduplication operations
-echo "[$(date -Iseconds)] Creating indexes on working table..." >&2
+log_info "Creating indexes on working table"
 sudo -u "${SUDO_USER:-$USER}" psql "$DB_URL" -c "
 CREATE INDEX idx_${TABLE_NAME}_ino ON $TABLE_NAME(ino);
 CREATE INDEX idx_${TABLE_NAME}_ino_path ON $TABLE_NAME(ino, path);
 " || fail "Failed to create indexes on working table"
 
-# ---------- 3. dedupe into real tables ----------
-echo "[$(date -Iseconds)] Deduplicating into final tables..." >&2
-log_stage dedupe_start "{\"medium_hash\": \"$MEDIUM_HASH\"}"
+# ---------- 3. load into paths table ----------
+log_info "Loading into paths table" medium_hash="$MEDIUM_HASH"
 
 # Capture start time for performance monitoring
-DEDUPE_START=$(date +%s)
+LOAD_START=$(date +%s)
 
 sudo -u "${SUDO_USER:-$USER}" psql "$DB_URL" -c "
 -- Performance tuning for bulk load
 SET work_mem = '256MB';
 SET maintenance_work_mem = '1GB';
 SET synchronous_commit = OFF;
-SET statement_timeout = '15min';  -- Prevent indefinite hangs
+SET statement_timeout = '30min';  -- Increased for large DELETEs
 
 -- medium row (if new) - use known medium_hash instead of scanning table
 INSERT INTO medium (medium_hash, added_at)
 VALUES ('$MEDIUM_HASH', now())
 ON CONFLICT DO NOTHING;
 
--- SAFETY CHECK: Verify partitions are attached before proceeding
--- This catches spontaneous detachment issues early
+-- DELETE existing data for this medium (idempotent reload)
+-- This replaces the old TRUNCATE partition approach
 DO \$\$
+DECLARE
+  delete_start_time timestamptz := clock_timestamp();
+  deleted_count bigint;
+  delete_duration_ms numeric;
 BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_inherits
-    WHERE inhrelid = 'path_p_${PARTITION_SUFFIX}'::regclass
-      AND inhparent = 'path'::regclass
-  ) THEN
-    RAISE EXCEPTION 'SAFETY CHECK FAILED: partition path_p_${PARTITION_SUFFIX} is not attached to parent table';
-  END IF;
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_inherits
-    WHERE inhrelid = 'inode_p_${PARTITION_SUFFIX}'::regclass
-      AND inhparent = 'inode'::regclass
-  ) THEN
-    RAISE EXCEPTION 'SAFETY CHECK FAILED: partition inode_p_${PARTITION_SUFFIX} is not attached to parent table';
-  END IF;
+  DELETE FROM paths WHERE medium_hash = '$MEDIUM_HASH';
+  GET DIAGNOSTICS deleted_count = ROW_COUNT;
+  delete_duration_ms := extract(epoch from clock_timestamp() - delete_start_time) * 1000;
+
+  -- Log DELETE performance for monitoring
+  RAISE NOTICE 'DELETE performance: % rows in %.2f ms (%.2f ms/1000 rows)',
+    deleted_count,
+    delete_duration_ms,
+    CASE WHEN deleted_count > 0 THEN delete_duration_ms / (deleted_count / 1000.0) ELSE 0 END;
 END\$\$;
 
--- Clear any existing data for this medium (loads are always fresh/complete)
--- Use TRUNCATE instead of DELETE (faster, simpler, no FK cascade complexity)
--- Safe with P2P FK architecture - only affects this partition pair
-TRUNCATE path_p_${PARTITION_SUFFIX}, inode_p_${PARTITION_SUFFIX};
+-- Insert all paths with inode metadata
+-- Note: No deduplication - all paths inserted (including hardlinks)
+INSERT INTO paths (
+  medium_hash, path, dev, ino, size, mtime, fs_type, nlink,
+  exclude_reason, copied
+)
+SELECT
+  '$MEDIUM_HASH',
+  convert_to(path, 'LATIN1'),  -- Convert to bytea to preserve exact bytes
+  dev, ino, size, mtime, fs_type, nlink,
+  exclude_reason,
+  -- Mark non-files and excluded files as already copied
+  CASE WHEN fs_type = 'f' AND exclude_reason IS NULL THEN false ELSE true END
+FROM $TABLE_NAME;
 
--- inode rows: Use DISTINCT ON instead of GROUP BY with MAX
--- DISTINCT ON is faster and correct since inode metadata is identical for hardlinks
--- No ON CONFLICT needed - partition is now empty (TRUNCATE above)
--- Mark non-files (directories, symlinks, special files) as already copied
-INSERT INTO inode (medium_hash,fs_type,dev,ino,nlink,size,mtime,copied,claimed_by)
-SELECT DISTINCT ON (medium_hash, ino)
-       '$MEDIUM_HASH' as medium_hash,
-       fs_type,
-       dev,
-       ino,
-       nlink,
-       size,
-       mtime,
-       CASE WHEN fs_type = 'f' THEN false ELSE true END as copied,
-       CASE WHEN fs_type = 'f' THEN NULL ELSE 'NON_FILE' END as claimed_by
-FROM   $TABLE_NAME
-ORDER BY medium_hash, ino;
-
--- path rows: Direct SELECT (no GROUP BY needed - verified zero duplicate ino,path pairs)
--- Convert Latin1 text to bytea to preserve exact bytes from filesystem
--- No ON CONFLICT needed - partition is now empty (TRUNCATE above)
-INSERT INTO path (medium_hash,dev,ino,path,exclude_reason)
-SELECT '$MEDIUM_HASH' as medium_hash, dev, ino, convert_to(path, 'LATIN1'), exclude_reason
-FROM   $TABLE_NAME;
-
--- Mark inodes as EXCLUDED if all their paths are excluded
--- This prevents copier from claiming them (saves infinite loop)
-UPDATE inode
-SET copied = true, claimed_by = 'EXCLUDED'
-WHERE medium_hash = '$MEDIUM_HASH'
-  AND copied = false
-  AND NOT EXISTS (
-    SELECT 1 FROM path
-    WHERE path.medium_hash = inode.medium_hash
-      AND path.ino = inode.ino
-      AND path.exclude_reason IS NULL
-  );
-
--- Initialize queue_stats for this medium (faster than triggers for bulk load)
--- Copier workers check queue_stats to determine TABLESAMPLE vs ORDER BY RANDOM() strategy
+-- Update queue_stats for this medium
+-- Copier workers check queue_stats to determine claiming strategy
 INSERT INTO queue_stats (medium_hash, unclaimed_count, total_count)
 SELECT
   '$MEDIUM_HASH',
-  COUNT(*) FILTER (WHERE copied = false AND claimed_by IS NULL),
+  COUNT(*) FILTER (WHERE copied = false),
   COUNT(*)
-FROM inode_p_${PARTITION_SUFFIX}
+FROM paths
+WHERE medium_hash = '$MEDIUM_HASH'
 ON CONFLICT (medium_hash) DO UPDATE
 SET unclaimed_count = EXCLUDED.unclaimed_count,
     total_count = EXCLUDED.total_count,
     last_updated = NOW();
 
--- Ensure fresh statistics for query planner (prevents first-query planning issues)
-ANALYZE inode_p_${PARTITION_SUFFIX};
-ANALYZE path_p_${PARTITION_SUFFIX};
-" || fail "Failed to deduplicate into final tables"
+-- Optional: ANALYZE paths for query planner
+-- Only needed if table statistics are stale
+-- ANALYZE paths;
+" || fail "Failed to load into paths table"
 
-# Log deduplication performance
-DEDUPE_END=$(date +%s)
-DEDUPE_DURATION=$((DEDUPE_END - DEDUPE_START))
-echo "[$(date -Iseconds)] Deduplication completed in ${DEDUPE_DURATION}s" >&2
-log_stage dedupe_complete "{\"duration_sec\": $DEDUPE_DURATION, \"medium_hash\": \"$MEDIUM_HASH\"}"
+# Log load performance
+LOAD_END=$(date +%s)
+LOAD_DURATION=$((LOAD_END - LOAD_START))
+log_info "Load completed" duration_sec="$LOAD_DURATION" medium_hash="$MEDIUM_HASH"
 
-# Count excluded inodes (those with ALL paths excluded)
-EXCLUDED_INODES=$(sudo -u "${SUDO_USER:-$USER}" psql "$DB_URL" -t -A -c "
+# Count excluded paths (those with exclude_reason set)
+EXCLUDED_PATHS=$(sudo -u "${SUDO_USER:-$USER}" psql "$DB_URL" -t -A -c "
   SELECT COUNT(*)
-  FROM inode
+  FROM paths
   WHERE medium_hash = '$MEDIUM_HASH'
-    AND claimed_by = 'EXCLUDED'
+    AND exclude_reason IS NOT NULL
 " 2>/dev/null | grep -o '[0-9]*' | head -1 || echo "0")
 
-echo "[$(date -Iseconds)] Marked $EXCLUDED_INODES inodes as EXCLUDED (all paths excluded)" >&2
-log_stage excluded_inodes "{\"count\": \"$EXCLUDED_INODES\", \"medium_hash\": \"$MEDIUM_HASH\"}"
+log_info "Marked paths as EXCLUDED" count="$EXCLUDED_PATHS" medium_hash="$MEDIUM_HASH"
 
-# Count non-file inodes (directories, symlinks, special files)
-NON_FILE_INODES=$(sudo -u "${SUDO_USER:-$USER}" psql "$DB_URL" -t -A -c "
+# Count non-file paths (directories, symlinks, special files) - those copied=true but no exclude_reason
+NON_FILE_PATHS=$(sudo -u "${SUDO_USER:-$USER}" psql "$DB_URL" -t -A -c "
   SELECT COUNT(*)
-  FROM inode
+  FROM paths
   WHERE medium_hash = '$MEDIUM_HASH'
-    AND claimed_by = 'NON_FILE'
+    AND copied = true
+    AND exclude_reason IS NULL
 " 2>/dev/null | grep -o '[0-9]*' | head -1 || echo "0")
 
-echo "[$(date -Iseconds)] Marked $NON_FILE_INODES inodes as NON_FILE (directories, symlinks, special files)" >&2
-log_stage non_file_inodes "{\"count\": \"$NON_FILE_INODES\", \"medium_hash\": \"$MEDIUM_HASH\"}"
+log_info "Marked paths as NON_FILE" count="$NON_FILE_PATHS" medium_hash="$MEDIUM_HASH"
 
 # ---------- 4. cleanup and summary ----------
-ROWS=$(sudo -u "${SUDO_USER:-$USER}" psql "$DB_URL" -t -A -c "SELECT count(*) FROM path WHERE medium_hash='$MEDIUM_HASH'" 2>/dev/null | grep -o '[0-9]*' | head -1 || echo "unknown")
+ROWS=$(sudo -u "${SUDO_USER:-$USER}" psql "$DB_URL" -t -A -c "SELECT count(*) FROM paths WHERE medium_hash='$MEDIUM_HASH'" 2>/dev/null | grep -o '[0-9]*' | head -1 || echo "unknown")
 
 # Drop the working tables
 sudo -u "${SUDO_USER:-$USER}" psql "$DB_URL" -c "DROP TABLE $TABLE_NAME, $TEMP_TABLE;" 2>/dev/null || true
+
 if [[ "$ACTUAL_RECORDS" == "0" ]]; then
-  echo "[$(date -Iseconds)] ✓ Loading complete: $ROWS paths total for medium $MEDIUM_HASH (no new records - already loaded)" >&2
+  log_info "Loading complete (no new records)" rows="$ROWS" medium_hash="$MEDIUM_HASH"
 else
-  echo "[$(date -Iseconds)] ✓ Loading complete: $ROWS paths loaded for medium $MEDIUM_HASH" >&2
+  log_info "Loading complete" rows="$ROWS" medium_hash="$MEDIUM_HASH"
 fi
-log_stage done "{\"rows\": \"$ROWS\", \"exit\": 0}"
 
 exit 0
