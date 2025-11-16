@@ -1,0 +1,50 @@
+[project]
+name = "ntt"
+version = "0.1.0"
+description = "NTT disk image deduplication and archival system"
+readme = "README.md"
+requires-python = ">=3.13"
+
+# NTT uses uv inline script dependencies for bin/ scripts.
+# This file is for project-wide dev tools only (linting, type checking).
+# Individual scripts declare their own dependencies in inline metadata.
+
+[dependency-groups]
+dev = [
+    "mypy>=1.15.0",
+    "ruff>=0.11.11",
+    "types-psycopg2>=2.9.0",  # Type stubs for psycopg if needed
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+# Enable core linting rules
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # isort
+    "N",   # pep8-naming
+    "W",   # pycodestyle warnings
+    "UP",  # pyupgrade
+]
+
+# Exclude common directories
+exclude = [
+    ".git",
+    "__pycache__",
+    "bin/deprecated",
+    "bin/archive",
+    "bin/__pycache__",
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["ntt"]
+
+[tool.mypy]
+python_version = "3.13"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false  # Scripts use inline typing, not enforced project-wide
+ignore_missing_imports = true  # Many scripts use uv inline deps

@@ -1,0 +1,657 @@
+#!/usr/bin/env bash
+# Author: PB and Claude
+# Date: 2025-10-19
+# License: (c) HRDAG, 2025, GPL-2 or newer
+#
+# ------
+# ntt/bin/floppy-recover-best-img
+#
+# Comprehensive floppy image recovery analyzer
+# Compares 4 recovery methods and selects best based on filesystem integrity:
+#   1. Greaseweazle original
+#   2. disk-analyse default
+#   3. disk-analyse optimized (--pll-period-adj=3)
+#   4. HxC flux recovery
+#
+# Decision criteria:
+#   Primary: Fewest fsck.vfat errors
+#   Secondary: Most files
+#   Tertiary: Best physical metrics (missing sectors, unidentified tracks)
+#
+# Outputs: canonical ${HASH}.img + analysis.json
+#
+# EXTERNAL DEPENDENCIES:
+#   This script requires disk-analyse flux decoder from the Greaseweazle project:
+#   - Repository: https://github.com/keirf/disk-utilities
+#   - Tools used: disk-analyse, libdisk
+#   - Default location: ~/src/disk-utilities/
+#   - Override with: DISKUTIL_DIR environment variable
+#
+#   Optional HxC Floppy Emulator for method 4:
+#   - Repository: https://github.com/jfdelnero/HxCFloppyEmulator
+#   - Default location: ~/src/HxCFloppyEmulator/build/
+#   - Override with: HXCFE_DIR environment variable
+
+set -euo pipefail
+
+# ---------- Configuration ----------
+HXCFE_DIR="${HXCFE_DIR:-$HOME/src/HxCFloppyEmulator/build}"
+DISKUTIL_DIR="${DISKUTIL_DIR:-$HOME/src/disk-utilities}"
+DISK_ANALYSE="$DISKUTIL_DIR/disk-analyse/disk-analyse"
+LIBDISK_DIR="$DISKUTIL_DIR/libdisk"
+DISK_DIR="/data/fast/floppies/disks"
+
+# ---------- Usage ----------
+usage() {
+  cat <<'EOF'
+Usage: floppy-recover-best-img [--flux-only] <session_hash|prefix>
+
+Comprehensive floppy disk recovery analyzer.
+Tries 4 recovery methods and selects best based on filesystem integrity.
+
+Recovery methods:
+  1. Greaseweazle original (already exists)
+  2. disk-analyse default recovery from SCP
+  3. disk-analyse optimized recovery (--pll-period-adj=3)
+  4. HxC flux recovery from SCP (if SCP exists)
+
+Creates:
+  {hash}.img                  Canonical image (winner)
+  {hash}_greaseweazle.img     Greaseweazle original
+  {hash}_da_default.img       disk-analyse default recovery
+  {hash}_da_opt.img           disk-analyse optimized recovery
+  {hash}_hxc.img              HxC flux recovery (if SCP exists)
+  analysis.json               Comprehensive recovery analysis
+
+Options:
+  --flux-only      Process flux-only captures (no greaseweazle IMG)
+                   Requires .scp file, skips greaseweazle candidate
+
+Arguments:
+  <session_hash>   Full 32-character hash
+  <prefix>         First 6 characters of hash (must be unique)
+
+Examples:
+  floppy-recover-best-img 84f29fadce562311bfc03dc23016d7a4  # Full hash
+  floppy-recover-best-img 84f29f                            # 6-char prefix
+  floppy-recover-best-img --flux-only b8584e                # Flux-only disk
+
+Environment variables:
+  HXCFE_DIR      Path to HxC build dir (default: ~/src/HxCFloppyEmulator/build)
+  DISKUTIL_DIR   Path to disk-utilities (default: ~/src/disk-utilities)
+
+Disk directory:
+  /data/fast/floppies/disks/{hash}/
+EOF
+  exit 1
+}
+
+# ---------- Argument parsing ----------
+if [[ $# -eq 0 ]] || [[ "${1:-}" == "-h" ]] || [[ "${1:-}" == "--help" ]]; then
+  usage
+fi
+
+FLUX_ONLY=false
+
+# Check for --flux-only flag
+if [[ "${1:-}" == "--flux-only" ]]; then
+  FLUX_ONLY=true
+  shift
+fi
+
+if [[ $# -ne 1 ]]; then
+  echo "ERROR: Expected exactly 1 argument (plus optional --flux-only), got $#" >&2
+  echo "" >&2
+  usage
+fi
+
+HASH_INPUT="$1"
+
+# If input is 6 characters or less, search for matching directory
+if [[ ${#HASH_INPUT} -le 6 ]]; then
+  echo "Searching for hash starting with: $HASH_INPUT" >&2
+
+  MATCHES=($(ls -d "$DISK_DIR"/${HASH_INPUT}* 2>/dev/null | xargs -n1 basename))
+
+  if [[ ${#MATCHES[@]} -eq 0 ]]; then
+    echo "ERROR: No directories found matching prefix: $HASH_INPUT" >&2
+    echo "Available prefixes:" >&2
+    ls "$DISK_DIR" | cut -c1-6 | sort -u | head -10 >&2
+    exit 1
+  elif [[ ${#MATCHES[@]} -gt 1 ]]; then
+    echo "ERROR: Multiple directories match prefix: $HASH_INPUT" >&2
+    echo "Matches:" >&2
+    printf "  %s\n" "${MATCHES[@]}" >&2
+    exit 1
+  fi
+
+  HASH="${MATCHES[0]}"
+  echo "Found: $HASH" >&2
+else
+  HASH="$HASH_INPUT"
+fi
+
+# Change to disk directory
+DISK_PATH="$DISK_DIR/$HASH"
+if [[ ! -d "$DISK_PATH" ]]; then
+  echo "ERROR: Directory not found: $DISK_PATH" >&2
+  exit 1
+fi
+
+cd "$DISK_PATH"
+
+# ---------- Banner ----------
+echo "==========================================" >&2
+echo "Floppy Image Recovery Analysis" >&2
+echo "==========================================" >&2
+echo "Hash: $HASH" >&2
+echo "Directory: $DISK_PATH" >&2
+echo "" >&2
+
+# ---------- Validation ----------
+SCP_FILE="${HASH}.scp"
+ORIG_IMG="${HASH}.img"
+LOG_FILE="${HASH}.log"
+
+if [[ "$FLUX_ONLY" == "true" ]]; then
+  # Flux-only mode: require SCP, skip original IMG check
+  if [[ ! -f "$SCP_FILE" ]]; then
+    echo "ERROR: Flux-only mode requires SCP file: $SCP_FILE" >&2
+    exit 1
+  fi
+  echo "=== Flux-Only Mode (No greaseweazle IMG) ===" >&2
+  HAS_SCP=true
+else
+  # Normal mode: require original IMG
+  if [[ ! -f "$ORIG_IMG" ]]; then
+    echo "ERROR: Original image not found: $ORIG_IMG" >&2
+    exit 1
+  fi
+
+  # Check if SCP exists (determines if we can do recovery attempts)
+  HAS_SCP=false
+  if [[ -f "$SCP_FILE" ]]; then
+    HAS_SCP=true
+    echo "=== SCP File Found (Can attempt flux recovery) ===" >&2
+  else
+    echo "=== No SCP File (100% success read, using original only) ===" >&2
+  fi
+fi
+
+# ---------- Analysis Functions ----------
+
+# Parse disk-analyse stdout for physical metrics
+parse_disk_analyse_output() {
+  local da_output="$1"
+
+  # Parse unidentified tracks
+  # Example: "** WARNING: 3 tracks are damaged or unidentified!"
+  local unidentified_tracks=$(echo "$da_output" | \
+    grep -oP '\d+(?= tracks? (is|are) damaged or unidentified)' | head -1)
+  unidentified_tracks=${unidentified_tracks:-0}
+
+  # Count missing sectors across all tracks
+  # Example: "T5.1: sectors 3,7,12 missing"
+  local total_missing_sectors=0
+  while IFS= read -r line; do
+    if echo "$line" | grep -q "missing"; then
+      local sectors=$(echo "$line" | grep -oP '(?<=sectors )[0-9,]+' | tr ',' ' ')
+      local sector_count=$(echo "$sectors" | wc -w)
+      total_missing_sectors=$((total_missing_sectors + sector_count))
+    fi
+  done < <(echo "$da_output" | grep "^T[0-9]")
+
+  # Output JSON
+  jq -n \
+    --argjson unidentified "$unidentified_tracks" \
+    --argjson missing "$total_missing_sectors" \
+    '{
+      unidentified_tracks: $unidentified,
+      missing_sectors: $missing
+    }'
+}
+
+# Analyze IMG with fsck.vfat
+analyze_img_fsck() {
+  local img_file="$1"
+  local label="$2"
+
+  echo "  Checking filesystem: $label" >&2
+
+  # Run fsck.vfat
+  local fsck_output_file="/tmp/fsck_${label}_$$_$(date +%s).txt"
+  fsck.vfat -n "$img_file" > "$fsck_output_file" 2>&1 || true
+  local fsck_exitcode=$?
+  local fsck_output=$(cat "$fsck_output_file")
+  rm -f "$fsck_output_file"
+
+  # Parse fsck output
+  local fs_files=$(echo "$fsck_output" | grep -oP '\d+(?= files)' | tail -1)
+  fs_files=${fs_files:-0}
+
+  # Count critical filesystem errors (excluding "FATs differ" which is common and not critical)
+  # grep -c returns exit code 1 when count is 0, but still outputs "0"
+  # so we need to handle this carefully
+  local fs_errors=$(echo "$fsck_output" | grep -ciE "error|corrupt|bad sector|unreadable|invalid|beyond limit|truncat" || true)
+  fs_errors=${fs_errors:-0}
+
+  # Ensure numeric values
+  fsck_exitcode=${fsck_exitcode:-0}
+  fs_files=${fs_files:-0}
+  fs_errors=${fs_errors:-0}
+
+  echo "    Files: $fs_files, Errors: $fs_errors" >&2
+
+  # Output JSON (truncate raw output to avoid "Argument list too long")
+  # Keep first 5000 chars + last 1000 chars of fsck output
+  local fsck_truncated="$fsck_output"
+  if [[ ${#fsck_output} -gt 6000 ]]; then
+    local fsck_head=$(echo "$fsck_output" | head -c 5000)
+    local fsck_tail=$(echo "$fsck_output" | tail -c 1000)
+    fsck_truncated="${fsck_head}... [truncated] ...${fsck_tail}"
+  fi
+
+  jq -n \
+    --arg label "$label" \
+    --argjson fsck_exit "$fsck_exitcode" \
+    --argjson fs_files "$fs_files" \
+    --argjson fs_errors "$fs_errors" \
+    --arg fsck_output "$fsck_truncated" \
+    '{
+      label: $label,
+      fsck: {
+        exit_code: $fsck_exit,
+        files: $fs_files,
+        errors: $fs_errors,
+        raw_output: $fsck_output
+      }
+    }'
+}
+
+# ---------- STEP 1: Preserve Original ----------
+if [[ "$FLUX_ONLY" == "false" ]]; then
+  echo "=== Step 1: Preserving Original ===" >&2
+
+  GREASEWEAZLE_IMG="${HASH}_greaseweazle.img"
+
+  # Only copy if not already preserved
+  if [[ ! -f "$GREASEWEAZLE_IMG" ]]; then
+    cp "$ORIG_IMG" "$GREASEWEAZLE_IMG"
+    echo "✓ Preserved: $ORIG_IMG → $GREASEWEAZLE_IMG" >&2
+  else
+    echo "✓ Already preserved: $GREASEWEAZLE_IMG" >&2
+  fi
+
+  echo "" >&2
+fi
+
+# ---------- STEP 2: Recovery Attempts ----------
+CANDIDATES=()
+CANDIDATE_ANALYSES=()
+
+# Candidate 1: Greaseweazle (skip if flux-only)
+if [[ "$FLUX_ONLY" == "false" ]]; then
+  echo "=== Candidate 1: Greaseweazle ===" >&2
+  GW_ANALYSIS=$(analyze_img_fsck "$GREASEWEAZLE_IMG" "greaseweazle")
+  CANDIDATES+=("greaseweazle")
+  CANDIDATE_ANALYSES+=("$GW_ANALYSIS")
+  echo "" >&2
+else
+  echo "=== Skipping Greaseweazle (flux-only mode) ===" >&2
+  echo "" >&2
+fi
+
+# Only attempt other recoveries if SCP exists
+if [[ "$HAS_SCP" == "true" ]]; then
+
+  # Candidate 2: disk-analyse default
+  echo "=== Candidate 2: disk-analyse default ===" >&2
+  DA_DEFAULT_IMG="${HASH}_da_default.img"
+  DA_DEFAULT_OUTPUT="/tmp/da_default_$$_$(date +%s).txt"
+
+  export LD_LIBRARY_PATH="$LIBDISK_DIR"
+  if "$DISK_ANALYSE" \
+      --config="$DISKUTIL_DIR/disk-analyse/formats" \
+      --format=ibm \
+      "$SCP_FILE" \
+      "$DA_DEFAULT_IMG" > "$DA_DEFAULT_OUTPUT" 2>&1; then
+    echo "✓ disk-analyse default recovery complete" >&2
+
+    # Pad to full 1.44MB if truncated (missing side)
+    IMG_SIZE=$(stat --format="%s" "$DA_DEFAULT_IMG")
+    if [[ $IMG_SIZE -lt 1474560 ]]; then
+      echo "  Padding to 1.44MB (was $(( IMG_SIZE / 1024 ))KB)" >&2
+      truncate -s 1474560 "$DA_DEFAULT_IMG"
+    fi
+
+    DA_DEFAULT_DA_OUTPUT=$(cat "$DA_DEFAULT_OUTPUT")
+    DA_DEFAULT_FSCK=$(analyze_img_fsck "$DA_DEFAULT_IMG" "da_default")
+
+    # Debug: check if fsck JSON is valid
+    if ! echo "$DA_DEFAULT_FSCK" | jq empty 2>/dev/null; then
+      echo "ERROR: Invalid fsck JSON:" >&2
+      echo "$DA_DEFAULT_FSCK" >&2
+      exit 1
+    fi
+
+    # Combine physical + fsck metrics
+    # Parse physical metrics and save to temp file
+    parse_disk_analyse_output "$DA_DEFAULT_DA_OUTPUT" > /tmp/physical_$$.json
+
+    # Debug: check if physical JSON is valid
+    if ! jq empty /tmp/physical_$$.json 2>/dev/null; then
+      echo "ERROR: Invalid physical JSON:" >&2
+      cat /tmp/physical_$$.json >&2
+      exit 1
+    fi
+
+    # Combine metrics
+    DA_DEFAULT_ANALYSIS=$(echo "$DA_DEFAULT_FSCK" | jq \
+      --slurpfile physical /tmp/physical_$$.json \
+      --arg da_output "$DA_DEFAULT_DA_OUTPUT" \
+      '. + {physical: $physical[0], disk_analyse_output: $da_output}')
+
+    rm -f /tmp/physical_$$.json
+
+    CANDIDATES+=("da_default")
+    CANDIDATE_ANALYSES+=("$DA_DEFAULT_ANALYSIS")
+  else
+    echo "⚠ disk-analyse default failed" >&2
+    DA_DEFAULT_ANALYSIS='{"label": "da_default", "error": "disk-analyse failed"}'
+  fi
+  rm -f "$DA_DEFAULT_OUTPUT"
+  echo "" >&2
+
+  # Candidate 3: disk-analyse optimized
+  echo "=== Candidate 3: disk-analyse optimized (--pll-period-adj=3) ===" >&2
+  DA_OPT_IMG="${HASH}_da_opt.img"
+  DA_OPT_OUTPUT="/tmp/da_opt_$$_$(date +%s).txt"
+
+  export LD_LIBRARY_PATH="$LIBDISK_DIR"
+  if "$DISK_ANALYSE" \
+      --config="$DISKUTIL_DIR/disk-analyse/formats" \
+      --format=ibm \
+      --pll-period-adj=3 \
+      "$SCP_FILE" \
+      "$DA_OPT_IMG" > "$DA_OPT_OUTPUT" 2>&1; then
+    echo "✓ disk-analyse optimized recovery complete" >&2
+
+    # Pad to full 1.44MB if truncated (missing side)
+    IMG_SIZE=$(stat --format="%s" "$DA_OPT_IMG")
+    if [[ $IMG_SIZE -lt 1474560 ]]; then
+      echo "  Padding to 1.44MB (was $(( IMG_SIZE / 1024 ))KB)" >&2
+      truncate -s 1474560 "$DA_OPT_IMG"
+    fi
+
+    DA_OPT_DA_OUTPUT=$(cat "$DA_OPT_OUTPUT")
+    DA_OPT_FSCK=$(analyze_img_fsck "$DA_OPT_IMG" "da_opt")
+
+    # Combine physical + fsck metrics
+    # Parse physical metrics and save to temp file
+    parse_disk_analyse_output "$DA_OPT_DA_OUTPUT" > /tmp/physical_$$.json
+
+    # Debug: check if physical JSON is valid
+    if ! jq empty /tmp/physical_$$.json 2>/dev/null; then
+      echo "ERROR: Invalid physical JSON:" >&2
+      cat /tmp/physical_$$.json >&2
+      exit 1
+    fi
+
+    # Combine metrics
+    DA_OPT_ANALYSIS=$(echo "$DA_OPT_FSCK" | jq \
+      --slurpfile physical /tmp/physical_$$.json \
+      --arg da_output "$DA_OPT_DA_OUTPUT" \
+      '. + {physical: $physical[0], disk_analyse_output: $da_output}')
+
+    rm -f /tmp/physical_$$.json
+
+    CANDIDATES+=("da_opt")
+    CANDIDATE_ANALYSES+=("$DA_OPT_ANALYSIS")
+  else
+    echo "⚠ disk-analyse optimized failed" >&2
+    DA_OPT_ANALYSIS='{"label": "da_opt", "error": "disk-analyse failed"}'
+  fi
+  rm -f "$DA_OPT_OUTPUT"
+  echo "" >&2
+
+  # Candidate 4: HxC
+  echo "=== Candidate 4: HxC flux recovery ===" >&2
+  HXC_IMG="${HASH}_hxc.img"
+  HXC_OUTPUT="/tmp/hxc_$$_$(date +%s).txt"
+
+  # Remove existing HxC image if present
+  if [[ -f "$HXC_IMG" ]]; then
+    echo "⚠ Removing existing HxC image: $HXC_IMG" >&2
+    rm -f "$HXC_IMG"
+  fi
+
+  # Run HxC flux recovery (without layout to avoid garbage data)
+  cd "$HXCFE_DIR"
+  export LD_LIBRARY_PATH="$HXCFE_DIR"
+  if ./hxcfe \
+      -finput:"$DISK_PATH/$SCP_FILE" \
+      -conv:RAW_LOADER \
+      -foutput:"$DISK_PATH/$HXC_IMG" > "$HXC_OUTPUT" 2>&1; then
+    echo "✓ HxC flux recovery complete" >&2
+    cd "$DISK_PATH"
+
+    # Pad to full 1.44MB if truncated (missing side)
+    IMG_SIZE=$(stat --format="%s" "$HXC_IMG")
+    if [[ $IMG_SIZE -lt 1474560 ]]; then
+      echo "  Padding to 1.44MB (was $(( IMG_SIZE / 1024 ))KB)" >&2
+      truncate -s 1474560 "$HXC_IMG"
+    fi
+
+    HXC_HXC_OUTPUT=$(cat "$HXC_OUTPUT")
+    HXC_FSCK=$(analyze_img_fsck "$HXC_IMG" "hxc")
+
+    # HxC doesn't provide physical metrics like disk-analyse
+    HXC_ANALYSIS=$(echo "$HXC_FSCK" | jq \
+      --arg hxc_output "$HXC_HXC_OUTPUT" \
+      '. + {hxc_output: $hxc_output}')
+
+    CANDIDATES+=("hxc")
+    CANDIDATE_ANALYSES+=("$HXC_ANALYSIS")
+  else
+    echo "⚠ HxC recovery failed or had warnings" >&2
+    cd "$DISK_PATH"
+
+    # Check if image was created despite warnings
+    if [[ -f "$HXC_IMG" ]]; then
+      echo "  HxC image exists despite warnings, analyzing anyway..." >&2
+
+      # Pad to full 1.44MB if truncated
+      IMG_SIZE=$(stat --format="%s" "$HXC_IMG")
+      if [[ $IMG_SIZE -lt 1474560 ]]; then
+        echo "  Padding to 1.44MB (was $(( IMG_SIZE / 1024 ))KB)" >&2
+        truncate -s 1474560 "$HXC_IMG"
+      fi
+
+      HXC_HXC_OUTPUT=$(cat "$HXC_OUTPUT")
+      HXC_FSCK=$(analyze_img_fsck "$HXC_IMG" "hxc")
+      HXC_ANALYSIS=$(echo "$HXC_FSCK" | jq \
+        --arg hxc_output "$HXC_HXC_OUTPUT" \
+        '. + {hxc_output: $hxc_output, warning: "HxC reported errors but image was created"}')
+      CANDIDATES+=("hxc")
+      CANDIDATE_ANALYSES+=("$HXC_ANALYSIS")
+    else
+      HXC_ANALYSIS='{"label": "hxc", "error": "HxC failed to create image"}'
+    fi
+  fi
+  rm -f "$HXC_OUTPUT"
+  echo "" >&2
+
+else
+  echo "=== Skipping recovery attempts (no SCP file) ===" >&2
+  echo "" >&2
+fi
+
+# ---------- STEP 3: Decision Logic ----------
+echo "=== Step 3: Selecting Best Candidate ===" >&2
+
+BEST_CANDIDATE=""
+BEST_ERRORS=999999
+BEST_FILES=0
+BEST_MISSING=999999
+BEST_UNIDENTIFIED=999999
+
+for i in "${!CANDIDATES[@]}"; do
+  candidate="${CANDIDATES[$i]}"
+  analysis="${CANDIDATE_ANALYSES[$i]}"
+
+  # Extract metrics
+  errors=$(echo "$analysis" | jq -r '.fsck.errors // 999999')
+  files=$(echo "$analysis" | jq -r '.fsck.files // 0')
+  missing=$(echo "$analysis" | jq -r '.physical.missing_sectors // 999999')
+  unidentified=$(echo "$analysis" | jq -r '.physical.unidentified_tracks // 999999')
+
+  echo "  $candidate: errors=$errors, files=$files, missing=$missing, unidentified=$unidentified" >&2
+
+  # Decision logic:
+  # 1. CRITICAL: Disqualify candidates with 0 files (empty filesystem)
+  # 2. Primary: Among candidates with files, pick fewest errors
+  # 3. Secondary: If tied on errors, pick most files
+  # 4. Tertiary: If tied on files, pick best physical metrics
+
+  # Skip candidates with 0 files (unless ALL candidates have 0 files)
+  if [[ $files -eq 0 ]] && [[ $BEST_FILES -gt 0 ]]; then
+    echo "    → Skipped (0 files)" >&2
+    continue
+  fi
+
+  # If this is the first candidate with files, it wins immediately over any 0-file candidate
+  if [[ $files -gt 0 ]] && [[ $BEST_FILES -eq 0 ]]; then
+    BEST_CANDIDATE="$candidate"
+    BEST_ERRORS=$errors
+    BEST_FILES=$files
+    BEST_MISSING=$missing
+    BEST_UNIDENTIFIED=$unidentified
+    echo "    → New winner (has files)" >&2
+    continue
+  fi
+
+  # Now compare among candidates that both have files (or both have 0)
+  # Primary: fewest errors
+  if [[ $errors -lt $BEST_ERRORS ]]; then
+    BEST_CANDIDATE="$candidate"
+    BEST_ERRORS=$errors
+    BEST_FILES=$files
+    BEST_MISSING=$missing
+    BEST_UNIDENTIFIED=$unidentified
+    echo "    → New winner (fewer errors)" >&2
+  elif [[ $errors -eq $BEST_ERRORS ]]; then
+    # Tie on errors, check file count
+    if [[ $files -gt $BEST_FILES ]]; then
+      BEST_CANDIDATE="$candidate"
+      BEST_FILES=$files
+      BEST_MISSING=$missing
+      BEST_UNIDENTIFIED=$unidentified
+      echo "    → New winner (more files)" >&2
+    elif [[ $files -eq $BEST_FILES ]]; then
+      # Tie on files, check physical metrics
+      if [[ $missing -lt $BEST_MISSING ]]; then
+        BEST_CANDIDATE="$candidate"
+        BEST_MISSING=$missing
+        BEST_UNIDENTIFIED=$unidentified
+        echo "    → New winner (fewer missing sectors)" >&2
+      elif [[ $missing -eq $BEST_MISSING ]] && [[ $unidentified -lt $BEST_UNIDENTIFIED ]]; then
+        BEST_CANDIDATE="$candidate"
+        BEST_UNIDENTIFIED=$unidentified
+        echo "    → New winner (fewer unidentified tracks)" >&2
+      fi
+    fi
+  fi
+done
+
+echo "" >&2
+echo "✓ Winner: $BEST_CANDIDATE" >&2
+echo "  Errors: $BEST_ERRORS, Files: $BEST_FILES" >&2
+echo "" >&2
+
+# ---------- STEP 4: Create Canonical Image ----------
+echo "=== Step 4: Creating Canonical Image ===" >&2
+
+case "$BEST_CANDIDATE" in
+  greaseweazle)
+    cp "$GREASEWEAZLE_IMG" "$ORIG_IMG"
+    echo "✓ Using greaseweazle: $GREASEWEAZLE_IMG → $ORIG_IMG" >&2
+    ;;
+  da_default)
+    cp "$DA_DEFAULT_IMG" "$ORIG_IMG"
+    echo "✓ Using disk-analyse default: $DA_DEFAULT_IMG → $ORIG_IMG" >&2
+    ;;
+  da_opt)
+    cp "$DA_OPT_IMG" "$ORIG_IMG"
+    echo "✓ Using disk-analyse optimized: $DA_OPT_IMG → $ORIG_IMG" >&2
+    ;;
+  hxc)
+    cp "$HXC_IMG" "$ORIG_IMG"
+    echo "✓ Using HxC: $HXC_IMG → $ORIG_IMG" >&2
+    ;;
+  *)
+    echo "ERROR: Unknown winner: $BEST_CANDIDATE" >&2
+    exit 1
+    ;;
+esac
+
+echo "" >&2
+
+# ---------- STEP 5: Write analysis.json ----------
+echo "=== Step 5: Writing analysis.json ===" >&2
+
+# Build candidates array
+# Save each candidate analysis to a temp file to avoid shell quoting issues
+for i in "${!CANDIDATES[@]}"; do
+  analysis="${CANDIDATE_ANALYSES[$i]}"
+  echo "$analysis" > "/tmp/candidate_${i}_$$.json"
+done
+
+# Combine all candidate JSONs into an array
+CANDIDATES_JSON="[]"
+for i in "${!CANDIDATES[@]}"; do
+  CANDIDATES_JSON=$(echo "$CANDIDATES_JSON" | jq \
+    --slurpfile item "/tmp/candidate_${i}_$$.json" \
+    '. += [$item[0]]')
+  rm -f "/tmp/candidate_${i}_$$.json"
+done
+
+# Build final JSON
+jq -n \
+  --arg timestamp "$(date -Iseconds)" \
+  --arg hash "$HASH" \
+  --argjson candidates "$CANDIDATES_JSON" \
+  --arg winner "$BEST_CANDIDATE" \
+  --argjson winner_errors "$BEST_ERRORS" \
+  --argjson winner_files "$BEST_FILES" \
+  '{
+    timestamp: $timestamp,
+    hash: $hash,
+    candidates: $candidates,
+    decision: {
+      winner: $winner,
+      errors: $winner_errors,
+      files: $winner_files,
+      criteria: "Primary: fewest fsck errors | Secondary: most files | Tertiary: best physical metrics"
+    },
+    files: {
+      canonical_image: ($hash + ".img"),
+      greaseweazle_image: ($hash + "_greaseweazle.img"),
+      da_default_image: ($hash + "_da_default.img"),
+      da_opt_image: ($hash + "_da_opt.img"),
+      hxc_image: ($hash + "_hxc.img"),
+      flux_capture: ($hash + ".scp"),
+      session_log: ($hash + ".log")
+    }
+  }' > analysis.json
+
+echo "✓ Analysis written to analysis.json" >&2
+echo "" >&2
+
+# ---------- Summary ----------
+echo "==========================================" >&2
+echo "Recovery Complete" >&2
+echo "==========================================" >&2
+echo "Winner: $BEST_CANDIDATE ($BEST_ERRORS errors, $BEST_FILES files)" >&2
+echo "Canonical image: $ORIG_IMG" >&2
+echo "Analysis: analysis.json" >&2
+echo "" >&2
