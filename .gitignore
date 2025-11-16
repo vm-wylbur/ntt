@@ -5,3 +5,4 @@ __pycache__/
 *.pyc
 *.pyo
 bin/__pycache__/
+uv.lock
