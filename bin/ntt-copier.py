@@ -9,6 +9,7 @@
 #     "python-magic",
 #     "typer",
 #     "bitmath",
+#     "redis",
 # ]
 # ///
 #
@@ -33,6 +34,8 @@
 
 import os
 import bitmath
+import cProfile
+import json
 import shutil
 import signal
 import subprocess
@@ -42,6 +45,7 @@ from pathlib import Path
 from typing import Optional
 import psycopg
 from psycopg.rows import dict_row
+import redis
 import yaml
 from loguru import logger
 import typer
@@ -239,15 +243,15 @@ class CopyWorker:
         # MIME type detector (reused across files)
         self.mime_detector = magic.Magic(mime=True)
 
-        # Calculate max_id for this medium (used for random probe strategy)
-        with self.conn.cursor() as cur:
-            cur.execute("""
-                SELECT MAX(id) FROM inode WHERE medium_hash = %s
-            """, (self.medium_hash,))
-            result = cur.fetchone()
-            self.max_id = result['max'] if result and result['max'] else 0
-
-        logger.info(f"Worker {self.worker_id} max_id for medium {self.medium_hash}: {self.max_id}")
+        # Redis connection for work queue
+        redis_url = os.environ.get('NTT_REDIS_URL', 'redis://localhost:6379/0')
+        try:
+            self.redis = redis.from_url(redis_url, decode_responses=True)
+            self.redis.ping()
+            logger.info(f"Worker {self.worker_id} connected to Redis: {redis_url}")
+        except redis.ConnectionError as e:
+            logger.error(f"Failed to connect to Redis at {redis_url}: {e}")
+            raise typer.Exit(code=1)
 
         # Setup signal handlers
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -282,41 +286,198 @@ class CopyWorker:
         logger.info(f"Received signal {signum}, shutting down...")
         self.shutdown = True
 
-    def run(self):
-        """Main worker loop - batch processing mode."""
-        logger.info(f"Worker {self.worker_id} starting (batch mode, batch_size={self.batch_size})")
+    def populate_queue_if_empty(self):
+        """
+        Populate Redis queue with unclaimed work (first-worker-wins with lock).
 
-        # Ensure medium is mounted before starting
+        This is called once at worker startup. If queue is already populated,
+        returns immediately. Otherwise, acquires a distributed lock and populates
+        the global queue from PostgreSQL.
+        """
+        QUEUE_KEY = "ntt:queue:global"
+        LOCK_KEY = "ntt:queue:population_lock"
+        LOCK_TTL = 600  # 10 minutes (in case worker crashes during population)
+
+        # Check queue depth first (fast check)
+        queue_len = self.redis.llen(QUEUE_KEY)
+        if queue_len > 0:
+            logger.info(f"Queue already populated: {queue_len} items")
+            return
+
+        # Try to acquire population lock
+        lock_acquired = self.redis.set(
+            LOCK_KEY,
+            self.worker_id,
+            nx=True,  # Only set if doesn't exist
+            ex=LOCK_TTL
+        )
+
+        if not lock_acquired:
+            logger.info("Another worker is populating queue, waiting...")
+            # Wait for population to complete (up to 60 seconds)
+            for i in range(60):
+                time.sleep(1)
+                queue_len = self.redis.llen(QUEUE_KEY)
+                if queue_len > 0:
+                    logger.info(f"Queue populated by another worker: {queue_len} items")
+                    return
+            logger.warning("Timeout waiting for queue population, proceeding anyway")
+            return
+
         try:
-            self.ensure_medium_mounted(self.medium_hash)
-        except Exception as e:
-            logger.error(f"Failed to ensure mount for {self.medium_hash}: {e}")
-            raise
+            logger.info(f"Acquired population lock, building queue from PostgreSQL...")
 
-        # One-time startup check for inodes that exceeded max retries
+            # Query all unclaimed work from PostgreSQL
+            with self.conn.cursor() as cur:
+                cur.execute("""
+                    SELECT medium_hash, ino, dev, size, mtime
+                    FROM paths
+                    WHERE copied = false
+                      AND claimed_by IS NULL
+                      AND exclude_reason IS NULL
+                    ORDER BY size DESC  -- Process large files first (better progress visibility)
+                """)
+
+                # Batch push to Redis (efficient)
+                pipeline = self.redis.pipeline()
+                count = 0
+                for row in cur:
+                    work_item = json.dumps({
+                        'medium_hash': row['medium_hash'],
+                        'ino': row['ino'],
+                        'dev': row['dev'],
+                        'size': row['size'],
+                        'mtime': row['mtime']
+                    })
+                    pipeline.lpush(QUEUE_KEY, work_item)
+                    count += 1
+
+                    # Execute in batches of 10k
+                    if count % 10000 == 0:
+                        pipeline.execute()
+                        pipeline = self.redis.pipeline()
+                        logger.info(f"Queued {count} work items...")
+
+                # Final batch
+                if count % 10000 != 0:
+                    pipeline.execute()
+
+            logger.info(f"✓ Queue populated: {count} work items")
+
+        except Exception as e:
+            logger.error(f"Failed to populate queue: {e}", exc_info=True)
+            raise
+        finally:
+            # Always release lock
+            self.redis.delete(LOCK_KEY)
+
+    def claim_batch_from_redis(self) -> list[dict]:
+        """
+        Pop batch of work items from Redis queue, claim in PostgreSQL.
+
+        Returns:
+            List of claimed work dicts with columns: medium_hash, ino, dev, size, mtime, nlink
+            Empty list if queue is empty or all items already claimed.
+        """
+        QUEUE_KEY = "ntt:queue:global"
+
+        # Pop batch from Redis (atomic per-item)
+        pipeline = self.redis.pipeline()
+        for _ in range(self.batch_size):
+            pipeline.rpop(QUEUE_KEY)
+        redis_items = pipeline.execute()
+
+        # Parse JSON work items (filter out None values from empty queue)
+        work_items = []
+        for item in redis_items:
+            if item:
+                try:
+                    work_items.append(json.loads(item))
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Invalid JSON in queue: {item[:100]}: {e}")
+
+        if not work_items:
+            return []
+
+        # Build composite keys for PostgreSQL claim
+        medium_hashes = [w['medium_hash'] for w in work_items]
+        inos = [w['ino'] for w in work_items]
+        devs = [w['dev'] for w in work_items]
+
+        # Atomically claim in PostgreSQL
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE paths
+                    SET claimed_by = %s, claimed_at = NOW()
+                    WHERE (medium_hash, ino, dev) IN (
+                        SELECT * FROM unnest(%s::text[], %s::bigint[], %s::bigint[])
+                    )
+                    AND claimed_by IS NULL  -- Guard against race conditions
+                    RETURNING medium_hash, ino, dev, size, mtime, nlink
+                """, (
+                    self.worker_id,
+                    medium_hashes,
+                    inos,
+                    devs
+                ))
+
+                claimed = cur.fetchall()
+
+            self.conn.commit()
+
+            if len(claimed) < len(work_items):
+                logger.debug(f"Claimed {len(claimed)}/{len(work_items)} items (some already claimed by other workers)")
+
+            return claimed
+
+        except Exception as e:
+            logger.error(f"Failed to claim batch in PostgreSQL: {e}", exc_info=True)
+            self.conn.rollback()
+            return []
+
+    def run(self):
+        """Main worker loop - Redis queue mode."""
+        logger.info(f"Worker {self.worker_id} starting (Redis queue mode, batch_size={self.batch_size})")
+
+        # Populate Redis queue if empty (first worker wins)
+        self.populate_queue_if_empty()
+
+        # Ensure medium is mounted before starting (if medium_hash specified)
+        if self.medium_hash:
+            try:
+                self.ensure_medium_mounted(self.medium_hash)
+            except Exception as e:
+                logger.error(f"Failed to ensure mount for {self.medium_hash}: {e}")
+                raise
+
+        # One-time startup check for paths that exceeded max retries
         self.mark_max_retries_exceeded()
 
         consecutive_no_work = 0
         max_no_work_attempts = 3  # Exit after 3 consecutive empty batches
 
         while not self.shutdown:
-            # Process one batch
-            batch_processed = self.process_batch()
+            # Claim batch from Redis queue
+            claimed_work = self.claim_batch_from_redis()
 
-            if not batch_processed:
+            if not claimed_work:
                 consecutive_no_work += 1
 
                 if consecutive_no_work >= max_no_work_attempts:
-                    logger.info(f"No work found after {max_no_work_attempts} attempts, exiting")
+                    logger.info(f"Queue empty after {max_no_work_attempts} attempts, exiting")
                     break
 
-                logger.debug("No work available, waiting...")
-                time.sleep(0.1)  # 100ms between batch attempts
+                logger.debug("Queue empty, waiting...")
+                time.sleep(1)  # 1 second between empty queue checks
                 continue
 
-            consecutive_no_work = 0  # Reset on successful batch
+            consecutive_no_work = 0  # Reset on successful claim
 
-            # Check limit (limit is in inodes processed, not batches)
+            # Process claimed batch
+            self.process_batch_work(claimed_work)
+
+            # Check limit (limit is in items processed, not batches)
             if self.limit > 0 and self.processed_count >= self.limit:
                 logger.info(f"Limit reached: {self.limit}")
                 break
@@ -340,6 +501,17 @@ class CopyWorker:
             result = cur.fetchone()
             return result['image_path'] if result else None
 
+    def get_medium_type(self, medium_hash: str) -> Optional[str]:
+        """Get medium type from database (physical, extracted, carved)."""
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                SELECT medium_type
+                FROM medium
+                WHERE medium_hash = %s
+            """, (medium_hash,))
+            result = cur.fetchone()
+            return result['medium_type'] if result else None
+
     def get_medium_health(self, medium_hash: str) -> Optional[str]:
         """Get health status for a medium from database."""
         with self.conn.cursor() as cur:
@@ -356,9 +528,21 @@ class CopyWorker:
 
         Returns mount path or raises exception if cannot mount.
         Uses cache to avoid repeated filesystem checks for same medium.
+
+        For extracted media (medium_type='extracted'), paths are already absolute
+        and accessible on disk, so no mounting is needed.
         """
         # Check cache first
         if medium_hash in self._mounted_media:
+            return f"/mnt/ntt/{medium_hash}"
+
+        # Check if this is extracted media (no mounting needed)
+        medium_type = self.get_medium_type(medium_hash)
+        if medium_type == 'extracted':
+            # Paths are already absolute, no mounting needed
+            self._mounted_media.add(medium_hash)
+            logger.info(f"Medium {medium_hash} is extracted media (type={medium_type}), no mounting needed")
+            # Return dummy mount point (won't be used since paths are absolute)
             return f"/mnt/ntt/{medium_hash}"
 
         mount_point = f"/mnt/ntt/{medium_hash}"
@@ -405,7 +589,7 @@ class CopyWorker:
             # Mark all inodes for this medium as EXCLUDED
             with self.conn.cursor() as cur:
                 cur.execute("""
-                    UPDATE inode
+                    UPDATE paths
                     SET copied = true, claimed_by = 'EXCLUDED: bad_health', claimed_at = NOW()
                     WHERE medium_hash = %s
                       AND copied = false
@@ -444,7 +628,7 @@ class CopyWorker:
 
     def mark_max_retries_exceeded(self):
         """
-        One-time startup check: mark inodes with >= 5 errors as permanently failed.
+        One-time startup check: mark paths with >= 5 errors as permanently failed.
 
         BUG-007: Uses new status model to classify failures as retryable or permanent
         based on the most recent error in the errors array.
@@ -452,17 +636,17 @@ class CopyWorker:
         This prevents them from being claimed by workers. Runs once at startup,
         not on every batch (that would scan millions of rows constantly).
         """
-        logger.info(f"Checking for inodes with max retries exceeded...")
+        logger.info(f"Checking for paths with max retries exceeded...")
 
         with self.conn.cursor() as cur:
             cur.execute("""
-                SELECT id, ino, errors
-                FROM inode
-                WHERE medium_hash = %s
-                  AND copied = false
+                SELECT medium_hash, ino, dev, errors
+                FROM paths
+                WHERE copied = false
                   AND claimed_by IS NULL
                   AND array_length(errors, 1) >= 5
-            """, (self.medium_hash,))
+                LIMIT 1000
+            """)
 
             exceeded = cur.fetchall()
             if exceeded:
@@ -479,13 +663,13 @@ class CopyWorker:
                         error_type = 'unknown'
 
                     cur.execute("""
-                        UPDATE inode
+                        UPDATE paths
                         SET copied = true,
                             claimed_by = 'MAX_RETRIES_EXCEEDED',
                             status = %s,
                             error_type = %s
-                        WHERE id = %s
-                    """, (status, error_type, row['id']))
+                        WHERE medium_hash = %s AND ino = %s AND dev = %s
+                    """, (status, error_type, row['medium_hash'], row['ino'], row['dev']))
 
                     logger.error(
                         f"PERMANENTLY FAILED ino={row['ino']} "
@@ -519,7 +703,7 @@ class CopyWorker:
         claim_query_with_probe = """
             WITH candidate AS (
                 SELECT medium_hash, ino, dev, size, mtime, nlink, id
-                FROM inode
+                FROM paths
                 WHERE medium_hash = %s
                   AND copied = false
                   AND claimed_by IS NULL
@@ -528,7 +712,7 @@ class CopyWorker:
                 LIMIT %s
                 FOR UPDATE SKIP LOCKED
             )
-            UPDATE inode i
+            UPDATE paths i
             SET claimed_by = %s, claimed_at = NOW()
             FROM candidate c
             WHERE (i.medium_hash, i.ino) = (c.medium_hash, c.ino)
@@ -539,7 +723,7 @@ class CopyWorker:
         claim_query_sequential = """
             WITH candidate AS (
                 SELECT medium_hash, ino, dev, size, mtime, nlink, id
-                FROM inode
+                FROM paths
                 WHERE medium_hash = %s
                   AND copied = false
                   AND claimed_by IS NULL
@@ -547,7 +731,7 @@ class CopyWorker:
                 LIMIT %s
                 FOR UPDATE SKIP LOCKED
             )
-            UPDATE inode i
+            UPDATE paths i
             SET claimed_by = %s, claimed_at = NOW()
             FROM candidate c
             WHERE (i.medium_hash, i.ino) = (c.medium_hash, c.ino)
@@ -647,26 +831,25 @@ class CopyWorker:
             if temp_file_path and temp_file_path.exists():
                 temp_file_path.unlink(missing_ok=True)
 
-    def process_batch(self) -> bool:
+    def process_batch_work(self, claimed_inodes: list[dict]):
         """
-        Process one batch of inodes with timeout protection.
+        Process a batch of already-claimed work items.
 
-        Returns True if work was processed, False if no work available.
+        Args:
+            claimed_inodes: List of claimed work dicts from claim_batch_from_redis()
         """
         import time
         t_batch_start = time.time()
+
+        if not claimed_inodes:
+            return
 
         try:
             with self.conn.cursor() as cur:
                 # Set timeout for this transaction (auto-resets after commit/rollback)
                 cur.execute("SET LOCAL statement_timeout = '5min'")
 
-                # 1. Claim batch
-                claimed_inodes = self.fetch_and_claim_batch()
-                if not claimed_inodes:
-                    return False  # No work
-
-                logger.debug(f"Claimed batch of {len(claimed_inodes)} inodes")
+                logger.debug(f"Processing batch of {len(claimed_inodes)} items")
 
                 # Calculate size distribution for this batch
                 size_dist = {
@@ -682,13 +865,19 @@ class CopyWorker:
 
                 # 2. Get paths for all inodes in batch
                 t_fetch_start = time.time()
+                # Build lists of (medium_hash, ino, dev) tuples
+                medium_hashes = [row['medium_hash'] for row in claimed_inodes]
                 inos = [row['ino'] for row in claimed_inodes]
+                devs = [row['dev'] for row in claimed_inodes]
+
                 cur.execute("""
                     SELECT medium_hash, ino, path
-                    FROM path
-                    WHERE medium_hash = %s AND ino = ANY(%s)
-                      AND exclude_reason IS NULL
-                """, (self.medium_hash, inos))
+                    FROM paths
+                    WHERE (medium_hash, ino, dev) IN (
+                        SELECT * FROM unnest(%s::text[], %s::bigint[], %s::bigint[])
+                    )
+                    AND exclude_reason IS NULL
+                """, (medium_hashes, inos, devs))
                 paths_rows = cur.fetchall()
                 t_fetch_end = time.time()
 
@@ -877,10 +1066,10 @@ class CopyWorker:
                         inos_for_paths.append(ino)
                         blob_ids.append(result['blob_id'])
 
-                # For inode table - separate success, failures, and permanent failures
-                success_ids, success_blob_ids, success_mime_types = [], [], []
-                failed_inodes = []  # List of {id, ino, error_type, error_msg}
-                permanent_failures = []  # List of {id, ino, status, error_type}
+                # For paths table - separate success, failures, and permanent failures
+                success_medium_hashes, success_inos, success_devs, success_blob_ids, success_mime_types = [], [], [], [], []
+                failed_inodes = []  # List of {medium_hash, ino, dev, error_type, error_msg}
+                permanent_failures = []  # List of {medium_hash, ino, dev, status, error_type}
 
                 for inode_row in claimed_inodes:
                     key = (inode_row['medium_hash'], inode_row['ino'])
@@ -890,8 +1079,8 @@ class CopyWorker:
                     if result is None:
                         logger.error(f"CRITICAL: No result for claimed inode {key}, treating as transient error")
                         failed_inodes.append({
-                            'id': inode_row['id'],
                             'ino': inode_row['ino'],
+                            'dev': inode_row['dev'],
                             'medium_hash': inode_row['medium_hash'],
                             'error_type': 'MissingResultError',
                             'error_msg': 'Inode processed but no result recorded (possible exception)'
@@ -901,8 +1090,8 @@ class CopyWorker:
                     if isinstance(result, dict) and 'failure_status' in result:
                         # Max retries reached - mark with status (BUG-007 fix)
                         permanent_failures.append({
-                            'id': inode_row['id'],
                             'ino': inode_row['ino'],
+                            'dev': inode_row['dev'],
                             'medium_hash': inode_row['medium_hash'],
                             'status': result['failure_status'],
                             'error_type': result['failure_error_type']
@@ -910,22 +1099,24 @@ class CopyWorker:
                     elif isinstance(result, dict) and 'error_type' in result:
                         # Transient failure: result is error info dict (will retry)
                         failed_inodes.append({
-                            'id': inode_row['id'],
                             'ino': inode_row['ino'],
+                            'dev': inode_row['dev'],
                             'medium_hash': inode_row['medium_hash'],
                             'error_type': result['error_type'],
                             'error_msg': result['error_msg']
                         })
                     elif isinstance(result, dict):
                         # Success: result is dict with blob_id and mime_type
-                        success_ids.append(inode_row['id'])
+                        success_medium_hashes.append(inode_row['medium_hash'])
+                        success_inos.append(inode_row['ino'])
+                        success_devs.append(inode_row['dev'])
                         success_blob_ids.append(result.get('blob_id'))
                         success_mime_types.append(result.get('mime_type'))
                     else:
                         # Truly unknown result type (shouldn't happen)
                         failed_inodes.append({
-                            'id': inode_row['id'],
                             'ino': inode_row['ino'],
+                            'dev': inode_row['dev'],
                             'medium_hash': inode_row['medium_hash'],
                             'error_type': 'UnknownError',
                             'error_msg': f'Unexpected result type: {type(result)}'
@@ -939,29 +1130,31 @@ class CopyWorker:
                 if medium_hashes:
                     t0 = time.time()
                     cur.execute("""
-                        UPDATE path SET blobid = updates.blob_id
+                        UPDATE paths SET blobid = updates.blob_id
                         FROM unnest(%s::bigint[], %s::text[])
                              AS updates(ino, blob_id)
-                        WHERE path.medium_hash = %s
-                          AND path.ino = updates.ino
-                          AND path.exclude_reason IS NULL
+                        WHERE paths.medium_hash = %s
+                          AND paths.ino = updates.ino
+                          AND paths.exclude_reason IS NULL
                     """, (inos_for_paths, blob_ids, self.medium_hash))
                     t1 = time.time()
                     logger.debug(f"TIMING: UPDATE path: {t1-t0:.3f}s for {len(medium_hashes)} paths")
 
-                if success_ids:
+                if success_medium_hashes:
                     t2 = time.time()
                     cur.execute("""
-                        UPDATE inode SET copied = true, blobid = updates.blob_id,
-                                         mime_type = COALESCE(updates.mime_type, inode.mime_type),
+                        UPDATE paths SET copied = true, blobid = updates.blob_id,
+                                         mime_type = COALESCE(updates.mime_type, paths.mime_type),
                                          status = 'success',
                                          processed_at = NOW()
-                        FROM unnest(%s::bigint[], %s::text[], %s::text[]) AS updates(id, blob_id, mime_type)
-                        WHERE inode.id = updates.id
-                          AND inode.medium_hash = %s
-                    """, (success_ids, success_blob_ids, success_mime_types, self.medium_hash))
+                        FROM unnest(%s::text[], %s::bigint[], %s::bigint[], %s::text[], %s::text[])
+                             AS updates(medium_hash, ino, dev, blob_id, mime_type)
+                        WHERE paths.medium_hash = updates.medium_hash
+                          AND paths.ino = updates.ino
+                          AND paths.dev = updates.dev
+                    """, (success_medium_hashes, success_inos, success_devs, success_blob_ids, success_mime_types))
                     t3 = time.time()
-                    logger.debug(f"TIMING: UPDATE inode (success): {t3-t2:.3f}s for {len(success_ids)} inodes")
+                    logger.debug(f"TIMING: UPDATE paths (success): {t3-t2:.3f}s for {len(success_medium_hashes)} paths")
 
                     # Insert into blobs table to record blob existence with mime_type
                     t_blobs_start = time.time()
@@ -975,48 +1168,70 @@ class CopyWorker:
                     t_blobs_end = time.time()
                     logger.debug(f"TIMING: INSERT blobs: {t_blobs_end-t_blobs_start:.3f}s for {len(success_blob_ids)} blobids")
 
-                # BUG-007: Update permanent failures with status and error_type
+                # BUG-007: Update permanent failures with status and error_type (BATCHED)
                 if permanent_failures:
                     t_perm_start = time.time()
-                    for pf in permanent_failures:
-                        cur.execute("""
-                            UPDATE inode
-                            SET status = %s,
-                                error_type = %s,
-                                copied = true,
-                                claimed_by = NULL,
-                                claimed_at = NULL
-                            WHERE id = %s AND medium_hash = %s
-                        """, (pf['status'], pf['error_type'], pf['id'], pf['medium_hash']))
 
+                    # Extract arrays for batched update
+                    pf_medium_hashes = [pf['medium_hash'] for pf in permanent_failures]
+                    pf_inos = [pf['ino'] for pf in permanent_failures]
+                    pf_devs = [pf['dev'] for pf in permanent_failures]
+                    pf_statuses = [pf['status'] for pf in permanent_failures]
+                    pf_error_types = [pf['error_type'] for pf in permanent_failures]
+
+                    # Single batched UPDATE using unnest
+                    cur.execute("""
+                        UPDATE paths
+                        SET status = updates.status,
+                            error_type = updates.error_type,
+                            copied = true,
+                            claimed_by = NULL,
+                            claimed_at = NULL
+                        FROM unnest(%s::text[], %s::bigint[], %s::bigint[], %s::text[], %s::text[])
+                             AS updates(medium_hash, ino, dev, status, error_type)
+                        WHERE paths.medium_hash = updates.medium_hash
+                          AND paths.ino = updates.ino
+                          AND paths.dev = updates.dev
+                    """, (pf_medium_hashes, pf_inos, pf_devs, pf_statuses, pf_error_types))
+
+                    # Log each permanent failure
+                    for pf in permanent_failures:
                         logger.warning(
                             f"PERMANENTLY FAILED ino={pf['ino']} "
                             f"status={pf['status']} error_type={pf['error_type']}"
                         )
 
                     t_perm_end = time.time()
-                    logger.debug(f"TIMING: UPDATE inode (permanent failures): {t_perm_end-t_perm_start:.3f}s for {len(permanent_failures)} inodes")
+                    logger.debug(f"TIMING: UPDATE paths (permanent failures): {t_perm_end-t_perm_start:.3f}s for {len(permanent_failures)} inodes")
 
                 if failed_inodes:
                     t4 = time.time()
-                    # Update each failed inode with error tracking
-                    for f in failed_inodes:
-                        error_entry = f"{f['error_type']}: {f['error_msg']}"
-                        # CRITICAL: WHERE clause includes medium_hash (partition key) for partition pruning
-                        # Without medium_hash, PostgreSQL scans all 47 partitions (81ms → 0.4ms speedup)
-                        cur.execute("""
-                            UPDATE inode
-                            SET claimed_by = NULL,
-                                claimed_at = NULL,
-                                errors = array_append(errors, %s::text)
-                            WHERE id = %s AND medium_hash = %s
-                        """, (error_entry, f['id'], f['medium_hash']))
 
-                        # Log each error clearly
-                        logger.warning(f"Failed inode id={f['id']} ino={f['ino']}: {f['error_type']}: {f['error_msg']}")
+                    # Extract arrays for batched update
+                    fail_medium_hashes = [f['medium_hash'] for f in failed_inodes]
+                    fail_inos = [f['ino'] for f in failed_inodes]
+                    fail_devs = [f['dev'] for f in failed_inodes]
+                    fail_error_entries = [f"{f['error_type']}: {f['error_msg']}" for f in failed_inodes]
+
+                    # Single batched UPDATE using unnest - append error to existing errors array
+                    cur.execute("""
+                        UPDATE paths
+                        SET claimed_by = NULL,
+                            claimed_at = NULL,
+                            errors = array_append(COALESCE(paths.errors, ARRAY[]::text[]), updates.error_entry)
+                        FROM unnest(%s::text[], %s::bigint[], %s::bigint[], %s::text[])
+                             AS updates(medium_hash, ino, dev, error_entry)
+                        WHERE paths.medium_hash = updates.medium_hash
+                          AND paths.ino = updates.ino
+                          AND paths.dev = updates.dev
+                    """, (fail_medium_hashes, fail_inos, fail_devs, fail_error_entries))
+
+                    # Log each error clearly
+                    for f in failed_inodes:
+                        logger.warning(f"Failed path medium={f['medium_hash'][:8]} ino={f['ino']}: {f['error_type']}: {f['error_msg']}")
 
                     t5 = time.time()
-                    logger.debug(f"TIMING: UPDATE inode (failed): {t5-t4:.3f}s for {len(failed_inodes)} inodes")
+                    logger.debug(f"TIMING: UPDATE paths (failed): {t5-t4:.3f}s for {len(failed_inodes)} inodes")
 
                 # 6. Commit
                 t6 = time.time()
@@ -1086,12 +1301,12 @@ class CopyWorker:
                 size_by_action_mb = {k: v/1024/1024 for k, v in size_by_action.items()}
                 logger.debug(f"BATCH_SIZE_BY_ACTION_MB: {size_by_action_mb}")
 
-                logger.debug(f"Completed batch: {len(success_ids)} copied, {len(failed_inodes)} failed")
+                logger.debug(f"Completed batch: {len(success_medium_hashes)} copied, {len(failed_inodes)} failed")
 
                 # Update stats
-                self.stats['copied'] += len(success_ids)
+                self.stats['copied'] += len(success_medium_hashes)
                 self.stats['errors'] += len(failed_inodes)
-                self.processed_count += len(success_ids)
+                self.processed_count += len(success_medium_hashes)
 
                 return True
 
@@ -1221,7 +1436,7 @@ class CopyWorker:
             # Track this error in the errors array
             with self.conn.cursor() as cur:
                 cur.execute("""
-                    UPDATE inode
+                    UPDATE paths
                     SET errors = array_append(errors, %s)
                     WHERE medium_hash = %s AND ino = %s
                     RETURNING array_length(errors, 1) as error_count, errors
@@ -1245,7 +1460,7 @@ class CopyWorker:
         # Normal release - clear claim
         with self.conn.cursor() as cur:
             cur.execute("""
-                UPDATE inode
+                UPDATE paths
                 SET claimed_by = NULL, claimed_at = NULL
                 WHERE medium_hash = %s AND ino = %s
                   AND claimed_by = %s
@@ -1271,7 +1486,7 @@ class CopyWorker:
         with self.conn.cursor() as cur:
             cur.execute("""
                 SELECT NOT EXISTS (
-                    SELECT 1 FROM path
+                    SELECT 1 FROM pathss
                     WHERE medium_hash = %s AND ino = %s
                       AND exclude_reason IS NULL
                 ) as all_excluded
@@ -1283,7 +1498,7 @@ class CopyWorker:
         claimed_by = f'EXCLUDED: {reason}' if reason else 'EXCLUDED'
         with self.conn.cursor() as cur:
             cur.execute("""
-                UPDATE inode
+                UPDATE paths
                 SET copied = true, claimed_by = %s, claimed_at = NOW()
                 WHERE medium_hash = %s AND ino = %s
             """, (claimed_by, inode_row['medium_hash'], inode_row['ino']))
@@ -1655,7 +1870,7 @@ class CopyWorker:
         with self.conn.cursor() as cur:
             # Update inode
             cur.execute("""
-                UPDATE inode
+                UPDATE paths
                 SET blobid = %s,
                     copied = true,
                     by_hash_created = %s,
@@ -1685,7 +1900,7 @@ class CopyWorker:
         """Update DB for directory."""
         with self.conn.cursor() as cur:
             cur.execute("""
-                UPDATE inode
+                UPDATE paths
                 SET copied = true,
                     by_hash_created = true,
                     mime_type = 'inode/directory',
@@ -1699,7 +1914,7 @@ class CopyWorker:
         """Update DB for symlink."""
         with self.conn.cursor() as cur:
             cur.execute("""
-                UPDATE inode
+                UPDATE paths
                 SET copied = true,
                     by_hash_created = true,
                     mime_type = 'inode/symlink',
@@ -1720,7 +1935,7 @@ class CopyWorker:
 
         with self.conn.cursor() as cur:
             cur.execute("""
-                UPDATE inode
+                UPDATE paths
                 SET copied = true,
                     by_hash_created = true,
                     mime_type = %s,
@@ -1787,4 +2002,4 @@ def main(
 
 
 if __name__ == "__main__":
-    app()
+    cProfile.run('app()', 'copier.prof')
