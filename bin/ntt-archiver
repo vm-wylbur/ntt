@@ -73,30 +73,46 @@ fail() {
 usage() {
   cat <<EOF
 Usage:
-  sudo $0 <medium_hash> [--force] [--verbose] [--floppy]
+  sudo $0 <medium_hash> [--force] [--verbose] [--source <path>]
 
-Archives disk image files to cold storage after copying completes.
+Archives disk images and extracted media to cold storage using dar.
 
 Arguments:
   medium_hash    The medium hash to archive
 
 Options:
   --force        Skip safety checks (copy completion, existing archive)
-  --verbose      Show tar progress and detailed output
-  --floppy       Archive floppy disk (different source/destination)
+  --verbose      Show dar progress and detailed output
+  --source       Override auto-detected source directory
 
-Archives:
-  Normal mode:
-    Source: $IMAGE_ROOT/<hash>*
-    Destination: $ARCHIVE_ROOT/<hash>.tar.zst
+Medium Types (auto-detected from database):
+  physical       Disk image (.raw file)
+                 Source: $IMAGE_ROOT/<hash>.raw
+                 Destination: $ARCHIVE_ROOT/<hash>.1.dar
 
-  Floppy mode (--floppy):
-    Source: /data/fast/floppies/disks/<hash>/ (entire directory)
-    Destination: $ARCHIVE_ROOT/floppies/<hash>.tar.zst
+  extracted      Extracted tape/archive directory
+                 Source: <image_path from database> or --source
+                 Destination: $ARCHIVE_ROOT/<hash>.1.dar
+                 Note: Excludes extracted/ subdirectory if present
+
+  floppy         Floppy disk directory
+                 Source: /data/fast/floppies/disks/<hash>/
+                 Destination: $ARCHIVE_ROOT/floppies/<hash>.1.dar
+
+  manual         Manual source (requires --source)
+                 Source: <path from --source>
+                 Destination: $ARCHIVE_ROOT/<hash>.1.dar
+
+Features:
+  - Creates dar archives with zstd:3 compression
+  - Generates metadata.json from database (extracted/floppy types)
+  - Instant catalogue listing without full decompression
+  - Removes source after successful archival
 
 Safety checks (unless --force):
-  - All inodes must be copied (normal mode only)
+  - All paths must be copied (physical/extracted types)
   - Archive must not already exist
+  - Archive size > 0 after creation
 
 Exit codes:
   0 = success
@@ -104,9 +120,14 @@ Exit codes:
   2 = already archived (skipped)
 
 Examples:
+  # Physical disk image (auto-detected)
   sudo $0 af1349b9f5f9a1a6a0404dea36dcc949
-  sudo $0 af1349b9f5f9a1a6a0404dea36dcc949 --force
-  sudo $0 af1349b9f5f9a1a6a0404dea36dcc949 --floppy
+
+  # Extracted tape with custom source
+  sudo $0 b82431235963a5b1a8c5ab27dee5413a --source /data/fast/tapes/vxa/tape1
+
+  # Force overwrite existing archive
+  sudo $0 af1349b9f5f9a1a6a0404dea36dcc949 --force --verbose
 EOF
   exit 1
 }
@@ -117,7 +138,7 @@ EOF
 MEDIUM_HASH=""
 FORCE=false
 VERBOSE=false
-FLOPPY_MODE=false
+SOURCE_OVERRIDE=""
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -129,9 +150,15 @@ while [[ $# -gt 0 ]]; do
       VERBOSE=true
       shift
       ;;
-    --floppy)
-      FLOPPY_MODE=true
+    --source)
       shift
+      if [[ $# -ge 1 && "$1" != -* ]]; then
+        SOURCE_OVERRIDE="$1"
+        shift
+      else
+        echo "Error: --source requires a directory path" >&2
+        usage
+      fi
       ;;
     -*)
       echo "Unknown option: $1" >&2
@@ -157,68 +184,134 @@ if [[ ! "$MEDIUM_HASH" =~ ^[a-f0-9]{16,64}$ ]]; then
 fi
 
 # ---------- main ----------
-log_info "Starting archive process for $MEDIUM_HASH (force=$FORCE verbose=$VERBOSE floppy=$FLOPPY_MODE)"
+log_info "Starting archive process for $MEDIUM_HASH (force=$FORCE verbose=$VERBOSE source=$SOURCE_OVERRIDE)"
 
-# Check if source files exist
-if [[ "$FLOPPY_MODE" == "true" ]]; then
-  # Floppy mode: archive entire directory
-  FLOPPY_SOURCE_DIR="/data/fast/floppies/disks/${MEDIUM_HASH}"
+# Query medium table for auto-detection (unless --source provided)
+if [[ -z "$SOURCE_OVERRIDE" ]]; then
+  MEDIUM_INFO=$(psql_as_user "$DB_URL" -tAc "
+    SELECT medium_type, image_path
+    FROM medium
+    WHERE medium_hash = '$MEDIUM_HASH'
+  " 2>/dev/null | grep -v "^Pager")
 
-  if [[ ! -d "$FLOPPY_SOURCE_DIR" ]]; then
-    fail "Floppy source directory not found: $FLOPPY_SOURCE_DIR"
-  fi
-
-  # Get all files in directory
-  SOURCE_FILES=("$FLOPPY_SOURCE_DIR"/*)
-  if [[ ! -e "${SOURCE_FILES[0]}" ]]; then
-    fail "No files found in floppy directory: $FLOPPY_SOURCE_DIR"
-  fi
-
-  FOUND_IN="$(dirname "$FLOPPY_SOURCE_DIR")"
-  log_info "Found floppy directory: $FLOPPY_SOURCE_DIR"
-
-  if [[ "$VERBOSE" == "true" ]]; then
-    log_info "Found files:"
-    for f in "${SOURCE_FILES[@]}"; do
-      ls -lh "$f" >&2
-    done
+  if [[ -z "$MEDIUM_INFO" ]]; then
+    log_warn "Medium not found in database, falling back to physical mode"
+    MEDIUM_TYPE="physical"
+    IMAGE_PATH=""
+  else
+    MEDIUM_TYPE=$(echo "$MEDIUM_INFO" | cut -d'|' -f1 | xargs)
+    IMAGE_PATH=$(echo "$MEDIUM_INFO" | cut -d'|' -f2 | xargs)
+    log_info "Detected medium_type=$MEDIUM_TYPE image_path=$IMAGE_PATH"
   fi
 else
-  # Normal mode: search for files with hash prefix
-  SEARCH_PATHS=("$IMAGE_ROOT" "/data/cold/img-unprocessed")
-  SOURCE_FILES=()
-  FOUND_IN=""
+  # --source provided: check database for medium_type, fall back to manual
+  MEDIUM_TYPE_DB=$(psql_as_user "$DB_URL" -tAc "
+    SELECT medium_type
+    FROM medium
+    WHERE medium_hash = '$MEDIUM_HASH'
+  " 2>/dev/null | grep -v "^Pager" | xargs)
 
-  for search_path in "${SEARCH_PATHS[@]}"; do
-    CANDIDATES=("$search_path/${MEDIUM_HASH}"*)
-    if [[ -e "${CANDIDATES[0]}" ]]; then
-      SOURCE_FILES=("${CANDIDATES[@]}")
-      FOUND_IN="$search_path"
-      break
-    fi
-  done
-
-  if [[ ${#SOURCE_FILES[@]} -eq 0 ]]; then
-    fail "No source files found in: ${SEARCH_PATHS[*]} (pattern: ${MEDIUM_HASH}*)"
-  fi
-
-  log_info "Found source files in: $FOUND_IN"
-
-  if [[ "$VERBOSE" == "true" ]]; then
-    log_info "Found source files:"
-    for f in "${SOURCE_FILES[@]}"; do
-      ls -lh "$f" >&2
-    done
+  if [[ -n "$MEDIUM_TYPE_DB" ]]; then
+    MEDIUM_TYPE="$MEDIUM_TYPE_DB"
+    IMAGE_PATH="$SOURCE_OVERRIDE"
+    log_info "Using medium_type=$MEDIUM_TYPE from database with --source override: $SOURCE_OVERRIDE"
+  else
+    MEDIUM_TYPE="manual"
+    IMAGE_PATH="$SOURCE_OVERRIDE"
+    log_info "Medium not in database, using manual mode with --source: $SOURCE_OVERRIDE"
   fi
 fi
+
+# Determine source directory based on medium type
+case "$MEDIUM_TYPE" in
+  physical)
+    # Physical disk image - search for .raw files
+    SEARCH_PATHS=("$IMAGE_ROOT" "/data/cold/img-unprocessed")
+    SOURCE_DIR=""
+
+    for search_path in "${SEARCH_PATHS[@]}"; do
+      if [[ -f "$search_path/${MEDIUM_HASH}.raw" ]]; then
+        SOURCE_DIR="$search_path"
+        break
+      fi
+    done
+
+    if [[ -z "$SOURCE_DIR" ]]; then
+      fail "Physical disk image not found in: ${SEARCH_PATHS[*]} (pattern: ${MEDIUM_HASH}.raw)"
+    fi
+
+    log_info "Found physical disk image: $SOURCE_DIR/${MEDIUM_HASH}.raw"
+    ARCHIVE_BASENAME="$MEDIUM_HASH"
+    ARCHIVE_FILE="$ARCHIVE_ROOT/${MEDIUM_HASH}.1.dar"
+    DAR_EXCLUDES=()
+    ;;
+
+  extracted)
+    # Extracted directory - use image_path from database or --source override
+    if [[ -n "$SOURCE_OVERRIDE" ]]; then
+      SOURCE_DIR="$SOURCE_OVERRIDE"
+    elif [[ -n "$IMAGE_PATH" ]]; then
+      SOURCE_DIR="$IMAGE_PATH"
+    else
+      fail "No source directory for extracted medium (use --source or check database)"
+    fi
+
+    if [[ ! -d "$SOURCE_DIR" ]]; then
+      fail "Extracted directory not found: $SOURCE_DIR"
+    fi
+
+    log_info "Found extracted directory: $SOURCE_DIR"
+    ARCHIVE_BASENAME="$MEDIUM_HASH"
+    ARCHIVE_FILE="$ARCHIVE_ROOT/${MEDIUM_HASH}.1.dar"
+
+    # Exclude the extracted/ subdirectory if it exists
+    if [[ -d "$SOURCE_DIR/extracted" ]]; then
+      DAR_EXCLUDES=("-P" "extracted")
+      log_info "Will exclude extracted/ subdirectory from archive"
+    else
+      DAR_EXCLUDES=()
+    fi
+    ;;
+
+  floppy)
+    # Floppy directory
+    SOURCE_DIR="/data/fast/floppies/disks/${MEDIUM_HASH}"
+
+    if [[ ! -d "$SOURCE_DIR" ]]; then
+      fail "Floppy directory not found: $SOURCE_DIR"
+    fi
+
+    log_info "Found floppy directory: $SOURCE_DIR"
+    mkdir -p "$ARCHIVE_ROOT/floppies"
+    ARCHIVE_BASENAME="floppies/$MEDIUM_HASH"
+    ARCHIVE_FILE="$ARCHIVE_ROOT/floppies/${MEDIUM_HASH}.1.dar"
+    DAR_EXCLUDES=()
+    ;;
+
+  manual)
+    # Manual source override
+    if [[ -z "$SOURCE_OVERRIDE" ]]; then
+      fail "Manual mode requires --source directory"
+    fi
+
+    SOURCE_DIR="$SOURCE_OVERRIDE"
+
+    if [[ ! -d "$SOURCE_DIR" ]] && [[ ! -f "$SOURCE_DIR" ]]; then
+      fail "Manual source not found: $SOURCE_DIR"
+    fi
+
+    log_info "Using manual source: $SOURCE_DIR"
+    ARCHIVE_BASENAME="$MEDIUM_HASH"
+    ARCHIVE_FILE="$ARCHIVE_ROOT/${MEDIUM_HASH}.1.dar"
+    DAR_EXCLUDES=()
+    ;;
+
+  *)
+    fail "Unknown medium_type: $MEDIUM_TYPE"
+    ;;
+esac
 
 # Check if archive already exists
-if [[ "$FLOPPY_MODE" == "true" ]]; then
-  ARCHIVE_FILE="$ARCHIVE_ROOT/floppies/${MEDIUM_HASH}.tar.zst"
-  mkdir -p "$ARCHIVE_ROOT/floppies"
-else
-  ARCHIVE_FILE="$ARCHIVE_ROOT/${MEDIUM_HASH}.tar.zst"
-fi
 if [[ -f "$ARCHIVE_FILE" ]]; then
   if [[ "$FORCE" == "true" ]]; then
     log_warn "Archive already exists, overwriting (--force): $ARCHIVE_FILE"
@@ -228,8 +321,9 @@ if [[ -f "$ARCHIVE_FILE" ]]; then
   fi
 fi
 
-# Safety check: Verify all inodes are copied (unless --force or floppy mode)
-if [[ "$FORCE" == "false" ]] && [[ "$FLOPPY_MODE" == "false" ]]; then
+# Safety check: Verify all paths are copied (unless --force)
+# Skip verification for floppy (no database tracking) and manual (may not be in DB)
+if [[ "$FORCE" == "false" ]] && [[ "$MEDIUM_TYPE" != "floppy" ]] && [[ "$MEDIUM_TYPE" != "manual" ]]; then
   log_info "Checking copy completion..."
 
   COPY_STATUS=$(psql_as_user "$DB_URL" -tAc "
@@ -237,7 +331,7 @@ if [[ "$FORCE" == "false" ]] && [[ "$FLOPPY_MODE" == "false" ]]; then
       COUNT(*) FILTER (WHERE copied = true) as copied,
       COUNT(*) FILTER (WHERE copied = false) as pending,
       COUNT(*) as total
-    FROM inode
+    FROM paths
     WHERE medium_hash = '$MEDIUM_HASH'
   " 2>/dev/null | grep -v "^Pager" | grep "|")
 
@@ -246,45 +340,108 @@ if [[ "$FORCE" == "false" ]] && [[ "$FLOPPY_MODE" == "false" ]]; then
   TOTAL=$(echo "$COPY_STATUS" | cut -d'|' -f3)
 
   if [[ $TOTAL -eq 0 ]]; then
-    log_warn "No inodes found for this medium (empty filesystem?)"
+    log_warn "No paths found for this medium (empty filesystem?)"
   elif [[ $PENDING -gt 0 ]]; then
-    fail "Copy incomplete: $PENDING of $TOTAL inodes not copied (use --force to skip)"
+    fail "Copy incomplete: $PENDING of $TOTAL paths not copied (use --force to skip)"
   else
-    log_info "Copy complete: $COPIED of $TOTAL inodes copied"
+    log_info "Copy complete: $COPIED of $TOTAL paths copied"
   fi
-elif [[ "$FLOPPY_MODE" == "true" ]]; then
-  log_info "Floppy mode: skipping inode copy verification"
+else
+  log_info "Skipping copy verification (medium_type=$MEDIUM_TYPE, force=$FORCE)"
 fi
 
-# Create archive
+# Generate metadata.json if it doesn't exist (for extracted/floppy types)
+if [[ "$MEDIUM_TYPE" == "extracted" ]] || [[ "$MEDIUM_TYPE" == "floppy" ]]; then
+  METADATA_FILE="$SOURCE_DIR/metadata.json"
+
+  if [[ ! -f "$METADATA_FILE" ]]; then
+    log_info "Generating metadata.json: $METADATA_FILE"
+
+    # Query medium table for metadata
+    MEDIUM_DATA=$(psql_as_user "$DB_URL" -tAc "
+      SELECT medium_hash, medium_human, added_at, enum_done, copy_done,
+             health, image_path, message, diagnostics, problems,
+             medium_type, source_blobid, extraction_method, extracted_at
+      FROM medium
+      WHERE medium_hash = '$MEDIUM_HASH'
+    " 2>/dev/null | grep -v "^Pager")
+
+    if [[ -n "$MEDIUM_DATA" ]]; then
+      # Parse the pipe-delimited row
+      IFS='|' read -r m_hash m_human m_added m_enum m_copy m_health m_image \
+                      m_message m_diag m_problems m_type m_blob m_extract m_extracted_at <<< "$MEDIUM_DATA"
+
+      # Generate JSON (basic formatting)
+      cat > "$METADATA_FILE" <<EOF
+{
+  "medium_hash": "$m_hash",
+  "medium_human": "$m_human",
+  "added_at": "$m_added",
+  "enum_done": "$m_enum",
+  "copy_done": "$m_copy",
+  "health": $([[ -z "$m_health" ]] && echo "null" || echo "\"$m_health\""),
+  "image_path": "$m_image",
+  "message": $([[ -z "$m_message" ]] && echo "null" || echo "\"$m_message\""),
+  "diagnostics": $([[ -z "$m_diag" ]] && echo "null" || echo "\"$m_diag\""),
+  "problems": $([[ -z "$m_problems" ]] && echo "null" || echo "\"$m_problems\""),
+  "medium_type": "$m_type",
+  "source_blobid": $([[ -z "$m_blob" ]] && echo "null" || echo "\"$m_blob\""),
+  "extraction_method": $([[ -z "$m_extract" ]] && echo "null" || echo "\"$m_extract\""),
+  "extracted_at": $([[ -z "$m_extracted_at" ]] && echo "null" || echo "\"$m_extracted_at\"")
+}
+EOF
+      log_info "Created metadata.json from database"
+    else
+      log_warn "No database entry found for $MEDIUM_HASH, creating minimal metadata.json"
+      cat > "$METADATA_FILE" <<EOF
+{
+  "medium_hash": "$MEDIUM_HASH",
+  "medium_human": null,
+  "added_at": null,
+  "enum_done": null,
+  "copy_done": null,
+  "health": null,
+  "image_path": "$SOURCE_DIR",
+  "message": null,
+  "diagnostics": null,
+  "problems": null,
+  "medium_type": "$MEDIUM_TYPE",
+  "source_blobid": null,
+  "extraction_method": null,
+  "extracted_at": null
+}
+EOF
+    fi
+  else
+    log_info "metadata.json already exists: $METADATA_FILE"
+  fi
+fi
+
+# Create archive with dar
 log_info "Creating archive: $ARCHIVE_FILE"
 
-if [[ "$FLOPPY_MODE" == "true" ]]; then
-  # Floppy mode: archive entire directory
-  TAR_OPTS="-C $FOUND_IN -c"
-  if [[ "$VERBOSE" == "true" ]]; then
-    TAR_OPTS="$TAR_OPTS -v"
-  fi
-  FILE_PATTERNS=("$MEDIUM_HASH")
-else
-  # Normal mode: archive individual files
-  TAR_OPTS="-C $FOUND_IN -c"
-  if [[ "$VERBOSE" == "true" ]]; then
-    TAR_OPTS="$TAR_OPTS -v"
-  fi
+# Build dar command
+DAR_CMD=(dar -c "$ARCHIVE_ROOT/$ARCHIVE_BASENAME" -R "$SOURCE_DIR")
 
-  # Build file list (just basenames, tar will handle them from -C directory)
-  FILE_PATTERNS=()
-  for f in "${SOURCE_FILES[@]}"; do
-    FILE_PATTERNS+=("$(basename "$f")")
-  done
+# Add excludes if any
+if [[ ${#DAR_EXCLUDES[@]} -gt 0 ]]; then
+  DAR_CMD+=("${DAR_EXCLUDES[@]}")
 fi
 
-# Create archive with zstd compression
-if tar $TAR_OPTS "${FILE_PATTERNS[@]}" | zstd > "$ARCHIVE_FILE"; then
+# Add compression and no-slicing
+DAR_CMD+=(-zzstd:3 -s 0)
+
+# Add verbosity if requested
+if [[ "$VERBOSE" == "true" ]]; then
+  DAR_CMD+=(-v)
+fi
+
+# Execute dar
+log_info "Running: ${DAR_CMD[*]}"
+if "${DAR_CMD[@]}"; then
   log_info "Archive created successfully"
 else
-  fail "Archive creation failed (tar exit code: ${PIPESTATUS[0]}, zstd exit code: ${PIPESTATUS[1]})"
+  fail "Archive creation failed (dar exit code: $?)"
 fi
 
 # Chown archive to pball:pball with 644
@@ -307,42 +464,50 @@ fi
 ARCHIVE_SIZE_HUMAN=$(stat -c%s "$ARCHIVE_FILE" | numfmt --to=iec-i --suffix=B 2>/dev/null || echo "${ARCHIVE_SIZE} bytes")
 log_info "Archive verified: $ARCHIVE_SIZE_HUMAN"
 
-# Remove source files
-if [[ "$FLOPPY_MODE" == "true" ]]; then
-  # Floppy mode: remove entire directory
-  log_info "Removing floppy directory: $FLOPPY_SOURCE_DIR"
+# Remove source files/directories
+case "$MEDIUM_TYPE" in
+  physical)
+    # Physical disk image - remove .raw file and related files
+    log_info "Removing source files: $SOURCE_DIR/${MEDIUM_HASH}*"
 
-  rm -rf "$FLOPPY_SOURCE_DIR"
+    rm -f "$SOURCE_DIR/${MEDIUM_HASH}"*
 
-  # Verify directory is gone
-  if [[ -d "$FLOPPY_SOURCE_DIR" ]]; then
-    fail "Floppy directory removal failed: $FLOPPY_SOURCE_DIR still exists"
-  fi
-
-  log_info "Floppy directory removed successfully"
-else
-  # Normal mode: remove individual files
-  log_info "Removing source files (${#SOURCE_FILES[@]} files)..."
-
-  for f in "${SOURCE_FILES[@]}"; do
-    if [[ "$VERBOSE" == "true" ]]; then
-      log_info "  Removing: $f"
+    # Verify all matching files are gone
+    REMAINING_FILES=("$SOURCE_DIR/${MEDIUM_HASH}"*)
+    if [[ -e "${REMAINING_FILES[0]}" ]]; then
+      log_warn "Some source files still exist:"
+      for f in "${REMAINING_FILES[@]}"; do
+        ls -lh "$f" >&2
+      done
+      fail "Source file removal verification failed"
     fi
-    rm -f "$f"
-  done
 
-  # Verify source files are gone
-  REMAINING_FILES=("$FOUND_IN/${MEDIUM_HASH}"*)
-  if [[ -e "${REMAINING_FILES[0]}" ]]; then
-    log_warn "Some source files still exist:"
-    for f in "${REMAINING_FILES[@]}"; do
-      ls -lh "$f" >&2
-    done
-    fail "Source file removal verification failed"
-  fi
+    log_info "Source files removed successfully"
+    ;;
 
-  log_info "Source files removed successfully"
-fi
+  extracted|floppy)
+    # Directory-based sources - remove entire directory
+    log_info "Removing source directory: $SOURCE_DIR"
+
+    rm -rf "$SOURCE_DIR"
+
+    # Verify directory is gone
+    if [[ -d "$SOURCE_DIR" ]]; then
+      fail "Directory removal failed: $SOURCE_DIR still exists"
+    fi
+
+    log_info "Source directory removed successfully"
+    ;;
+
+  manual)
+    # Manual mode - log but don't remove (user should manage manually)
+    log_info "Manual source - NOT removing: $SOURCE_DIR (manage manually)"
+    ;;
+
+  *)
+    log_warn "Unknown medium_type for removal: $MEDIUM_TYPE"
+    ;;
+esac
 
 # Success
 log_info "Archive complete: $ARCHIVE_FILE ($ARCHIVE_SIZE_HUMAN)"

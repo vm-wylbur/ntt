@@ -209,6 +209,16 @@ class CopyWorker:
 
         logger.info(f"Worker {self.worker_id} paths: by-hash={self.BY_HASH_ROOT}")
 
+        # Clean up any orphaned temp files from crashed workers
+        my_tmp_dir = self.RAMDISK / self.worker_id
+        my_tmp_dir.mkdir(parents=True, exist_ok=True)
+        orphaned_count = 0
+        for f in my_tmp_dir.glob("*.tmp"):
+            f.unlink()
+            orphaned_count += 1
+        if orphaned_count > 0:
+            logger.info(f"Cleaned up {orphaned_count} orphaned temp files from {my_tmp_dir}")
+
         # Stats
         self.stats = {
             'copied': 0,
@@ -292,10 +302,10 @@ class CopyWorker:
 
         This is called once at worker startup. If queue is already populated,
         returns immediately. Otherwise, acquires a distributed lock and populates
-        the global queue from PostgreSQL.
+        the per-medium queue from PostgreSQL.
         """
-        QUEUE_KEY = "ntt:queue:global"
-        LOCK_KEY = "ntt:queue:population_lock"
+        QUEUE_KEY = f"ntt:queue:{self.medium_hash}"
+        LOCK_KEY = f"ntt:queue:population_lock:{self.medium_hash}"
         LOCK_TTL = 600  # 10 minutes (in case worker crashes during population)
 
         # Check queue depth first (fast check)
@@ -327,7 +337,7 @@ class CopyWorker:
         try:
             logger.info(f"Acquired population lock, building queue from PostgreSQL...")
 
-            # Query all unclaimed work from PostgreSQL
+            # Query all unclaimed work from PostgreSQL for this medium
             with self.conn.cursor() as cur:
                 cur.execute("""
                     SELECT medium_hash, ino, dev, size, mtime
@@ -335,8 +345,9 @@ class CopyWorker:
                     WHERE copied = false
                       AND claimed_by IS NULL
                       AND exclude_reason IS NULL
+                      AND medium_hash = %s
                     ORDER BY size DESC  -- Process large files first (better progress visibility)
-                """)
+                """, (self.medium_hash,))
 
                 # Batch push to Redis (efficient)
                 pipeline = self.redis.pipeline()
@@ -379,7 +390,7 @@ class CopyWorker:
             List of claimed work dicts with columns: medium_hash, ino, dev, size, mtime, nlink
             Empty list if queue is empty or all items already claimed.
         """
-        QUEUE_KEY = "ntt:queue:global"
+        QUEUE_KEY = f"ntt:queue:{self.medium_hash}"
 
         # Pop batch from Redis (atomic per-item)
         pipeline = self.redis.pipeline()
@@ -1168,34 +1179,20 @@ class CopyWorker:
                     t_blobs_end = time.time()
                     logger.debug(f"TIMING: INSERT blobs: {t_blobs_end-t_blobs_start:.3f}s for {len(success_blob_ids)} blobids")
 
-                # BUG-007: Update permanent failures with status and error_type (BATCHED)
+                # BUG-007: Update permanent failures with status and error_type (NON-BATCHED BASELINE)
                 if permanent_failures:
                     t_perm_start = time.time()
-
-                    # Extract arrays for batched update
-                    pf_medium_hashes = [pf['medium_hash'] for pf in permanent_failures]
-                    pf_inos = [pf['ino'] for pf in permanent_failures]
-                    pf_devs = [pf['dev'] for pf in permanent_failures]
-                    pf_statuses = [pf['status'] for pf in permanent_failures]
-                    pf_error_types = [pf['error_type'] for pf in permanent_failures]
-
-                    # Single batched UPDATE using unnest
-                    cur.execute("""
-                        UPDATE paths
-                        SET status = updates.status,
-                            error_type = updates.error_type,
-                            copied = true,
-                            claimed_by = NULL,
-                            claimed_at = NULL
-                        FROM unnest(%s::text[], %s::bigint[], %s::bigint[], %s::text[], %s::text[])
-                             AS updates(medium_hash, ino, dev, status, error_type)
-                        WHERE paths.medium_hash = updates.medium_hash
-                          AND paths.ino = updates.ino
-                          AND paths.dev = updates.dev
-                    """, (pf_medium_hashes, pf_inos, pf_devs, pf_statuses, pf_error_types))
-
-                    # Log each permanent failure
                     for pf in permanent_failures:
+                        cur.execute("""
+                            UPDATE paths
+                            SET status = %s,
+                                error_type = %s,
+                                copied = true,
+                                claimed_by = NULL,
+                                claimed_at = NULL
+                            WHERE medium_hash = %s AND ino = %s AND dev = %s
+                        """, (pf['status'], pf['error_type'], pf['medium_hash'], pf['ino'], pf['dev']))
+
                         logger.warning(
                             f"PERMANENTLY FAILED ino={pf['ino']} "
                             f"status={pf['status']} error_type={pf['error_type']}"
@@ -1206,28 +1203,18 @@ class CopyWorker:
 
                 if failed_inodes:
                     t4 = time.time()
-
-                    # Extract arrays for batched update
-                    fail_medium_hashes = [f['medium_hash'] for f in failed_inodes]
-                    fail_inos = [f['ino'] for f in failed_inodes]
-                    fail_devs = [f['dev'] for f in failed_inodes]
-                    fail_error_entries = [f"{f['error_type']}: {f['error_msg']}" for f in failed_inodes]
-
-                    # Single batched UPDATE using unnest - append error to existing errors array
-                    cur.execute("""
-                        UPDATE paths
-                        SET claimed_by = NULL,
-                            claimed_at = NULL,
-                            errors = array_append(COALESCE(paths.errors, ARRAY[]::text[]), updates.error_entry)
-                        FROM unnest(%s::text[], %s::bigint[], %s::bigint[], %s::text[])
-                             AS updates(medium_hash, ino, dev, error_entry)
-                        WHERE paths.medium_hash = updates.medium_hash
-                          AND paths.ino = updates.ino
-                          AND paths.dev = updates.dev
-                    """, (fail_medium_hashes, fail_inos, fail_devs, fail_error_entries))
-
-                    # Log each error clearly
+                    # Update each failed path with error tracking (NON-BATCHED BASELINE)
                     for f in failed_inodes:
+                        error_entry = f"{f['error_type']}: {f['error_msg']}"
+                        cur.execute("""
+                            UPDATE paths
+                            SET claimed_by = NULL,
+                                claimed_at = NULL,
+                                errors = array_append(errors, %s::text)
+                            WHERE medium_hash = %s AND ino = %s AND dev = %s
+                        """, (error_entry, f['medium_hash'], f['ino'], f['dev']))
+
+                        # Log each error clearly
                         logger.warning(f"Failed path medium={f['medium_hash'][:8]} ino={f['ino']}: {f['error_type']}: {f['error_msg']}")
 
                     t5 = time.time()
