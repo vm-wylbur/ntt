@@ -291,10 +291,39 @@ class CopyWorker:
         elif self.medium_health != 'ok':
             logger.warning(f"Medium {self.medium_health[:8]} has health={self.medium_health}")
 
+        # Release stale claims from crashed/failed workers
+        self.release_stale_claims()
+
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals gracefully."""
         logger.info(f"Received signal {signum}, shutting down...")
         self.shutdown = True
+
+    def release_stale_claims(self, stale_threshold_hours=24):
+        """
+        Release claims from workers that haven't updated in > stale_threshold_hours.
+
+        This handles the case where workers crash/fail and leave files claimed.
+        A claim is considered stale if claimed_at is older than the threshold.
+        """
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                UPDATE paths
+                SET claimed_by = NULL,
+                    claimed_at = NULL
+                WHERE medium_hash = %s
+                  AND copied = false
+                  AND claimed_by IS NOT NULL
+                  AND claimed_at < NOW() - INTERVAL '%s hours'
+            """, (self.medium_hash, stale_threshold_hours))
+
+            released_count = cur.rowcount
+            self.conn.commit()
+
+            if released_count > 0:
+                logger.warning(f"Released {released_count} stale claims (>{stale_threshold_hours}h old) for medium {self.medium_hash[:8]}")
+            else:
+                logger.info(f"No stale claims found for medium {self.medium_hash[:8]}")
 
     def populate_queue_if_empty(self):
         """
@@ -336,6 +365,36 @@ class CopyWorker:
 
         try:
             logger.info(f"Acquired population lock, building queue from PostgreSQL...")
+
+            # Diagnostic: Query work breakdown to understand queue eligibility
+            with self.conn.cursor() as diag_cur:
+                diag_cur.execute("""
+                    SELECT
+                        COUNT(*) FILTER (WHERE copied = false AND claimed_by IS NULL AND exclude_reason IS NULL) as queueable,
+                        COUNT(*) FILTER (WHERE copied = false AND claimed_by IS NOT NULL) as stale_claims,
+                        COUNT(*) FILTER (WHERE copied = false AND exclude_reason IS NOT NULL) as excluded,
+                        COUNT(*) FILTER (WHERE copied = true) as already_copied
+                    FROM paths
+                    WHERE medium_hash = %s
+                """, (self.medium_hash,))
+
+                stats = diag_cur.fetchone()
+                logger.info(f"Queue eligibility: queueable={stats['queueable']}, stale_claims={stats['stale_claims']}, excluded={stats['excluded']}, already_copied={stats['already_copied']}")
+
+                if stats['stale_claims'] > 0:
+                    # Show which workers left stale claims
+                    diag_cur.execute("""
+                        SELECT claimed_by, COUNT(*) as count
+                        FROM paths
+                        WHERE medium_hash = %s
+                          AND copied = false
+                          AND claimed_by IS NOT NULL
+                        GROUP BY claimed_by
+                        ORDER BY count DESC
+                    """, (self.medium_hash,))
+
+                    stale_workers = diag_cur.fetchall()
+                    logger.warning(f"Found {stats['stale_claims']} files with stale claims from {len(stale_workers)} workers: {dict(stale_workers)}")
 
             # Query all unclaimed work from PostgreSQL for this medium
             with self.conn.cursor() as cur:
