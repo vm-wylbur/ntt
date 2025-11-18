@@ -98,36 +98,35 @@ These symlinks define the selection - everything else is unwanted.
 For each symlink in `for-ingestion/tapeN/`:
 1. Follow the symlink to find the target directory
 2. Copy the target directory (dereferencing symlinks → real files)
-3. Destination: `/data/fast/tapes/vxa/ready-for-ntt/tapeN/`
+3. **FLATTEN nested directory structure** - copy directly to `ready-for-ntt/tapeN/`
+4. Destination: `/data/fast/tapes/vxa/ready-for-ntt/tapeN/`
 
 **CRITICAL:** Our tools (ntt-enum, ntt-copier) do NOT handle symlinks correctly. All symlinks must be dereferenced to real files.
 
+**IMPORTANT:** Flatten the directory structure when copying. If for-ingestion has nested symlinks like `home/pball/project1`, copy the target directory directly to `ready-for-ntt/tapeN/project1/` (not `ready-for-ntt/tapeN/home/pball/project1/`).
+
 ```bash
-# Example for tape3
-mkdir -p /data/fast/tapes/vxa/ready-for-ntt/vxa-tape3
+# Example for tape4 with flattened structure
+mkdir -p /data/fast/tapes/vxa/ready-for-ntt/vxa-tape4
 
-# For each symlink, copy dereferenced content
-cp -rL /data/fast/tapes/vxa/for-ingestion/vxa-tape3/root \
-  /data/fast/tapes/vxa/ready-for-ntt/vxa-tape3/
-
-cp -rL /data/fast/tapes/vxa/for-ingestion/vxa-tape3/rsync \
-  /data/fast/tapes/vxa/ready-for-ntt/vxa-tape3/
-
-# Recursively handle nested symlinks in home/
-# ...
+# Find all symlinks in for-ingestion and copy their targets (dereferenced) with flattening
+find /data/fast/tapes/vxa/for-ingestion/vxa-tape4/ -type l -print0 | \
+while IFS= read -r -d '' symlink; do
+  target=$(readlink -f "$symlink")
+  dirname=$(basename "$target")
+  cp -rL "$target" "/data/fast/tapes/vxa/ready-for-ntt/vxa-tape4/$dirname"
+done
 ```
 
 **Important:** Use `cp -rL` (or equivalent) to dereference symlinks.
 
-#### 2d. Delete unwanted directories
+#### 2d. Keep extracted directory (don't delete yet)
 
-Remove the full extraction (everything not referenced by symlinks):
+**DO NOT delete `tapeN/extracted/` yet.** Keep it until after successful archival.
 
-```bash
-rm -rf /data/fast/tapes/vxa/tapeN/extracted/
-```
+The archiver (ntt-archiver) will automatically exclude the `extracted/` subdirectory when archiving.
 
-**Result:** `ready-for-ntt/tapeN/` contains ONLY selected directories as real files (no symlinks), ready for enumeration.
+**Result:** `ready-for-ntt/tapeN/` contains ONLY selected directories as real files (no symlinks, flattened structure), ready for enumeration.
 
 ### Step 3: Enumerate
 
@@ -150,6 +149,20 @@ bin/ntt-loader /data/fast/raw/<medium_hash>.enum <medium_hash>
 ```
 
 This inserts records into the `paths` table with `copied = false`.
+
+**IMPORTANT:** ntt-loader automatically creates a `medium` record. If the medium already exists in the database, you may get duplicate records. Check for and delete duplicates:
+
+```sql
+-- Check for duplicates
+SELECT medium_hash, medium_type, image_path
+FROM medium
+WHERE medium_hash = '<medium_hash>';
+
+-- If duplicates exist, keep the correct record and delete others
+DELETE FROM medium
+WHERE medium_hash = '<medium_hash>'
+  AND medium_type = 'physical';  -- Delete wrong type, keep 'extracted'
+```
 
 ### Step 5: Copy Files (Deduplication)
 
@@ -285,13 +298,40 @@ After completing the workflow:
 
 **Solution:** Ensure `image_path` points to `tapeN/` (original), not `ready-for-ntt/tapeN/`
 
+**Example from tape4:**
+```sql
+-- WRONG: image_path pointing to working directory
+UPDATE medium SET image_path = '/data/fast/tapes/vxa/ready-for-ntt/vxa-tape4'
+WHERE medium_hash = '3eef17c9...';
+
+-- CORRECT: image_path pointing to original tape directory
+UPDATE medium SET image_path = '/data/fast/tapes/vxa/tape4'
+WHERE medium_hash = '3eef17c9...';
+```
+
+### Issue: Duplicate medium records from ntt-loader
+
+**Symptom:** Copier fails with "No image_path in database" even though medium exists
+
+**Cause:** ntt-loader created duplicate medium record with `medium_type='physical'` and `image_path=NULL`
+
+**Solution:** Delete the duplicate physical record, keep the extracted record with correct image_path
+
+```sql
+-- Check for duplicates
+SELECT medium_hash, medium_type, image_path FROM medium WHERE medium_hash = '<hash>';
+
+-- Delete wrong record
+DELETE FROM medium WHERE medium_hash = '<hash>' AND medium_type = 'physical';
+```
+
 ### Issue: Copy incomplete but workers stopped
 
 **Symptom:** Database shows `copied = false` for many paths, but workers exited
 
 **Cause:** Workers encountered errors (permissions, disk space, bad files)
 
-**Solution:** Check `/var/log/ntt/copier.jsonl` for error details, resolve, re-run copier
+**Solution:** Check worker logs for error details, resolve, re-run copier
 
 ## Related Documentation
 
