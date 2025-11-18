@@ -127,11 +127,7 @@ if [[ "$DRY_RUN" == "false" ]]; then
                 string_to_array(
                     lower(  -- lowercase everything for case-insensitive search
                         regexp_replace(
-                            COALESCE(
-                                convert_from(path, 'UTF8'),      -- Try UTF-8 first
-                                convert_from(path, 'LATIN1'),    -- Fall back to LATIN1
-                                encode(path, 'escape')           -- Last resort: hex-escaped
-                            ),
+                            convert_from(path, 'LATIN1'),  -- Always succeeds, handles all byte sequences
                             '[/\\\\]+',  -- Normalize path separators (/ or \\)
                             '/',
                             'g'
