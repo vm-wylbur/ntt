@@ -441,6 +441,7 @@ if [[ "$MEDIUM_TYPE" == "physical" ]] && [[ -n "$IMAGE_PATH" ]]; then
   # Save current directory
   ORIG_DIR=$(pwd)
   cd "$SOURCE_DIR" || fail "Cannot cd to $SOURCE_DIR"
+  log_info "Changed to directory: $(pwd)"
 
   FILES_TO_ARCHIVE=()
   # Check for all possible file extensions for this medium_hash
@@ -449,6 +450,7 @@ if [[ "$MEDIUM_TYPE" == "physical" ]] && [[ -n "$IMAGE_PATH" ]]; then
                  "${MEDIUM_HASH}.map.bak" "${MEDIUM_HASH}.map.stall"; do
     if [[ -f "$pattern" ]]; then
       FILES_TO_ARCHIVE+=("$pattern")
+      log_info "Found file: $pattern"
     fi
   done
 
@@ -459,8 +461,13 @@ if [[ "$MEDIUM_TYPE" == "physical" ]] && [[ -n "$IMAGE_PATH" ]]; then
 
   log_info "Archiving ${#FILES_TO_ARCHIVE[@]} file(s): ${FILES_TO_ARCHIVE[*]}"
 
-  # Use explicit file list - dar will archive these from current directory
-  DAR_CMD=(dar -c "$ARCHIVE_ROOT/$ARCHIVE_BASENAME" "${FILES_TO_ARCHIVE[@]}")
+  # Build -g arguments for each file (dar needs -g per file when not using -R on directory)
+  DAR_CMD=(dar -c "$ARCHIVE_ROOT/$ARCHIVE_BASENAME")
+  for file in "${FILES_TO_ARCHIVE[@]}"; do
+    DAR_CMD+=(-g "$file")
+  done
+  # Add -R to specify root directory
+  DAR_CMD+=(-R .)
 else
   # For directories (extracted, floppy) or legacy physical, archive entire directory
   DAR_CMD=(dar -c "$ARCHIVE_ROOT/$ARCHIVE_BASENAME" -R "$SOURCE_DIR")
