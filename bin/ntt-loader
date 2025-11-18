@@ -182,7 +182,7 @@ SET statement_timeout = '30min';  -- Increased for large DELETEs
 -- medium row (if new) - use known medium_hash instead of scanning table
 INSERT INTO medium (medium_hash, added_at)
 VALUES ('$MEDIUM_HASH', now())
-ON CONFLICT DO NOTHING;
+ON CONFLICT (medium_hash) DO NOTHING;
 
 -- DELETE existing data for this medium (idempotent reload)
 -- This replaces the old TRUNCATE partition approach
