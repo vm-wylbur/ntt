@@ -225,22 +225,35 @@ fi
 # Determine source directory based on medium type
 case "$MEDIUM_TYPE" in
   physical)
-    # Physical disk image - search for .raw files
-    SEARCH_PATHS=("$IMAGE_ROOT" "/data/cold/img-unprocessed")
-    SOURCE_DIR=""
-
-    for search_path in "${SEARCH_PATHS[@]}"; do
-      if [[ -f "$search_path/${MEDIUM_HASH}.raw" ]]; then
-        SOURCE_DIR="$search_path"
-        break
+    # Physical disk image - use image_path from database or fall back to search
+    if [[ -n "$SOURCE_OVERRIDE" ]]; then
+      SOURCE_DIR="$SOURCE_OVERRIDE"
+      log_info "Using --source override for physical disk: $SOURCE_DIR"
+    elif [[ -n "$IMAGE_PATH" ]]; then
+      # Extract directory from full image path (e.g., /data/fast/img/hash.img -> /data/fast/img)
+      SOURCE_DIR="$(dirname "$IMAGE_PATH")"
+      if [[ ! -f "$IMAGE_PATH" ]]; then
+        fail "Physical disk image not found at database path: $IMAGE_PATH"
       fi
-    done
+      log_info "Using image_path from database: $IMAGE_PATH"
+    else
+      # Fall back to searching for .raw files (legacy behavior)
+      SEARCH_PATHS=("$IMAGE_ROOT" "/data/cold/img-unprocessed")
+      SOURCE_DIR=""
 
-    if [[ -z "$SOURCE_DIR" ]]; then
-      fail "Physical disk image not found in: ${SEARCH_PATHS[*]} (pattern: ${MEDIUM_HASH}.raw)"
+      for search_path in "${SEARCH_PATHS[@]}"; do
+        if [[ -f "$search_path/${MEDIUM_HASH}.raw" ]]; then
+          SOURCE_DIR="$search_path"
+          break
+        fi
+      done
+
+      if [[ -z "$SOURCE_DIR" ]]; then
+        fail "Physical disk image not found in: ${SEARCH_PATHS[*]} (pattern: ${MEDIUM_HASH}.raw or ${MEDIUM_HASH}.img)"
+      fi
+      log_info "Found physical disk image via search: $SOURCE_DIR/${MEDIUM_HASH}.raw"
     fi
 
-    log_info "Found physical disk image: $SOURCE_DIR/${MEDIUM_HASH}.raw"
     ARCHIVE_BASENAME="$MEDIUM_HASH"
     ARCHIVE_FILE="$ARCHIVE_ROOT/${MEDIUM_HASH}.1.dar"
     DAR_EXCLUDES=()
@@ -421,7 +434,37 @@ fi
 log_info "Creating archive: $ARCHIVE_FILE"
 
 # Build dar command
-DAR_CMD=(dar -c "$ARCHIVE_ROOT/$ARCHIVE_BASENAME" -R "$SOURCE_DIR")
+if [[ "$MEDIUM_TYPE" == "physical" ]] && [[ -n "$IMAGE_PATH" ]]; then
+  # For physical disks with explicit image_path, archive specific files by explicit list
+  # Build list of files to archive (avoiding dar -g glob which can exclude everything)
+
+  # Save current directory
+  ORIG_DIR=$(pwd)
+  cd "$SOURCE_DIR" || fail "Cannot cd to $SOURCE_DIR"
+
+  FILES_TO_ARCHIVE=()
+  # Check for all possible file extensions for this medium_hash
+  for pattern in "${MEDIUM_HASH}.img" "${MEDIUM_HASH}.raw" "${MEDIUM_HASH}.map" \
+                 "${MEDIUM_HASH}.json" "${MEDIUM_HASH}-ddrescue.log" \
+                 "${MEDIUM_HASH}.map.bak" "${MEDIUM_HASH}.map.stall"; do
+    if [[ -f "$pattern" ]]; then
+      FILES_TO_ARCHIVE+=("$pattern")
+    fi
+  done
+
+  if [[ ${#FILES_TO_ARCHIVE[@]} -eq 0 ]]; then
+    cd "$ORIG_DIR"
+    fail "No files found matching pattern ${MEDIUM_HASH}* in $SOURCE_DIR"
+  fi
+
+  log_info "Archiving ${#FILES_TO_ARCHIVE[@]} file(s): ${FILES_TO_ARCHIVE[*]}"
+
+  # Use explicit file list - dar will archive these from current directory
+  DAR_CMD=(dar -c "$ARCHIVE_ROOT/$ARCHIVE_BASENAME" "${FILES_TO_ARCHIVE[@]}")
+else
+  # For directories (extracted, floppy) or legacy physical, archive entire directory
+  DAR_CMD=(dar -c "$ARCHIVE_ROOT/$ARCHIVE_BASENAME" -R "$SOURCE_DIR")
+fi
 
 # Add excludes if any
 if [[ ${#DAR_EXCLUDES[@]} -gt 0 ]]; then
@@ -441,7 +484,18 @@ log_info "Running: ${DAR_CMD[*]}"
 if "${DAR_CMD[@]}"; then
   log_info "Archive created successfully"
 else
-  fail "Archive creation failed (dar exit code: $?)"
+  DAR_EXIT=$?
+  # Restore directory if we changed it
+  if [[ "$MEDIUM_TYPE" == "physical" ]] && [[ -n "$IMAGE_PATH" ]] && [[ -n "$ORIG_DIR" ]]; then
+    cd "$ORIG_DIR"
+  fi
+  fail "Archive creation failed (dar exit code: $DAR_EXIT)"
+fi
+
+# Restore original directory if we changed it
+if [[ "$MEDIUM_TYPE" == "physical" ]] && [[ -n "$IMAGE_PATH" ]] && [[ -n "$ORIG_DIR" ]]; then
+  cd "$ORIG_DIR"
+  log_info "Restored working directory"
 fi
 
 # Chown archive to pball:pball with 644
@@ -462,7 +516,49 @@ if [[ $ARCHIVE_SIZE -eq 0 ]]; then
 fi
 
 ARCHIVE_SIZE_HUMAN=$(stat -c%s "$ARCHIVE_FILE" | numfmt --to=iec-i --suffix=B 2>/dev/null || echo "${ARCHIVE_SIZE} bytes")
-log_info "Archive verified: $ARCHIVE_SIZE_HUMAN"
+log_info "Archive created: $ARCHIVE_SIZE_HUMAN"
+
+# CRITICAL: Verify archive actually contains files before deletion
+log_info "Verifying archive contents..."
+
+# Count files in archive (lines starting with [ in dar -l output)
+ARCHIVED_COUNT=$(dar -l "$ARCHIVE_FILE" 2>&1 | grep -c "^\[" || echo "0")
+
+if [[ $ARCHIVED_COUNT -eq 0 ]]; then
+  fail "Archive verification FAILED: 0 files archived (dar may have excluded everything). Refusing to delete source files. Archive: $ARCHIVE_FILE"
+fi
+
+log_info "Archive contains $ARCHIVED_COUNT file(s)"
+
+# For physical disks, verify critical files are present
+if [[ "$MEDIUM_TYPE" == "physical" ]]; then
+  # Check for .img or .raw file in archive
+  if ! dar -l "$ARCHIVE_FILE" 2>&1 | grep -q -E "${MEDIUM_HASH}\.(img|raw)"; then
+    fail "Archive verification FAILED: disk image file (.img or .raw) not found in archive. Refusing to delete source files."
+  fi
+  log_info "Verified: disk image file present in archive"
+fi
+
+# Minimum size check: archive should be at least some reasonable fraction of source
+# (accounting for compression, but catching completely empty archives)
+if [[ "$MEDIUM_TYPE" == "physical" ]]; then
+  # Calculate total size of source files
+  SOURCE_SIZE=$(find "$SOURCE_DIR" -name "${MEDIUM_HASH}*" -type f -exec stat -c%s {} + 2>/dev/null | awk '{sum+=$1} END {print sum}')
+  if [[ -z "$SOURCE_SIZE" ]] || [[ $SOURCE_SIZE -eq 0 ]]; then
+    log_warn "Could not calculate source size, skipping size verification"
+  else
+    # Archive should be at least 5% of source (very conservative for compression)
+    MIN_SIZE=$((SOURCE_SIZE / 20))
+    if [[ $ARCHIVE_SIZE -lt $MIN_SIZE ]]; then
+      SOURCE_SIZE_HUMAN=$(echo "$SOURCE_SIZE" | numfmt --to=iec-i --suffix=B 2>/dev/null || echo "${SOURCE_SIZE} bytes")
+      MIN_SIZE_HUMAN=$(echo "$MIN_SIZE" | numfmt --to=iec-i --suffix=B 2>/dev/null || echo "${MIN_SIZE} bytes")
+      fail "Archive verification FAILED: archive too small (${ARCHIVE_SIZE_HUMAN} < ${MIN_SIZE_HUMAN}, source=${SOURCE_SIZE_HUMAN}). Refusing to delete source files."
+    fi
+    log_info "Size check passed: archive size reasonable compared to source"
+  fi
+fi
+
+log_info "✓ Archive verification passed: $ARCHIVED_COUNT files, size checks OK"
 
 # Remove source files/directories
 case "$MEDIUM_TYPE" in
