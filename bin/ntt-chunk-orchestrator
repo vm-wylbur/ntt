@@ -74,6 +74,36 @@ def chunk_file_worker(blobid: str, path: str, file_size: int, large_file_thresho
         return None, f"Error chunking {blobid}: {e}", []
 
 
+def chunk_batch_worker(batch_items):
+    """
+    Process multiple small files in one worker call.
+    Reduces overhead for tiny files by amortizing process pool serialization costs.
+
+    Args:
+        batch_items: List of (blobid, path, size) tuples
+
+    Returns:
+        List of (blobid, chunks, error) tuples
+    """
+    results = []
+    for blobid, path, size in batch_items:
+        try:
+            if not os.path.exists(path):
+                results.append((blobid, None, f"File not found: {path}"))
+                continue
+
+            chunks = []
+            for off, sz, chash in fastcdc(path):
+                chunks.append((blobid, bytes(chash), off, sz))
+
+            results.append((blobid, chunks, None))
+
+        except Exception as e:
+            results.append((blobid, None, f"Error chunking {blobid}: {e}"))
+
+    return results
+
+
 async def process_one(executor, loop, pool, blobid, path, size, sem, stats, stats_lock):
     """Process one file with concurrency limiting."""
     async with sem:  # Only MAX_CONCURRENT in flight
@@ -104,6 +134,47 @@ async def process_one(executor, loop, pool, blobid, path, size, sem, stats, stat
             stats['bytes_processed'] += size
 
         return blobid, len(chunks) if chunks else 0
+
+
+async def process_batch(executor, loop, pool, batch, sem, stats, stats_lock):
+    """Process a batch of small files with concurrency limiting."""
+    async with sem:
+        # Prepare batch data
+        batch_items = [(b['blobid'], blobid_to_path(b['blobid']), b['size']) for b in batch]
+
+        # Process batch in worker
+        results = await loop.run_in_executor(executor, chunk_batch_worker, batch_items)
+
+        # Insert all chunks to database in one transaction
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                for blobid, chunks, error in results:
+                    if error:
+                        logger.warning(error)
+                        async with stats_lock:
+                            stats['errors'] += 1
+                    elif chunks:
+                        # Insert chunks
+                        await conn.executemany(
+                            "INSERT INTO file_chunks (blobid, chunk_hash, chunk_offset, chunk_size) "
+                            "VALUES ($1, $2, $3, $4)",
+                            chunks
+                        )
+                        # Mark complete
+                        await conn.execute(
+                            "UPDATE blobs SET chunked_complete = true WHERE blobid = $1",
+                            blobid
+                        )
+                        async with stats_lock:
+                            stats['chunks_inserted'] += len(chunks)
+
+                    # Update stats
+                    file_size = next(b['size'] for b in batch if b['blobid'] == blobid)
+                    async with stats_lock:
+                        stats['processed'] += 1
+                        stats['bytes_processed'] += file_size
+
+        return len(batch)
 
 
 async def main():
@@ -299,21 +370,46 @@ async def main():
     log_task = asyncio.create_task(log_progress())
 
     try:
-        # Queue all tasks - semaphore controls concurrency
-        tasks = []
-        for blob in blobs:
-            blobid = blob['blobid']
-            size = blob['size']
-            path = blobid_to_path(blobid)
+        # Partition into small and large files
+        SMALL_FILE_THRESHOLD = 32 * 1024  # 32KB
+        BATCH_SIZE = 50  # Files per batch
 
+        small_files = []
+        large_files = []
+
+        for blob in blobs:
+            path = blobid_to_path(blob['blobid'])
             # Quick existence check
             if not os.path.exists(path):
                 async with stats_lock:
                     stats['processed'] += 1
-                    stats['bytes_processed'] += size
+                    stats['bytes_processed'] += blob['size']
                 continue
 
-            tasks.append(process_one(executor, loop, pool, blobid, path, size, sem, stats, stats_lock))
+            if blob['size'] <= SMALL_FILE_THRESHOLD:
+                small_files.append(blob)
+            else:
+                large_files.append(blob)
+
+        logger.info(f"Large files (>{SMALL_FILE_THRESHOLD:,}B): {len(large_files):,} ({sum(b['size'] for b in large_files):,} bytes)")
+        logger.info(f"Small files (<={SMALL_FILE_THRESHOLD:,}B): {len(small_files):,} ({sum(b['size'] for b in small_files):,} bytes)")
+
+        # Queue all tasks
+        tasks = []
+
+        # Large files - process individually
+        for blob in large_files:
+            tasks.append(process_one(executor, loop, pool, blob['blobid'],
+                                    blobid_to_path(blob['blobid']),
+                                    blob['size'], sem, stats, stats_lock))
+
+        # Small files - process in batches
+        small_batches = [small_files[i:i+BATCH_SIZE]
+                        for i in range(0, len(small_files), BATCH_SIZE)]
+        logger.info(f"Small file batches: {len(small_batches):,} ({BATCH_SIZE} files/batch)")
+
+        for batch in small_batches:
+            tasks.append(process_batch(executor, loop, pool, batch, sem, stats, stats_lock))
 
         # Process all concurrently (semaphore limits to max_concurrent in-flight)
         results = await asyncio.gather(*tasks, return_exceptions=True)
