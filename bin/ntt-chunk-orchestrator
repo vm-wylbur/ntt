@@ -1,0 +1,386 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# dependencies = [
+#   "asyncpg",
+#   "blake3",
+#   "fastcdc",
+# ]
+# ///
+"""
+Author: PB and Claude
+Date: 2025-11-20
+License: (c) HRDAG, 2025, GPL-2 or newer
+
+NTT Chunk Orchestrator - FastCDC chunking for blob deduplication analysis
+"""
+
+import asyncio
+import asyncpg
+import os
+import sys
+import argparse
+from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
+from datetime import datetime
+import logging
+import cProfile
+import pstats
+from io import StringIO
+
+# Import from same directory
+sys.path.insert(0, str(Path(__file__).parent))
+from chunk_file import fastcdc
+
+# Logging setup
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+
+def blobid_to_path(blobid: str) -> str:
+    """Convert blobid to filesystem path in by-hash storage."""
+    return f"/data/fast/ntt/by-hash/{blobid[:2]}/{blobid[2:4]}/{blobid}"
+
+
+def chunk_file_worker(blobid: str, path: str, file_size: int, large_file_threshold: int = 100 * 1024 * 1024):
+    """
+    Worker function - runs in separate process.
+    Returns list of (blobid, chunk_hash, chunk_offset, chunk_size) tuples.
+    For large files (>100MB), yields progress updates.
+    """
+    try:
+        if not os.path.exists(path):
+            return None, f"File not found: {path}", []
+
+        is_large = file_size > large_file_threshold
+        chunks = []
+        bytes_chunked = 0
+
+        for off, sz, chash in fastcdc(path):
+            chunks.append((blobid, bytes(chash), off, sz))
+            bytes_chunked += sz
+
+            # For large files, log progress every 1GB chunked
+            if is_large and bytes_chunked % (1024**3) < sz:
+                # This chunk crossed a 1GB boundary
+                pct = (bytes_chunked / file_size) * 100
+                logger.info(f"  Large file progress: {bytes_chunked / 1024**3:.1f} GB / {file_size / 1024**3:.1f} GB ({pct:.0f}%) - {len(chunks)} chunks")
+
+        return chunks, None, []
+    except Exception as e:
+        return None, f"Error chunking {blobid}: {e}", []
+
+
+async def process_one(executor, loop, pool, blobid, path, size, sem, stats, stats_lock):
+    """Process one file with concurrency limiting."""
+    async with sem:  # Only MAX_CONCURRENT in flight
+        chunks, error, _ = await loop.run_in_executor(executor, chunk_file_worker, blobid, path, size)
+
+        if error:
+            logger.warning(error)
+            async with stats_lock:
+                stats['errors'] += 1
+        elif chunks:
+            # Insert chunks to database and mark as complete
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    await conn.executemany(
+                        "INSERT INTO file_chunks (blobid, chunk_hash, chunk_offset, chunk_size) "
+                        "VALUES ($1, $2, $3, $4)",
+                        chunks
+                    )
+                    await conn.execute(
+                        "UPDATE blobs SET chunked_complete = true WHERE blobid = $1",
+                        blobid
+                    )
+            async with stats_lock:
+                stats['chunks_inserted'] += len(chunks)
+
+        async with stats_lock:
+            stats['processed'] += 1
+            stats['bytes_processed'] += size
+
+        return blobid, len(chunks) if chunks else 0
+
+
+async def main():
+    """Main orchestrator loop."""
+
+    # Parse arguments
+    parser = argparse.ArgumentParser(
+        description="NTT Chunk Orchestrator - FastCDC chunking for blob deduplication analysis"
+    )
+    parser.add_argument(
+        '--limit',
+        type=int,
+        default=None,
+        help='Process only N blobs (for testing)'
+    )
+    parser.add_argument(
+        '--max-concurrent',
+        type=int,
+        default=100,
+        help='Maximum files to process concurrently (default: 100)'
+    )
+    parser.add_argument(
+        '--profile',
+        action='store_true',
+        help='Enable cProfile profiling and save to /tmp/chunker.prof'
+    )
+    args = parser.parse_args()
+
+    # Database connection
+    db_url = os.environ.get('NTT_DB_URL', 'postgresql://localhost/copyjob')
+    logger.info(f"Connecting to database: {db_url}")
+
+    pool = await asyncpg.create_pool(dsn=db_url, min_size=2, max_size=10)
+
+    # Get unchunked blobs (exclude archives/compression - we don't need chunks for those)
+    logger.info("Fetching unchunked blobs...")
+    limit_clause = f"LIMIT {args.limit}" if args.limit else ""
+
+    # Archive/compression MIME types to exclude (from ntt_extractor_handlers.py)
+    archive_mimes = [
+        'application/gzip', 'application/x-gzip',
+        'application/x-bzip2', 'application/x-bzip',
+        'application/x-xz', 'application/x-lzma',
+        'application/x-compress', 'application/x-lzip',
+        'application/x-tar',
+        'application/zip',
+        'application/x-archive',
+        'application/vnd.rar',
+        'application/vnd.ms-cab-compressed',
+        'application/x-7z-compressed',
+    ]
+
+    async with pool.acquire() as conn:
+        if args.limit:
+            # Get any N blobs, then sort by size descending
+            blobs = await conn.fetch(f"""
+                SELECT b.blobid, b.size
+                FROM blobs b
+                WHERE b.size > 0
+                  AND (b.chunked_complete IS NULL OR b.chunked_complete = false)
+                  AND (b.mime_type IS NULL OR b.mime_type NOT IN ({','.join(f"'{m}'" for m in archive_mimes)}))
+                LIMIT {args.limit}
+            """)
+            # Sort in Python by size descending
+            blobs = sorted(blobs, key=lambda b: b['size'], reverse=True)
+        else:
+            # No limit - just order by size descending
+            blobs = await conn.fetch(f"""
+                SELECT b.blobid, b.size
+                FROM blobs b
+                WHERE b.size > 0
+                  AND (b.chunked_complete IS NULL OR b.chunked_complete = false)
+                  AND (b.mime_type IS NULL OR b.mime_type NOT IN ({','.join(f"'{m}'" for m in archive_mimes)}))
+                ORDER BY b.size DESC
+            """)
+
+    total_blobs = len(blobs)
+    total_bytes = sum(b['size'] for b in blobs)
+    logger.info(f"Found {total_blobs:,} unchunked blobs ({total_bytes:,} bytes)")
+    logger.info(f"Max concurrent: {args.max_concurrent}")
+
+    if total_blobs == 0:
+        logger.info("No unchunked blobs found. Exiting.")
+        await pool.close()
+        return
+
+    # Setup process pool for CPU-bound chunking
+    max_workers = 32
+    logger.info(f"Starting ProcessPoolExecutor with {max_workers} workers")
+
+    # Set nice value to be gentle on system
+    try:
+        os.nice(10)
+        logger.info("Set process nice value to 10")
+    except PermissionError:
+        logger.warning("Could not set nice value (permission denied)")
+
+    executor = ProcessPoolExecutor(max_workers=max_workers)
+    loop = asyncio.get_event_loop()
+
+    # Semaphore controls concurrency
+    sem = asyncio.Semaphore(args.max_concurrent)
+
+    # Shared stats with lock for thread-safety
+    stats = {
+        'processed': 0,
+        'chunks_inserted': 0,
+        'errors': 0,
+        'bytes_processed': 0,
+        'last_bytes': 0
+    }
+    stats_lock = asyncio.Lock()
+
+    start_time = datetime.now()
+    last_log_time = start_time
+    last_log_processed = 0
+    last_log_chunks = 0
+    last_log_bytes = 0
+    ema_files_rate = None
+    ema_chunks_rate = None
+
+    # Progress logging task
+    async def log_progress():
+        nonlocal last_log_time, last_log_processed, last_log_chunks, last_log_bytes, ema_files_rate, ema_chunks_rate
+
+        while True:
+            await asyncio.sleep(5)  # Check every 5 seconds
+
+            async with stats_lock:
+                current_processed = stats['processed']
+                current_chunks = stats['chunks_inserted']
+                current_errors = stats['errors']
+                current_bytes = stats['bytes_processed']
+
+            # Log every 10k chunks OR every 1 minute OR every 1GB processed
+            now = datetime.now()
+            time_since_last = (now - last_log_time).total_seconds()
+            chunks_since_last = current_chunks - last_log_chunks
+            bytes_since_last = current_bytes - last_log_bytes
+
+            if chunks_since_last >= 10000 or time_since_last >= 60 or bytes_since_last >= 1024**3:
+                now = datetime.now()
+                interval_sec = (now - last_log_time).total_seconds()
+                interval_files = current_processed - last_log_processed
+                interval_chunks = current_chunks - last_log_chunks
+                interval_bytes = current_bytes - last_log_bytes
+
+                current_files_rate = interval_files / interval_sec if interval_sec > 0 else 0
+                current_chunks_rate = interval_chunks / interval_sec if interval_sec > 0 else 0
+
+                if ema_files_rate is None:
+                    ema_files_rate = current_files_rate
+                    ema_chunks_rate = current_chunks_rate
+                else:
+                    ema_files_rate = 0.3 * current_files_rate + 0.7 * ema_files_rate
+                    ema_chunks_rate = 0.3 * current_chunks_rate + 0.7 * ema_chunks_rate
+
+                bytes_remaining = total_bytes - current_bytes
+
+                # Format bytes remaining
+                if bytes_remaining >= 1024**3:  # GB
+                    bytes_str = f"{bytes_remaining / 1024**3:.1f} GB"
+                elif bytes_remaining >= 1024**2:  # MB
+                    bytes_str = f"{bytes_remaining / 1024**2:.0f} MB"
+                elif bytes_remaining >= 1024:  # KB
+                    bytes_str = f"{bytes_remaining / 1024:.0f} KB"
+                else:
+                    bytes_str = f"{bytes_remaining} B"
+
+                # Calculate bytes/sec rate for ETA
+                bytes_per_sec = interval_bytes / interval_sec if interval_sec > 0 else 0
+                mb_per_sec = bytes_per_sec / (1024 * 1024)
+
+                eta_sec = bytes_remaining / bytes_per_sec if bytes_per_sec > 0 else 0
+                eta_min = eta_sec / 60
+
+                logger.info(
+                    f"{current_processed:,}/{total_blobs:,} | "
+                    f"{bytes_str} remaining | "
+                    f"{int(ema_files_rate)} f/s | "
+                    f"{int(ema_chunks_rate)} c/s | "
+                    f"{mb_per_sec:.1f} MB/s | "
+                    f"{current_errors} err | "
+                    f"ETA {eta_min:.1f}m"
+                )
+
+                last_log_time = now
+                last_log_processed = current_processed
+                last_log_chunks = current_chunks
+                last_log_bytes = current_bytes
+
+    # Start progress logging in background
+    log_task = asyncio.create_task(log_progress())
+
+    try:
+        # Queue all tasks - semaphore controls concurrency
+        tasks = []
+        for blob in blobs:
+            blobid = blob['blobid']
+            size = blob['size']
+            path = blobid_to_path(blobid)
+
+            # Quick existence check
+            if not os.path.exists(path):
+                async with stats_lock:
+                    stats['processed'] += 1
+                    stats['bytes_processed'] += size
+                continue
+
+            tasks.append(process_one(executor, loop, pool, blobid, path, size, sem, stats, stats_lock))
+
+        # Process all concurrently (semaphore limits to max_concurrent in-flight)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Check for exceptions
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                logger.error(f"Task failed: {result}")
+
+    finally:
+        log_task.cancel()
+        try:
+            await log_task
+        except asyncio.CancelledError:
+            pass
+
+        executor.shutdown(wait=True)
+        await pool.close()
+
+    # Final summary
+    elapsed = (datetime.now() - start_time).total_seconds()
+    mb_per_sec = (stats['bytes_processed'] / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+
+    logger.info("=" * 80)
+    logger.info("CHUNKING COMPLETE")
+    logger.info(f"Processed: {stats['processed']:,} blobs")
+    logger.info(f"Chunks inserted: {stats['chunks_inserted']:,}")
+    logger.info(f"Errors: {stats['errors']:,}")
+    logger.info(f"Total time: {elapsed:.1f} seconds ({elapsed/60:.1f} minutes)")
+    logger.info(f"Rate: {stats['processed']/elapsed:.1f} blobs/sec")
+    logger.info(f"Throughput: {mb_per_sec:.1f} MB/s")
+    logger.info("=" * 80)
+
+
+if __name__ == "__main__":
+    try:
+        # Check if profiling is enabled by parsing args early
+        import argparse
+        parser = argparse.ArgumentParser(add_help=False)
+        parser.add_argument('--profile', action='store_true')
+        early_args, _ = parser.parse_known_args()
+
+        if early_args.profile:
+            logger.info("Profiling enabled - will save to /tmp/chunker.prof")
+            profiler = cProfile.Profile()
+            profiler.enable()
+
+            try:
+                asyncio.run(main())
+            finally:
+                profiler.disable()
+
+                # Save profile data
+                profiler.dump_stats('/tmp/chunker.prof')
+                logger.info("Profile saved to /tmp/chunker.prof")
+
+                # Print summary
+                s = StringIO()
+                ps = pstats.Stats(profiler, stream=s).sort_stats('cumulative')
+                ps.print_stats(30)  # Top 30 functions
+                logger.info(f"\n{s.getvalue()}")
+        else:
+            asyncio.run(main())
+
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"Fatal error: {e}", exc_info=True)
+        sys.exit(1)

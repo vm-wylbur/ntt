@@ -1,0 +1,137 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# dependencies = [
+#   "asyncpg",
+#   "blake3",
+# ]
+# ///
+"""
+Author: PB and Claude
+Date: 2025-11-20
+License: (c) HRDAG, 2025, GPL-2 or newer
+
+Verify that new buffered FastCDC produces identical chunks to old implementation
+"""
+
+import asyncio
+import asyncpg
+import os
+import sys
+from pathlib import Path
+
+# Import from same directory
+sys.path.insert(0, str(Path(__file__).parent))
+from chunk_file import fastcdc
+
+
+def blobid_to_path(blobid: str) -> str:
+    """Convert blobid to filesystem path in by-hash storage."""
+    return f"/data/fast/ntt/by-hash/{blobid[:2]}/{blobid[2:4]}/{blobid}"
+
+
+async def main():
+    """Verify chunking consistency."""
+
+    # Database connection
+    db_url = os.environ.get('NTT_DB_URL', 'postgresql://localhost/copyjob')
+    print(f"Connecting to database: {db_url}")
+
+    conn = await asyncpg.connect(dsn=db_url)
+
+    # Get 10 random blobs that have been chunked
+    print("\nSelecting 10 random previously-chunked blobs for verification...")
+    blobs = await conn.fetch("""
+        SELECT b.blobid, b.size
+        FROM blobs b
+        WHERE b.chunked_complete = true
+        ORDER BY random()
+        LIMIT 10
+    """)
+
+    if not blobs:
+        print("ERROR: No chunked blobs found in database!")
+        await conn.close()
+        return 1
+
+    print(f"Found {len(blobs)} blobs to verify\n")
+
+    all_passed = True
+
+    for i, blob in enumerate(blobs, 1):
+        blobid = blob['blobid']
+        size = blob['size']
+        path = blobid_to_path(blobid)
+
+        print(f"[{i}/10] Verifying {blobid[:16]}... ({size:,} bytes)")
+
+        # Check file exists
+        if not os.path.exists(path):
+            print(f"  ❌ SKIP: File not found: {path}")
+            continue
+
+        # Get existing chunks from database
+        db_chunks = await conn.fetch("""
+            SELECT chunk_hash, chunk_offset, chunk_size
+            FROM file_chunks
+            WHERE blobid = $1
+            ORDER BY chunk_offset
+        """, blobid)
+
+        # Re-chunk the file with new implementation
+        new_chunks = list(fastcdc(path))
+
+        # Compare counts
+        if len(db_chunks) != len(new_chunks):
+            print(f"  ❌ FAIL: Chunk count mismatch!")
+            print(f"     Database: {len(db_chunks)} chunks")
+            print(f"     New code: {len(new_chunks)} chunks")
+            all_passed = False
+            continue
+
+        # Compare each chunk
+        mismatches = []
+        for j, (db_chunk, new_chunk) in enumerate(zip(db_chunks, new_chunks)):
+            new_offset, new_size, new_hash = new_chunk
+
+            if db_chunk['chunk_offset'] != new_offset:
+                mismatches.append(f"Chunk {j}: offset {db_chunk['chunk_offset']} != {new_offset}")
+            if db_chunk['chunk_size'] != new_size:
+                mismatches.append(f"Chunk {j}: size {db_chunk['chunk_size']} != {new_size}")
+            if bytes(db_chunk['chunk_hash']) != new_hash:
+                mismatches.append(f"Chunk {j}: hash mismatch")
+
+        if mismatches:
+            print(f"  ❌ FAIL: {len(mismatches)} chunk mismatches:")
+            for mismatch in mismatches[:5]:  # Show first 5
+                print(f"     - {mismatch}")
+            if len(mismatches) > 5:
+                print(f"     ... and {len(mismatches) - 5} more")
+            all_passed = False
+        else:
+            print(f"  ✅ PASS: All {len(db_chunks)} chunks match perfectly")
+
+    await conn.close()
+
+    print("\n" + "=" * 80)
+    if all_passed:
+        print("✅ VERIFICATION PASSED: All chunks match!")
+        print("New buffered implementation produces identical results.")
+        return 0
+    else:
+        print("❌ VERIFICATION FAILED: Some chunks don't match!")
+        print("DO NOT USE the new implementation - there's a bug!")
+        return 1
+
+
+if __name__ == "__main__":
+    try:
+        exit_code = asyncio.run(main())
+        sys.exit(exit_code)
+    except KeyboardInterrupt:
+        print("\nInterrupted by user")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Fatal error: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
