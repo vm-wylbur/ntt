@@ -74,6 +74,14 @@ fi
 
 log_info "Starting USB backup job"
 
+# USB-SPECIFIC: Attempt to clear any suspended I/O state before validation
+# This recovers from transient USB disconnects/reconnects without failing
+if zpool list "$EXPECTED_POOL" &>/dev/null; then
+    if ! zpool clear "$EXPECTED_POOL" 2>/dev/null; then
+        log_warn "zpool clear failed (pool may not need clearing)"
+    fi
+fi
+
 # USB-SPECIFIC: Validate ntt-backup pool is properly mounted
 if ! validate_zfs_pool "$EXPECTED_POOL" "$BACKUP_ROOT"; then
     exit 1
