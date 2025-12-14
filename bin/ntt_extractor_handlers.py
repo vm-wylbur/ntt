@@ -9,6 +9,7 @@
 # Extraction handlers for archives and compression formats
 
 import os
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -89,8 +90,7 @@ def walk_and_hash_directory(
     Returns:
         (file_count, nested_archives) where nested_archives is [(blobid, mime_type), ...]
     """
-    inodes_batch = []
-    paths_batch = []
+    files_batch = []
     nested_archives = []
     file_count = 0
 
@@ -126,9 +126,8 @@ def walk_and_hash_directory(
             dev = 0
             ino = medium_manager.generate_synthetic_inode(medium_hash, path_str)
 
-            # Add to batches
-            inodes_batch.append((dev, ino, blobid, mime_type, size, mtime))
-            paths_batch.append((dev, ino, blobid, path_str))
+            # Add to batch: (dev, ino, path, mtime, size, blobid)
+            files_batch.append((dev, ino, path_str, mtime, size, blobid))
 
             file_count += 1
 
@@ -138,16 +137,13 @@ def walk_and_hash_directory(
                 nested_archives.append((blobid, mime_type))
 
             # Bulk insert every 1000 rows
-            if len(inodes_batch) >= 1000:
-                medium_manager.bulk_insert_inodes(medium_hash, inodes_batch)
-                medium_manager.bulk_insert_paths(medium_hash, paths_batch)
-                inodes_batch.clear()
-                paths_batch.clear()
+            if len(files_batch) >= 1000:
+                medium_manager.bulk_insert_files(medium_hash, files_batch)
+                files_batch.clear()
 
     # Insert remaining rows
-    if inodes_batch:
-        medium_manager.bulk_insert_inodes(medium_hash, inodes_batch)
-        medium_manager.bulk_insert_paths(medium_hash, paths_batch)
+    if files_batch:
+        medium_manager.bulk_insert_files(medium_hash, files_batch)
 
     return file_count, nested_archives
 
@@ -241,14 +237,10 @@ def _decompress_generic(
         dev = 0
         ino = medium_manager.generate_synthetic_inode(medium_hash, path_str)
 
-        # Insert inode and path
-        medium_manager.bulk_insert_inodes(
+        # Insert file record: (dev, ino, path, mtime, size, blobid)
+        medium_manager.bulk_insert_files(
             medium_hash,
-            [(dev, ino, decompressed_blobid, mime_type, size, mtime)]
-        )
-        medium_manager.bulk_insert_paths(
-            medium_hash,
-            [(dev, ino, decompressed_blobid, path_str)]
+            [(dev, ino, path_str, mtime, size, decompressed_blobid)]
         )
 
         # Check if decompressed file is a nested archive
@@ -264,14 +256,161 @@ def _decompress_generic(
         )
 
 
+def _decompress_with_gzrecover(db: psycopg.Connection, blobid: str) -> ExtractionResult:
+    """Recover data from corrupt gzip using gzrecover."""
+    logger.info(f"Attempting gzrecover for {blobid[:8]}...")
+    medium_manager = ExtractionMediumManager(db)
+
+    source_path = get_byhash_path(blobid)
+
+    with tempfile.TemporaryDirectory(dir=EXTRACTION_TEMP_DIR) as tmpdir:
+        tmpdir_path = Path(tmpdir)
+        output_file = tmpdir_path / "recovered"
+
+        # gzrecover writes to output file
+        result = subprocess.run(
+            ['gzrecover', '-o', str(output_file), str(source_path)],
+            capture_output=True,
+            timeout=300  # 5 minute timeout for large files
+        )
+
+        # gzrecover may return non-zero but still produce output
+        if not output_file.exists() or output_file.stat().st_size == 0:
+            raise ValueError(f"gzrecover produced no output for {blobid[:8]}")
+
+        logger.info(f"gzrecover extracted {output_file.stat().st_size} bytes")
+
+        # Hash and detect MIME
+        recovered_blobid, mime_type = hash_file_and_detect_mime(output_file)
+
+        # Copy to by-hash
+        copy_to_byhash(output_file, recovered_blobid)
+
+        # Create extracted medium
+        medium_hash = medium_manager.create_extracted_medium(
+            source_blobid=blobid,
+            extraction_method='gzip-recovered'
+        )
+
+        # Get file info
+        stat_info = output_file.stat()
+        size = stat_info.st_size
+        mtime = int(stat_info.st_mtime)
+
+        path_str = "/recovered"
+        dev = 0
+        ino = medium_manager.generate_synthetic_inode(medium_hash, path_str)
+
+        medium_manager.bulk_insert_files(
+            medium_hash,
+            [(dev, ino, path_str, mtime, size, recovered_blobid)]
+        )
+
+        # Check for nested archive
+        nested = []
+        if mime_type in MIME_HANDLERS:
+            nested.append((recovered_blobid, mime_type))
+
+        return ExtractionResult(
+            medium_hash=medium_hash,
+            files_extracted=1,
+            nested_archives=nested
+        )
+
+
 def decompress_gzip(db: psycopg.Connection, blobid: str) -> ExtractionResult:
-    """Decompress gzip file."""
-    return _decompress_generic(db, blobid, ['gzip', '-dc'], 'gzip')
+    """Decompress gzip file, with recovery fallback for corrupt files."""
+    try:
+        return _decompress_generic(db, blobid, ['gzip', '-dc'], 'gzip')
+    except subprocess.CalledProcessError as e:
+        logger.warning(f"Standard gzip failed for {blobid[:8]}..., trying gzrecover")
+        return _decompress_with_gzrecover(db, blobid)
+
+
+def _decompress_with_bzip2recover(db: psycopg.Connection, blobid: str) -> ExtractionResult:
+    """Recover data from corrupt bzip2 using bzip2recover."""
+    logger.info(f"Attempting bzip2recover for {blobid[:8]}...")
+    medium_manager = ExtractionMediumManager(db)
+
+    source_path = get_byhash_path(blobid)
+
+    with tempfile.TemporaryDirectory(dir=EXTRACTION_TEMP_DIR) as tmpdir:
+        tmpdir_path = Path(tmpdir)
+
+        # Copy source to tmpdir (bzip2recover creates files in same dir)
+        tmp_source = tmpdir_path / "source.bz2"
+        shutil.copy2(source_path, tmp_source)
+
+        # bzip2recover creates rec00001source.bz2, rec00002source.bz2, etc.
+        subprocess.run(
+            ['bzip2recover', str(tmp_source)],
+            cwd=tmpdir_path,
+            capture_output=True
+        )
+
+        # Find recovered block files
+        recovered_blocks = sorted(tmpdir_path.glob('rec*source.bz2'))
+        if not recovered_blocks:
+            raise ValueError(f"bzip2recover produced no blocks for {blobid[:8]}")
+
+        # Decompress each block and concatenate
+        output_file = tmpdir_path / "recovered"
+        with open(output_file, 'wb') as out:
+            for block in recovered_blocks:
+                try:
+                    result = subprocess.run(
+                        ['bzip2', '-dc', str(block)],
+                        stdout=out,
+                        stderr=subprocess.PIPE
+                    )
+                except:
+                    continue  # Skip unrecoverable blocks
+
+        if output_file.stat().st_size == 0:
+            raise ValueError(f"bzip2recover produced no usable data for {blobid[:8]}")
+
+        logger.info(f"bzip2recover extracted {output_file.stat().st_size} bytes from {len(recovered_blocks)} blocks")
+
+        # Hash and detect MIME
+        recovered_blobid, mime_type = hash_file_and_detect_mime(output_file)
+
+        # Copy to by-hash
+        copy_to_byhash(output_file, recovered_blobid)
+
+        # Create extracted medium
+        medium_hash = medium_manager.create_extracted_medium(
+            source_blobid=blobid,
+            extraction_method='bzip2-recovered'
+        )
+
+        stat_info = output_file.stat()
+        path_str = "/recovered"
+        dev = 0
+        ino = medium_manager.generate_synthetic_inode(medium_hash, path_str)
+
+        medium_manager.bulk_insert_files(
+            medium_hash,
+            [(dev, ino, path_str, int(stat_info.st_mtime), stat_info.st_size, recovered_blobid)]
+        )
+
+        nested = []
+        if mime_type in MIME_HANDLERS:
+            nested.append((recovered_blobid, mime_type))
+
+        return ExtractionResult(
+            medium_hash=medium_hash,
+            files_extracted=1,
+            nested_archives=nested
+        )
 
 
 def decompress_bzip2(db: psycopg.Connection, blobid: str) -> ExtractionResult:
-    """Decompress bzip2 file."""
-    return _decompress_generic(db, blobid, ['bzip2', '-dc'], 'bzip2')
+    """Decompress bzip2 file, with recovery fallback for corrupt files."""
+    try:
+        return _decompress_generic(db, blobid, ['bzip2', '-dc'], 'bzip2')
+    except subprocess.CalledProcessError:
+        logger.warning(f"Standard bzip2 failed for {blobid[:8]}..., trying bzip2recover")
+        return _decompress_with_bzip2recover(db, blobid)
 
 
 def decompress_xz(db: psycopg.Connection, blobid: str) -> ExtractionResult:
@@ -332,8 +471,69 @@ def extract_tar(db: psycopg.Connection, blobid: str) -> ExtractionResult:
         )
 
 
+def _extract_zip_with_recovery(db: psycopg.Connection, blobid: str) -> ExtractionResult:
+    """Recover data from corrupt zip using zip -FF."""
+    logger.info(f"Attempting zip -FF recovery for {blobid[:8]}...")
+    medium_manager = ExtractionMediumManager(db)
+
+    source_path = get_byhash_path(blobid)
+
+    with tempfile.TemporaryDirectory(dir=EXTRACTION_TEMP_DIR) as tmpdir:
+        tmpdir_path = Path(tmpdir)
+        fixed_zip = tmpdir_path / "fixed.zip"
+        extract_dir = tmpdir_path / "extracted"
+        extract_dir.mkdir()
+
+        # Try to fix the zip file
+        # zip -FF needs input from stdin to confirm (use yes)
+        # Timeout after 60 seconds - if it takes longer, file is probably too corrupt
+        fix_result = subprocess.run(
+            f"yes | zip -FF {source_path} --out {fixed_zip}",
+            shell=True,
+            capture_output=True,
+            cwd=tmpdir_path,
+            timeout=60
+        )
+
+        if not fixed_zip.exists():
+            raise ValueError(f"zip -FF failed to create fixed archive for {blobid[:8]}")
+
+        # Extract the fixed zip
+        result = subprocess.run(
+            ['7z', 'x', '-y', f'-o{extract_dir}', str(fixed_zip)],
+            capture_output=True
+        )
+
+        extracted_files = list(extract_dir.rglob('*'))
+        if not extracted_files:
+            raise ValueError(f"zip recovery produced no files for {blobid[:8]}")
+
+        logger.info(f"zip -FF recovered {len(extracted_files)} items")
+
+        medium_hash = medium_manager.create_extracted_medium(
+            source_blobid=blobid,
+            extraction_method='zip-recovered'
+        )
+
+        file_count, nested = walk_and_hash_directory(
+            extract_dir,
+            medium_manager,
+            medium_hash
+        )
+
+        return ExtractionResult(
+            medium_hash=medium_hash,
+            files_extracted=file_count,
+            nested_archives=nested
+        )
+
+
 def extract_zip(db: psycopg.Connection, blobid: str) -> ExtractionResult:
-    """Extract zip archive."""
+    """Extract zip archive using 7z, with recovery fallback.
+
+    Uses 7z instead of unzip for better ZIP64 support (files >4GB).
+    Falls back to zip -FF for corrupt archives.
+    """
     medium_manager = ExtractionMediumManager(db)
 
     source_path = get_byhash_path(blobid)
@@ -343,12 +543,22 @@ def extract_zip(db: psycopg.Connection, blobid: str) -> ExtractionResult:
         extract_dir = Path(tmpdir) / "extracted"
         extract_dir.mkdir()
 
-        # Extract zip
-        subprocess.run(
-            ['unzip', '-q', str(source_path), '-d', str(extract_dir)],
-            check=True,
-            stderr=subprocess.PIPE
+        # Use 7z for extraction (handles ZIP64 better than unzip)
+        result = subprocess.run(
+            ['7z', 'x', '-y', f'-o{extract_dir}', str(source_path)],
+            capture_output=True
         )
+        extracted_files = list(extract_dir.rglob('*'))
+        if not extracted_files:
+            # Try recovery before giving up
+            logger.warning(f"7z produced no files for {blobid[:8]}..., trying zip -FF recovery")
+            return _extract_zip_with_recovery(db, blobid)
+
+        if result.returncode != 0:
+            logger.warning(
+                f"7z returned {result.returncode} but extracted "
+                f"{len(extracted_files)} items"
+            )
 
         medium_hash = medium_manager.create_extracted_medium(
             source_blobid=blobid,
@@ -406,7 +616,11 @@ def extract_ar(db: psycopg.Connection, blobid: str) -> ExtractionResult:
 
 
 def extract_rar(db: psycopg.Connection, blobid: str) -> ExtractionResult:
-    """Extract rar archive."""
+    """Extract rar archive.
+
+    TODO: Could consolidate to use 7z instead of unrar for consistency.
+    7z handles RAR well and reduces tool dependencies.
+    """
     medium_manager = ExtractionMediumManager(db)
 
     source_path = get_byhash_path(blobid)
@@ -442,7 +656,11 @@ def extract_rar(db: psycopg.Connection, blobid: str) -> ExtractionResult:
 
 
 def extract_cab(db: psycopg.Connection, blobid: str) -> ExtractionResult:
-    """Extract cab archive."""
+    """Extract cab archive.
+
+    TODO: Could consolidate to use 7z instead of cabextract for consistency.
+    7z handles CAB well and reduces tool dependencies.
+    """
     medium_manager = ExtractionMediumManager(db)
 
     source_path = get_byhash_path(blobid)

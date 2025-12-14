@@ -61,11 +61,6 @@ class ExtractionMediumManager:
 
         now = datetime.now(timezone.utc)
 
-        # CRITICAL: Create partitions BEFORE inserting into medium table
-        # This prevents deadlock in multi-worker scenarios by ensuring
-        # all workers acquire locks in same order (inode first, then medium)
-        self._create_partitions(medium_hash)
-
         # Insert extracted medium record
         cursor.execute("""
             INSERT INTO medium (
@@ -98,24 +93,6 @@ class ExtractionMediumManager:
 
         return medium_hash
 
-    def _create_partitions(self, medium_hash: str):
-        """Create inode and path partitions for this medium."""
-        cursor = self.db.cursor()
-
-        # Create inode partition
-        cursor.execute(f"""
-            CREATE TABLE IF NOT EXISTS inode_{medium_hash} PARTITION OF inode
-            FOR VALUES IN ('{medium_hash}')
-        """)
-
-        # Create path partition
-        cursor.execute(f"""
-            CREATE TABLE IF NOT EXISTS path_{medium_hash} PARTITION OF path
-            FOR VALUES IN ('{medium_hash}')
-        """)
-
-        logger.debug(f"Created partitions for medium {medium_hash}")
-
     def generate_synthetic_inode(self, medium_hash: str, path: str) -> int:
         """
         Generate synthetic inode number from hash(medium_hash || path).
@@ -129,81 +106,45 @@ class ExtractionMediumManager:
         inode = int.from_bytes(hash_bytes, byteorder='big', signed=True)
         return inode
 
-    def bulk_insert_inodes(
+    def bulk_insert_files(
         self,
         medium_hash: str,
-        inodes: List[Tuple]
+        files: List[Tuple]
     ) -> int:
         """
-        Bulk insert inodes using COPY for performance.
+        Bulk insert files into paths table using COPY.
+
+        Post-partition-elimination schema stores all file metadata in paths.
+        Note: mime_type is stored in blobs table, not paths.
 
         Args:
             medium_hash: Target medium
-            inodes: List of tuples: (dev, ino, blobid, mime_type, size, mtime)
+            files: List of tuples: (dev, ino, path, mtime, size, blobid)
 
         Returns:
             Number of rows inserted
         """
-        if not inodes:
-            return 0
-
-        cursor = self.db.cursor()
-
-        # Use COPY for bulk insert (much faster than INSERT)
-        buf = StringIO()
-        for dev, ino, blobid, mime_type, size, mtime in inodes:
-            # Format: medium_hash, dev, ino, blobid, mime_type, size, mtime
-            buf.write(f"{medium_hash}\t{dev}\t{ino}\t{blobid}\t{mime_type}\t{size}\t{mtime}\n")
-
-        buf.seek(0)
-
-        with cursor.copy("""
-            COPY inode (medium_hash, dev, ino, blobid, mime_type, size, mtime)
-            FROM STDIN
-        """) as copy:
-            copy.write(buf.read())
-
-        count = len(inodes)
-        logger.debug(f"Bulk inserted {count:,} inodes for {medium_hash}")
-
-        return count
-
-    def bulk_insert_paths(
-        self,
-        medium_hash: str,
-        paths: List[Tuple]
-    ) -> int:
-        """
-        Bulk insert paths using COPY for performance.
-
-        Args:
-            medium_hash: Target medium
-            paths: List of tuples: (dev, ino, blobid, path)
-
-        Returns:
-            Number of rows inserted
-        """
-        if not paths:
+        if not files:
             return 0
 
         cursor = self.db.cursor()
 
         buf = StringIO()
-        for dev, ino, blobid, path in paths:
-            # Format: medium_hash, dev, ino, path, blobid
-            # Note: broken and exclude_reason default to NULL
-            buf.write(f"{medium_hash}\t{dev}\t{ino}\t{path}\t{blobid}\n")
+        for dev, ino, path, mtime, size, blobid in files:
+            # Encode path as hex for bytea COPY format
+            path_hex = '\\x' + path.encode('utf-8').hex()
+            buf.write(f"{medium_hash}\t{dev}\t{ino}\t{path_hex}\t{mtime}\t{size}\t{blobid}\n")
 
         buf.seek(0)
 
         with cursor.copy("""
-            COPY path (medium_hash, dev, ino, path, blobid)
+            COPY paths (medium_hash, dev, ino, path, mtime, size, blobid)
             FROM STDIN
         """) as copy:
             copy.write(buf.read())
 
-        count = len(paths)
-        logger.debug(f"Bulk inserted {count:,} paths for {medium_hash}")
+        count = len(files)
+        logger.debug(f"Bulk inserted {count:,} files for {medium_hash}")
 
         return count
 
