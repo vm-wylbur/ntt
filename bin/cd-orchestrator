@@ -1,0 +1,696 @@
+#!/usr/bin/env bash
+# Author: PB & Claude
+# Date: 2025-12-08
+# License: (c) HRDAG, 2025, GPL-2 or newer
+#
+# ------
+# cd-orchestrator
+#
+# CD/DVD reading orchestrator - thin wrapper for triage + imaging
+# Delegates heavy lifting to ntt-imager, adds:
+#   - Quick blank/audio detection (skip early)
+#   - CD-specific metadata capture
+#   - Batch status reporting (--show)
+#
+
+set -euo pipefail
+
+# ---------- config ----------
+CD_ROOT="${CD_ROOT:-/data/fast/cdrom}"
+DISK_ROOT="$CD_ROOT/disks"
+EVENT_LOG="$CD_ROOT/cd-orchestrator.jsonl"
+LOG_FILE=""  # Set per-disc in main()
+
+# Default device
+DEFAULT_DEVICE="/dev/sr0"
+
+# NTT tools
+NTT_BIN="${NTT_BIN:-/home/pball/projects/ntt/bin}"
+
+# Source bash-logger
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(cd "$SCRIPT_DIR/../lib" && pwd)"
+source "$LIB_DIR/bash-logger.sh"
+
+# ---------- logging functions ----------
+log_event() {
+  local stage="$1"
+  local extra="$2"
+  jq -cn --arg ts "$(date -Iseconds)" \
+        --arg stage "$stage" \
+        --argjson extra "$extra" \
+        '$extra + {ts: $ts, stage: $stage}' \
+  >> "$EVENT_LOG"
+  chmod 644 "$EVENT_LOG" 2>/dev/null || true
+}
+
+fail() {
+  log_error "Error: $1"
+  log_event error "{\"msg\": \"$1\"}"
+  exit 1
+}
+
+# ---------- hash functions ----------
+generate_session_hash() {
+  local timestamp="$1"
+  local message="$2"
+  local sequence="${3:-}"
+  echo -n "${timestamp}|${message}|${sequence}" | b3sum | cut -d' ' -f1 | cut -c1-32
+}
+
+# ---------- disc detection functions ----------
+detect_disc_type() {
+  local dev="$1"
+  local max_retries=3
+  local retry_delay=10
+
+  # Check if device exists
+  if [[ ! -b "$dev" ]]; then
+    echo "no_device"
+    return
+  fi
+
+  # Check if media is present (with retries for slow drives)
+  local attempt=1
+  while [[ $attempt -le $max_retries ]]; do
+    if timeout 10s dd if="$dev" of=/dev/null bs=512 count=1 status=none 2>/dev/null; then
+      break  # Success - media detected
+    fi
+
+    if [[ $attempt -lt $max_retries ]]; then
+      echo "Media read failed, retry $attempt/$max_retries in ${retry_delay}s..." >&2
+      sleep "$retry_delay"
+    fi
+    ((attempt++))
+  done
+
+  if [[ $attempt -gt $max_retries ]]; then
+    echo "no_media"
+    return
+  fi
+
+  # Check for blank disc (timeout protects against hung reads on bad sectors)
+  local blkid_out=$(timeout 15s blkid -p "$dev" 2>/dev/null || echo "")
+  if [[ -z "$blkid_out" ]]; then
+    # No filesystem signature - likely blank
+    # Double-check with isoinfo
+    if ! timeout 15s isoinfo -d -i "$dev" >/dev/null 2>&1; then
+      echo "blank"
+      return
+    fi
+  fi
+
+  # Check for audio CD
+  if command -v cdparanoia &>/dev/null; then
+    local cd_info=$(timeout 30s cdparanoia -Q 2>&1 || echo "")
+    if echo "$cd_info" | grep -q "audio tracks"; then
+      # Has audio tracks - check if ONLY audio
+      if ! echo "$cd_info" | grep -q "data track"; then
+        echo "audio"
+        return
+      else
+        echo "mixed"  # Both audio and data
+        return
+      fi
+    fi
+  fi
+
+  # It's a data disc - determine type
+  local disc_type=$(cat /sys/class/block/$(basename "$dev")/device/media 2>/dev/null || echo "unknown")
+
+  # Get more specific type from udevadm
+  local udev_type=$(udevadm info --query=property --name="$dev" 2>/dev/null | grep "ID_CDROM_MEDIA=" | cut -d= -f2 || echo "")
+
+  if [[ "$udev_type" == "1" ]]; then
+    # Check for DVD
+    if udevadm info --query=property --name="$dev" 2>/dev/null | grep -q "ID_CDROM_MEDIA_DVD=1"; then
+      echo "dvd"
+    else
+      echo "cd"
+    fi
+  else
+    echo "data"  # Generic data disc
+  fi
+}
+
+get_disc_info() {
+  local dev="$1"
+
+  # Get volume label (with timeout for damaged discs)
+  local label=$(timeout 15s blkid -s LABEL -o value "$dev" 2>/dev/null || echo "")
+
+  # Get size in bytes (with timeout)
+  local size_bytes=$(timeout 10s blockdev --getsize64 "$dev" 2>/dev/null || echo "0")
+  local size_mb=$((size_bytes / 1024 / 1024))
+
+  # Get ISO info if available (with timeout)
+  local iso_info=""
+  if command -v isoinfo &>/dev/null; then
+    iso_info=$(timeout 15s isoinfo -d -i "$dev" 2>/dev/null || echo "")
+  fi
+
+  # Extract publisher/preparer if available
+  local publisher=$(echo "$iso_info" | grep "^Publisher" | cut -d: -f2- | xargs || echo "")
+  local preparer=$(echo "$iso_info" | grep "^Data preparer" | cut -d: -f2- | xargs || echo "")
+  local app_id=$(echo "$iso_info" | grep "^Application" | cut -d: -f2- | xargs || echo "")
+  local volume_set=$(echo "$iso_info" | grep "^Volume set" | cut -d: -f2- | xargs || echo "")
+  local creation_date=$(echo "$iso_info" | grep "^Creation Date" | cut -d: -f2- | xargs || echo "")
+
+  # Build JSON
+  jq -n \
+    --arg label "$label" \
+    --argjson size_bytes "$size_bytes" \
+    --argjson size_mb "$size_mb" \
+    --arg publisher "$publisher" \
+    --arg preparer "$preparer" \
+    --arg app_id "$app_id" \
+    --arg volume_set "$volume_set" \
+    --arg creation_date "$creation_date" \
+    '{
+      label: (if $label == "" then null else $label end),
+      size_bytes: $size_bytes,
+      size_mb: $size_mb,
+      iso_info: {
+        publisher: (if $publisher == "" then null else $publisher end),
+        preparer: (if $preparer == "" then null else $preparer end),
+        application: (if $app_id == "" then null else $app_id end),
+        volume_set: (if $volume_set == "" then null else $volume_set end),
+        creation_date: (if $creation_date == "" then null else $creation_date end)
+      }
+    }'
+}
+
+# ---------- progress monitoring ----------
+monitor_imaging_progress() {
+  local map_path="$1"
+  local iso_path="$2"
+  local interval="${3:-30}"  # seconds between updates
+
+  while true; do
+    sleep "$interval"
+
+    # Check if mapfile exists yet
+    if [[ ! -f "$map_path" ]]; then
+      continue
+    fi
+
+    # Parse mapfile for progress
+    local rescued=$(grep -v '^#' "$map_path" 2>/dev/null | awk 'NF==3 && $2 ~ /^0x/ && $3=="+" {sum+=strtonum($2)} END {print sum+0}')
+    local bad=$(grep -v '^#' "$map_path" 2>/dev/null | awk 'NF==3 && $2 ~ /^0x/ && $3=="*" {sum+=strtonum($2)} END {print sum+0}')
+    local total=$(grep -v '^#' "$map_path" 2>/dev/null | awk 'NF==3 && $2 ~ /^0x/ {sum+=strtonum($2)} END {print sum+0}')
+
+    if [[ $total -gt 0 ]]; then
+      local rescued_mb=$((rescued / 1024 / 1024))
+      local total_mb=$((total / 1024 / 1024))
+      local bad_kb=$((bad / 1024))
+      local pct=$(echo "scale=1; $rescued * 100 / $total" | bc)
+
+      # Get current pass from mapfile header
+      local pass=$(grep -m1 "^# Copying\|^# Trimming\|^# Scraping" "$map_path" 2>/dev/null | head -1 || echo "")
+
+      log_info "Progress: ${rescued_mb}MB / ${total_mb}MB (${pct}%) | Bad: ${bad_kb}KB | $pass"
+    fi
+  done
+}
+
+# ---------- imaging ----------
+stage_image() {
+  local session_hash="$1"
+  local dev="$2"
+  local iso_path="$3"
+  local map_path="$4"
+
+  log_info "======================================"
+  log_info "STAGE: Image Disc"
+  log_info "======================================"
+  log_info "Device: $dev"
+  log_info "Output: $iso_path"
+
+  log_event image_start "{\"session_hash\": \"$session_hash\", \"device\": \"$dev\"}"
+
+  # Start background progress monitor (logs every 30 seconds)
+  monitor_imaging_progress "$map_path" "$iso_path" 30 &
+  local monitor_pid=$!
+
+  # Use ntt-imager with --quick flag (optical media doesn't benefit from retries)
+  log_info "Running: ntt-imager --quick $dev $iso_path $map_path"
+
+  local exit_code=0
+  # Redirect tee output to stderr so it doesn't contaminate function return value
+  if "$NTT_BIN/ntt-imager" --quick "$dev" "$iso_path" "$map_path" 2>&1 | tee -a "$LOG_FILE" >&2; then
+    exit_code=0
+  else
+    exit_code=$?
+  fi
+
+  # Stop progress monitor
+  kill $monitor_pid 2>/dev/null || true
+  wait $monitor_pid 2>/dev/null || true
+
+  # Determine status from mapfile
+  local status="failed"
+  local rescued_pct="0"
+
+  if [[ -f "$map_path" ]]; then
+    local rescued=$(grep -v '^#' "$map_path" 2>/dev/null | awk 'NF==3 && $2 ~ /^0x/ && $3=="+" {sum+=strtonum($2)} END {print sum+0}')
+    local total=$(grep -v '^#' "$map_path" 2>/dev/null | awk 'NF==3 && $2 ~ /^0x/ {sum+=strtonum($2)} END {print sum+0}')
+
+    if [[ $total -gt 0 ]]; then
+      rescued_pct=$(echo "scale=2; $rescued * 100 / $total" | bc)
+
+      if (( $(echo "$rescued_pct == 100" | bc -l) )); then
+        status="success"
+      elif (( $(echo "$rescued_pct >= 95" | bc -l) )); then
+        status="partial"
+      else
+        status="failed"
+      fi
+    fi
+  elif [[ -f "$iso_path" ]]; then
+    # No mapfile but image exists - assume success (dd was used)
+    status="success"
+    rescued_pct="100"
+  fi
+
+  log_info "Image status: $status ($rescued_pct% rescued)"
+  log_event image_complete "{\"session_hash\": \"$session_hash\", \"status\": \"$status\", \"rescued_pct\": \"$rescued_pct\"}"
+
+  echo "$status:$rescued_pct"
+}
+
+# ---------- metadata ----------
+write_metadata() {
+  local session_hash="$1"
+  local timestamp="$2"
+  local message="$3"
+  local sequence="$4"
+  local disc_type="$5"
+  local disc_info="$6"
+  local status="$7"
+  local rescued_pct="$8"
+  local device="$9"
+  local iso_file="${10}"
+
+  local metadata_file="metadata.json"
+
+  log_info "Writing metadata to $metadata_file"
+
+  # Get file size if exists
+  local iso_size=0
+  if [[ -f "$iso_file" ]]; then
+    iso_size=$(stat -c %s "$iso_file")
+  fi
+
+  # Write disc_info to temp file to avoid "argument list too long"
+  local disc_info_file="/tmp/disc_info_$$.json"
+  echo "$disc_info" > "$disc_info_file"
+
+  jq -n \
+    --arg session_hash "$session_hash" \
+    --arg timestamp "$timestamp" \
+    --arg message "$message" \
+    --argjson sequence "$sequence" \
+    --arg disc_type "$disc_type" \
+    --slurpfile disc_info "$disc_info_file" \
+    --arg status "$status" \
+    --arg rescued_pct "$rescued_pct" \
+    --arg device "$device" \
+    --arg iso_file "$iso_file" \
+    --argjson iso_size "$iso_size" \
+    --arg log_file "${session_hash}.log" \
+    '{
+      session_hash: $session_hash,
+      timestamp: $timestamp,
+      message: $message,
+      sequence: $sequence,
+      disc_type: $disc_type,
+      disc_info: $disc_info[0],
+      status: $status,
+      rescued_pct: $rescued_pct,
+      device: $device,
+      files: {
+        iso: (if $iso_file != "" then $iso_file else null end),
+        log: $log_file
+      },
+      diagnostics: {
+        iso_size_bytes: $iso_size
+      }
+    }' > "$metadata_file"
+
+  rm -f "$disc_info_file"
+
+  chmod 644 "$metadata_file"
+  log_info "Metadata written successfully"
+}
+
+# ---------- show mode ----------
+show_disks() {
+  echo "HASH   | DEST | TYPE  | SIZE    | STATUS  | LABEL"
+  echo "-------|------|-------|---------|---------|$(printf '%.0s-' {1..35})"
+
+  for meta in "$DISK_ROOT"/*/metadata.json; do
+    [[ -f "$meta" ]] || continue
+
+    local session_hash=$(jq -r '.session_hash' "$meta" 2>/dev/null || echo "")
+    local dest=$(jq -r '.dest // "?"' "$meta" 2>/dev/null || echo "?")
+    local disc_type=$(jq -r '.disc_type' "$meta" 2>/dev/null || echo "?")
+    local status=$(jq -r '.status' "$meta" 2>/dev/null || echo "?")
+    local rescued_pct=$(jq -r '.rescued_pct' "$meta" 2>/dev/null || echo "?")
+    local message=$(jq -r '.message' "$meta" 2>/dev/null || echo "")
+    local label=$(jq -r '.disc_info.label // ""' "$meta" 2>/dev/null || echo "")
+    local size_mb=$(jq -r '.disc_info.size_mb // 0' "$meta" 2>/dev/null || echo "0")
+
+    [[ -z "$session_hash" ]] && continue
+
+    local hash_prefix="${session_hash:0:6}"
+
+    # Format size
+    local size_str="${size_mb}MB"
+    if [[ $size_mb -gt 1000 ]]; then
+      size_str="$(echo "scale=1; $size_mb / 1024" | bc)GB"
+    fi
+
+    # Use label or message for display
+    local display="${label:-$message}"
+    if [[ ${#display} -gt 35 ]]; then
+      display="${display:0:32}..."
+    fi
+
+    printf "%s | %-4s | %-5s | %7s | %-7s | %s\n" \
+      "$hash_prefix" "$dest" "$disc_type" "$size_str" "$status" "$display"
+  done | sort -t'|' -k2,2 -k5,5
+
+  echo ""
+  local total=$(find "$DISK_ROOT" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l)
+  local ntt=$(grep -l '"dest": "ntt"' "$DISK_ROOT"/*/metadata.json 2>/dev/null | wc -l)
+  local mjd=$(grep -l '"dest": "mjd"' "$DISK_ROOT"/*/metadata.json 2>/dev/null | wc -l)
+  local skip=$(grep -l '"dest": "skip"' "$DISK_ROOT"/*/metadata.json 2>/dev/null | wc -l)
+
+  echo "Total: $total | NTT: $ntt | MJD: $mjd | Skip: $skip"
+}
+
+# ---------- argparse ----------
+usage() {
+  cat <<EOF
+Usage:
+  $0 --message <description> [options]    # Read a CD/DVD
+  $0 --show                                # Show status of all discs
+
+CD/DVD reading orchestrator with quick triage.
+Detects blank/audio discs early, images data discs via ntt-imager.
+
+Read Mode:
+  --message TEXT    Description of the disc [REQUIRED]
+  --seq NUM         Sequence number (for disc sets)
+  --device DEV      Optical device (default: $DEFAULT_DEVICE)
+  --no-eject        Don't eject disc after reading (default: auto-eject)
+
+Show Mode:
+  --show            Display status report of all discs
+
+Update Mode:
+  --set-dest HASH DEST   Set destination for disc (ntt, mjd, skip)
+                         HASH can be full hash or 6-char prefix
+
+Disc Types Detected:
+  blank   = No data (skipped)
+  audio   = Audio CD (skipped, use cdparanoia separately)
+  mixed   = Audio + data tracks
+  cd      = Data CD-ROM
+  dvd     = DVD
+
+Examples:
+  $0 --message "backup CD from 2003"
+  $0 --message "software install disc" --seq 1
+  $0 --message "old photos DVD" --no-eject   # keep disc in drive
+  $0 --show
+
+Outputs:
+  Directory: $DISK_ROOT/{session_hash}/
+  Files: {hash}.iso, {hash}.map (if errors), {hash}.log, metadata.json
+EOF
+  exit 1
+}
+
+# ---------- set-dest mode ----------
+set_dest() {
+  local hash_input="$1"
+  local dest="$2"
+
+  # Validate dest
+  if [[ "$dest" != "ntt" && "$dest" != "mjd" && "$dest" != "skip" && "$dest" != "blank" && "$dest" != "damaged" ]]; then
+    echo "Error: dest must be 'ntt', 'mjd', 'skip', 'blank', or 'damaged'" >&2
+    exit 1
+  fi
+
+  # Find matching directory
+  local matches=()
+  for dir in "$DISK_ROOT"/${hash_input}*/; do
+    [[ -d "$dir" ]] && matches+=("$dir")
+  done
+
+  if [[ ${#matches[@]} -eq 0 ]]; then
+    echo "Error: No disc found matching: $hash_input" >&2
+    exit 1
+  elif [[ ${#matches[@]} -gt 1 ]]; then
+    echo "Error: Multiple matches for '$hash_input':" >&2
+    printf "  %s\n" "${matches[@]}" >&2
+    exit 1
+  fi
+
+  local meta="${matches[0]}metadata.json"
+  if [[ ! -f "$meta" ]]; then
+    echo "Error: metadata.json not found in ${matches[0]}" >&2
+    exit 1
+  fi
+
+  # Update metadata.json with dest field
+  local tmp="/tmp/meta_update_$$.json"
+  jq --arg dest "$dest" '. + {dest: $dest}' "$meta" > "$tmp" && mv "$tmp" "$meta"
+
+  local hash=$(basename "${matches[0]}")
+  echo "Set dest=$dest for $hash"
+}
+
+# Parse arguments
+MESSAGE=""
+SEQUENCE="null"
+DEVICE="$DEFAULT_DEVICE"
+SHOW_MODE=false
+SET_DEST_MODE=false
+SET_DEST_HASH=""
+SET_DEST_VALUE=""
+EJECT=true  # Auto-eject by default
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --show)
+      SHOW_MODE=true
+      shift
+      ;;
+    --set-dest)
+      SET_DEST_MODE=true
+      shift
+      if [[ $# -ge 2 && "$1" != -* && "$2" != -* ]]; then
+        SET_DEST_HASH="$1"
+        SET_DEST_VALUE="$2"
+        shift 2
+      else
+        echo "Error: --set-dest requires HASH and DEST arguments" >&2
+        usage
+      fi
+      ;;
+    --message)
+      shift
+      if [[ $# -ge 1 && "$1" != -* ]]; then
+        MESSAGE="$1"
+        shift
+      else
+        echo "Error: --message requires a description string" >&2
+        usage
+      fi
+      ;;
+    --seq)
+      shift
+      if [[ $# -ge 1 && "$1" != -* ]]; then
+        SEQUENCE="$1"
+        shift
+      else
+        echo "Error: --seq requires a number" >&2
+        usage
+      fi
+      ;;
+    --device)
+      shift
+      if [[ $# -ge 1 && "$1" != -* ]]; then
+        DEVICE="$1"
+        shift
+      else
+        echo "Error: --device requires a device path" >&2
+        usage
+      fi
+      ;;
+    --no-eject)
+      EJECT=false
+      shift
+      ;;
+    -h|--help)
+      usage
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      usage
+      ;;
+  esac
+done
+
+# Handle --show mode
+if [[ "$SHOW_MODE" == "true" ]]; then
+  show_disks
+  exit 0
+fi
+
+# Handle --set-dest mode
+if [[ "$SET_DEST_MODE" == "true" ]]; then
+  set_dest "$SET_DEST_HASH" "$SET_DEST_VALUE"
+  exit 0
+fi
+
+# Validate required args
+if [[ -z "$MESSAGE" ]]; then
+  echo "Error: --message is required" >&2
+  usage
+fi
+
+# Check root
+if [[ $EUID -ne 0 ]]; then
+  echo "Error: This script must be run with sudo" >&2
+  exit 1
+fi
+
+# ---------- main ----------
+main() {
+  # Ensure directories exist
+  mkdir -p "$DISK_ROOT"
+  mkdir -p "$(dirname "$EVENT_LOG")"
+
+  # Generate session hash
+  local timestamp=$(date -Iseconds)
+  local session_hash=$(generate_session_hash "$timestamp" "$MESSAGE" "$SEQUENCE")
+
+  # Create work directory
+  local work_dir="$DISK_ROOT/$session_hash"
+  mkdir -p "$work_dir"
+  cd "$work_dir"
+
+  # Set up log file
+  LOG_FILE="$work_dir/${session_hash}.log"
+  log_init || exit 1
+
+  log_info "======================================"
+  log_info "CD Orchestrator Starting"
+  log_info "======================================"
+  log_info "Session: $session_hash"
+  log_info "Message: $MESSAGE"
+  log_info "Device: $DEVICE"
+
+  log_event start "{\"session_hash\": \"$session_hash\", \"message\": \"$MESSAGE\", \"device\": \"$DEVICE\"}"
+
+  # Quick triage - detect disc type
+  log_info "Detecting disc type..."
+  local disc_type=$(detect_disc_type "$DEVICE")
+  log_info "Disc type: $disc_type"
+
+  # Handle non-data discs
+  case "$disc_type" in
+    no_device)
+      fail "Device $DEVICE not found"
+      ;;
+    no_media)
+      fail "No disc in drive"
+      ;;
+    blank)
+      log_warn "Blank disc detected - skipping"
+      write_metadata "$session_hash" "$timestamp" "$MESSAGE" "$SEQUENCE" "blank" "{}" "skipped" "0" "$DEVICE" ""
+      log_event skipped "{\"session_hash\": \"$session_hash\", \"reason\": \"blank\"}"
+
+      if [[ "$EJECT" == "true" ]]; then
+        eject "$DEVICE" 2>/dev/null || true
+      fi
+      exit 0
+      ;;
+    audio)
+      log_warn "Audio CD detected - skipping (use cdparanoia for audio ripping)"
+      write_metadata "$session_hash" "$timestamp" "$MESSAGE" "$SEQUENCE" "audio" "{}" "skipped" "0" "$DEVICE" ""
+      log_event skipped "{\"session_hash\": \"$session_hash\", \"reason\": \"audio\"}"
+
+      if [[ "$EJECT" == "true" ]]; then
+        eject "$DEVICE" 2>/dev/null || true
+      fi
+      exit 0
+      ;;
+  esac
+
+  # Get disc info for data discs
+  log_info "Getting disc info..."
+  local disc_info=$(get_disc_info "$DEVICE")
+  local label=$(echo "$disc_info" | jq -r '.label // "unlabeled"')
+  local size_mb=$(echo "$disc_info" | jq -r '.size_mb')
+  log_info "Label: $label, Size: ${size_mb}MB"
+
+  # Define output files
+  local iso_file="${session_hash}.iso"
+  local map_file="${session_hash}.map"
+
+  # Image the disc
+  local image_result=$(stage_image "$session_hash" "$DEVICE" "$iso_file" "$map_file")
+  local status="${image_result%%:*}"
+  local rescued_pct="${image_result#*:}"
+
+  # Write metadata
+  write_metadata "$session_hash" "$timestamp" "$MESSAGE" "$SEQUENCE" "$disc_type" "$disc_info" "$status" "$rescued_pct" "$DEVICE" "$iso_file"
+
+  log_info "======================================"
+  log_info "COMPLETE: $status ($rescued_pct% rescued)"
+  log_info "======================================"
+
+  # Quick file listing - mount ISO and show contents
+  if [[ -f "$iso_file" && "$status" != "failed" ]]; then
+    local mount_point="/tmp/cd-preview-$$"
+    mkdir -p "$mount_point"
+
+    if mount -o loop,ro "$iso_file" "$mount_point" 2>/dev/null; then
+      echo ""
+      echo "=== FILES ON DISC ==="
+      # Show files with sizes, limit to first 50
+      find "$mount_point" -type f -printf '%s %P\n' 2>/dev/null | \
+        awk '{
+          size=$1; $1="";
+          if (size > 1073741824) printf "%6.1fG %s\n", size/1073741824, $0
+          else if (size > 1048576) printf "%6.1fM %s\n", size/1048576, $0
+          else if (size > 1024) printf "%6.1fK %s\n", size/1024, $0
+          else printf "%6dB %s\n", size, $0
+        }' | head -50
+
+      local file_count=$(find "$mount_point" -type f 2>/dev/null | wc -l)
+      if [[ $file_count -gt 50 ]]; then
+        echo "... and $((file_count - 50)) more files"
+      fi
+      echo "Total: $file_count files"
+      echo "====================="
+
+      umount "$mount_point" 2>/dev/null || true
+    fi
+    rmdir "$mount_point" 2>/dev/null || true
+  fi
+
+  log_event done "{\"session_hash\": \"$session_hash\", \"status\": \"$status\", \"rescued_pct\": \"$rescued_pct\"}"
+
+  # Eject if requested
+  if [[ "$EJECT" == "true" ]]; then
+    log_info "Ejecting disc..."
+    eject "$DEVICE" 2>/dev/null || log_warn "Eject failed"
+  fi
+}
+
+main

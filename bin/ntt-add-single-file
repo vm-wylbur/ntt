@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+# Author: PB and Claude
+# Date: 2025-11-23
+# License: (c) HRDAG, 2025, GPL-2 or newer
+#
+# ---
+# ntt/bin/ntt-add-single-file
+#
+# Add a single file to NTT pipeline with synthetic medium
+
+set -euo pipefail
+
+# NTT bin directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+NTT_BIN="${NTT_BIN:-$SCRIPT_DIR}"
+
+# Check arguments
+if [[ $# -lt 1 ]]; then
+    echo "Usage: $0 <file_path> [message]" >&2
+    echo "" >&2
+    echo "Example:" >&2
+    echo "  $0 /data/fast/img/gmail-20251113-002.mbox 'Gmail export 2025-11-13'" >&2
+    exit 1
+fi
+
+FILE="$1"
+MESSAGE="${2:-Single file import: $(basename "$FILE")}"
+
+# Validate file exists
+if [[ ! -f "$FILE" ]]; then
+    echo "Error: File not found: $FILE" >&2
+    exit 1
+fi
+
+# Get absolute path
+FILE=$(realpath "$FILE")
+
+# Get file metadata
+SIZE=$(stat -c%s "$FILE")
+MTIME=$(stat -c%Y "$FILE")
+BASENAME=$(basename "$FILE")
+
+echo "Adding file to NTT pipeline:"
+echo "  Path: $FILE"
+echo "  Size: $(numfmt --to=iec-i --suffix=B $SIZE)"
+echo "  Message: $MESSAGE"
+echo ""
+
+# Verify archive destinations exist
+if [[ ! -d "/data/cold/img-read" ]]; then
+    echo "Error: Archive destination not found: /data/cold/img-read" >&2
+    exit 1
+fi
+
+# Step 1: Compute medium hash (first 1MB + last 1MB)
+echo "[1/5] Computing medium hash (first+last 1MB)..."
+SIG_FILE="/tmp/ntt-sig-$$"
+dd if="$FILE" bs=1048576 count=1 status=none > "$SIG_FILE"
+
+# Calculate skip for last 1MB
+SKIP_MB=$((SIZE / 1048576 - 1))
+if [[ $SKIP_MB -lt 0 ]]; then
+    SKIP_MB=0
+fi
+dd if="$FILE" bs=1048576 skip=$SKIP_MB count=1 status=none >> "$SIG_FILE"
+
+MEDIUM_HASH=$(b3sum < "$SIG_FILE" | cut -d' ' -f1 | cut -c1-32)
+rm -f "$SIG_FILE"
+
+echo "  Medium hash: $MEDIUM_HASH"
+
+# Step 2: Insert medium record
+echo "[2/5] Inserting medium record..."
+psql copyjob -q <<EOF
+INSERT INTO medium (
+    medium_hash,
+    medium_human,
+    message,
+    medium_type,
+    image_path,
+    health,
+    diagnostics
+) VALUES (
+    '$MEDIUM_HASH',
+    '$BASENAME',
+    '$MESSAGE',
+    'extracted',
+    '$FILE',
+    'ok',
+    '{"source": "single-file-import", "size_bytes": $SIZE}'
+)
+ON CONFLICT (medium_hash) DO UPDATE SET
+    message = EXCLUDED.message,
+    diagnostics = EXCLUDED.diagnostics;
+EOF
+
+echo "  ✓ Medium record created"
+
+# Step 3: Insert path record
+echo "[3/5] Inserting path record..."
+psql copyjob -q <<EOF
+INSERT INTO paths (
+    medium_hash,
+    dev,
+    ino,
+    path,
+    mtime,
+    size,
+    fs_type,
+    nlink,
+    copied
+) VALUES (
+    '$MEDIUM_HASH',
+    0,
+    1,
+    '$FILE'::bytea,
+    $MTIME,
+    $SIZE,
+    'f',
+    1,
+    false
+)
+ON CONFLICT DO NOTHING;
+EOF
+
+echo "  ✓ Path record created"
+
+# Step 4: Run ntt-copier
+echo "[4/5] Running ntt-copier..."
+if sudo -E "$NTT_BIN/ntt-copier.py" --medium-hash "$MEDIUM_HASH" --batch-size 1; then
+    echo "  ✓ File copied to by-hash storage"
+else
+    echo "  ✗ Copy failed!" >&2
+    exit 1
+fi
+
+# Step 5: Create dar archive manually
+echo "[5/5] Creating dar archive..."
+ARCHIVE_ROOT="${NTT_IMAGES_ROOT:-/data/cold/img-read}"
+ARCHIVE_FILE="$ARCHIVE_ROOT/$MEDIUM_HASH.1.dar"
+
+if [[ -f "$ARCHIVE_FILE" ]]; then
+    echo "  ⚠ Archive already exists: $ARCHIVE_FILE"
+else
+    # Create archive of the original file (dar requires relative path)
+    cd "$(dirname "$FILE")"
+    if dar -c "$ARCHIVE_ROOT/$MEDIUM_HASH" -g "$(basename "$FILE")" -R . -zzstd:3 -s 0 -q; then
+        cd - > /dev/null
+        # Set ownership to user
+        if [[ -n "$USER" ]]; then
+            chown "$USER:$USER" "$ARCHIVE_FILE" 2>/dev/null || true
+            chmod 644 "$ARCHIVE_FILE" 2>/dev/null || true
+        fi
+        ARCHIVE_SIZE=$(stat -c%s "$ARCHIVE_FILE" | numfmt --to=iec-i --suffix=B)
+        echo "  ✓ Archive created: $ARCHIVE_SIZE"
+    else
+        cd - > /dev/null
+        echo "  ✗ Archive creation failed!" >&2
+        exit 1
+    fi
+fi
+
+# Step 6: Sync to backup location
+echo "[6/6] Syncing to /mnt/ntt-images..."
+BACKUP_ROOT="/mnt/ntt-images"
+if [[ -d "$BACKUP_ROOT" ]]; then
+    if rsync -ah "$ARCHIVE_FILE" "$BACKUP_ROOT/"; then
+        echo "  ✓ Archive synced to backup"
+    else
+        echo "  ⚠ Backup sync failed (non-fatal)" >&2
+    fi
+else
+    echo "  ⚠ Backup location not mounted: $BACKUP_ROOT" >&2
+fi
+
+# Get final blobid
+BLOBID=$(psql copyjob -tAc "SELECT blobid FROM paths WHERE medium_hash = '$MEDIUM_HASH' LIMIT 1")
+
+echo ""
+echo "✓ Complete!"
+echo "  Medium hash: $MEDIUM_HASH"
+echo "  Blob ID: $BLOBID"
+echo "  Archive: /data/cold/img-read/$MEDIUM_HASH.1.dar"
+echo "  Backup: /mnt/ntt-images/$MEDIUM_HASH.1.dar"
