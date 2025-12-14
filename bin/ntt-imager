@@ -19,14 +19,19 @@ LIB_DIR="$(cd "$SCRIPT_DIR/../lib" && pwd)"
 LOG_FILE="/var/log/ntt/imager.jsonl"
 
 # ---------- Arguments ----------
-if [[ $# -lt 3 ]]; then
+usage() {
   cat <<EOF
-Usage: $0 <device> <output.img> <mapfile>
+Usage: $0 [--quick] <device> <output.img> <mapfile>
 
 Progressive ddrescue imaging with 7 escalating phases.
 Runs until 100% rescued or all methods exhausted.
 
-Phases:
+Options:
+  --quick    Quick mode for optical media (CDs/DVDs)
+             Only runs Phase 1, bails out at >95% rescued
+             Recommended for optical media where retries rarely help
+
+Phases (full mode):
   1. Quick first pass (large blocks, ~2-4 hours)
   2. Trimming bad areas (small blocks, ~2-4 hours)
   3. Aggressive scraping (10 retries, ~12-24 hours)
@@ -37,13 +42,36 @@ Phases:
 
 Exit codes:
   0 = 100% rescued (SUCCESS)
-  1 = Exhausted all 7 phases, some sectors unreadable (PARTIAL)
+  1 = Exhausted all phases, some sectors unreadable (PARTIAL)
   2 = Error (device not found, disk full, etc.)
 
-Example:
+Examples:
   sudo $0 /dev/sdc /data/fast/img/backup.img /data/fast/img/backup.map
+  sudo $0 --quick /dev/sr0 /data/fast/cdrom/disc.iso /data/fast/cdrom/disc.map
 EOF
   exit 2
+}
+
+# Parse options
+QUICK_MODE=false
+while [[ $# -gt 0 && "$1" == --* ]]; do
+  case "$1" in
+    --quick)
+      QUICK_MODE=true
+      shift
+      ;;
+    --help|-h)
+      usage
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      usage
+      ;;
+  esac
+done
+
+if [[ $# -lt 3 ]]; then
+  usage
 fi
 
 DEVICE="$1"
@@ -221,6 +249,21 @@ run_phase 1 "Quick first pass (large blocks, no scraping)" \
   --no-trim \
   --idirect \
   --cluster-size=128
+
+# Quick mode: bail out after Phase 1 (optimal for optical media)
+if [[ "$QUICK_MODE" == "true" ]]; then
+  rescued_pct=$(parse_mapfile_percentage "$MAPFILE")
+  elapsed=$(( ($(date +%s) - START_TIME) / 60 ))
+  log "======================================"
+  log "QUICK MODE: Phase 1 complete (${rescued_pct}% rescued)"
+  log "Total time: $elapsed minutes"
+  log "======================================"
+  if (( $(echo "$rescued_pct >= 95" | bc -l) )); then
+    cleanup_and_exit 0  # Good enough for optical
+  else
+    cleanup_and_exit 1  # Partial recovery
+  fi
+fi
 
 # ---------- PHASE 2: Trimming ----------
 run_phase 2 "Trimming bad areas (small blocks, 5 retry passes)" \
