@@ -1176,12 +1176,31 @@ class CopyWorker:
                             'error_msg': result['error_msg']
                         })
                     elif isinstance(result, dict):
-                        # Success: result is dict with blob_id and mime_type
-                        success_medium_hashes.append(inode_row['medium_hash'])
-                        success_inos.append(inode_row['ino'])
-                        success_devs.append(inode_row['dev'])
-                        success_blob_ids.append(result.get('blob_id'))
-                        success_mime_types.append(result.get('mime_type'))
+                        blob_id = result.get('blob_id')
+
+                        # BUG FIX: Only treat as success if blob_id is valid BLAKE3 hash
+                        # Use same validation as first UPDATE (line 1134) for consistency
+                        # Note: is_sha256_hash_lowercase() is misnamed but validates 64 hex chars (correct for BLAKE3)
+                        # Directories/symlinks/skipped files return None and should NOT be
+                        # marked as copied=true (remains copied=false for investigation)
+                        if is_sha256_hash_lowercase(blob_id):
+                            # Success: result is dict with valid BLAKE3 blob_id
+                            success_medium_hashes.append(inode_row['medium_hash'])
+                            success_inos.append(inode_row['ino'])
+                            success_devs.append(inode_row['dev'])
+                            success_blob_ids.append(blob_id)
+                            success_mime_types.append(result.get('mime_type'))
+                        else:
+                            # Invalid/missing blob_id - release claim and log error
+                            # BUG FIX: Previously only logged debug and skipped update,
+                            # leaving claim unreleased (files stuck forever)
+                            failed_inodes.append({
+                                'ino': inode_row['ino'],
+                                'dev': inode_row['dev'],
+                                'medium_hash': inode_row['medium_hash'],
+                                'error_type': 'InvalidBlobId',
+                                'error_msg': f"Processing returned invalid blob_id={blob_id} fs_type={inode_row.get('fs_type')}"
+                            })
                     else:
                         # Truly unknown result type (shouldn't happen)
                         failed_inodes.append({
@@ -1269,9 +1288,10 @@ class CopyWorker:
                             UPDATE paths
                             SET claimed_by = NULL,
                                 claimed_at = NULL,
-                                errors = array_append(errors, %s::text)
+                                errors = array_append(errors, %s::text),
+                                error_type = %s
                             WHERE medium_hash = %s AND ino = %s AND dev = %s
-                        """, (error_entry, f['medium_hash'], f['ino'], f['dev']))
+                        """, (error_entry, f['error_type'], f['medium_hash'], f['ino'], f['dev']))
 
                         # Log each error clearly
                         logger.warning(f"Failed path medium={f['medium_hash'][:8]} ino={f['ino']}: {f['error_type']}: {f['error_msg']}")

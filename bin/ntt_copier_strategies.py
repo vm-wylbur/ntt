@@ -17,6 +17,7 @@
 import blake3
 import shutil
 import subprocess
+import unicodedata
 from pathlib import Path
 from typing import Optional
 
@@ -40,20 +41,72 @@ def parse_partition_path(path_bytes: bytes, medium_hash: str) -> Path:
     Returns:
         Path object for filesystem access
     """
-    # Decode path from Latin1 (preserves all byte values)
-    try:
-        path_str = path_bytes.decode('latin1') if isinstance(path_bytes, bytes) else str(path_bytes)
-    except (UnicodeDecodeError, AttributeError):
+    # BUG FIX: Decode as UTF-8 first, preserve original Unicode form
+    # Problem: Database stores exact bytes from filesystem (could be NFD or NFC).
+    # Latin1 decoding creates mojibake.
+    # Solution: UTF-8 decode → use as-is → fallback to alternate form if not found
+
+    if isinstance(path_bytes, bytes):
+        try:
+            # Try UTF-8 first (proper Unicode handling)
+            path_str = path_bytes.decode('utf-8')
+        except UnicodeDecodeError:
+            # Fall back to latin1 for truly binary paths (rare)
+            path_str = path_bytes.decode('latin1')
+    elif isinstance(path_bytes, memoryview):
+        # psycopg may return memoryview for bytea
+        path_str = bytes(path_bytes).decode('utf-8')
+    else:
         path_str = str(path_bytes)
 
     # If path is already absolute, return as-is (extracted media case)
     if path_str.startswith('/'):
-        return Path(path_str)
+        # Try path as-is first (preserves original NFD/NFC form from filesystem)
+        result = Path(path_str)
+        if result.exists():
+            return result
+
+        # If not found, try NFC normalized (for cross-platform compatibility)
+        nfc_path = unicodedata.normalize('NFC', path_str)
+        if nfc_path != path_str:
+            result_nfc = Path(nfc_path)
+            if result_nfc.exists():
+                return result_nfc
+
+        # If still not found, try NFD normalized (macOS HFS+ stores NFD)
+        nfd_path = unicodedata.normalize('NFD', path_str)
+        if nfd_path != path_str:
+            result_nfd = Path(nfd_path)
+            if result_nfd.exists():
+                return result_nfd
+
+        # Return original path (will fail on access, but preserves error message)
+        return result
 
     # Relative path - prepend mount point
     mount_base = Path(f"/mnt/ntt/{medium_hash}")
     if mount_base.exists():
-        return mount_base / path_str
+        # Try as-is first
+        result = mount_base / path_str
+        if result.exists():
+            return result
+
+        # Try NFC normalized
+        nfc_path = unicodedata.normalize('NFC', path_str)
+        if nfc_path != path_str:
+            result_nfc = mount_base / nfc_path
+            if result_nfc.exists():
+                return result_nfc
+
+        # Try NFD normalized
+        nfd_path = unicodedata.normalize('NFD', path_str)
+        if nfd_path != path_str:
+            result_nfd = mount_base / nfd_path
+            if result_nfd.exists():
+                return result_nfd
+
+        # Return original (will fail but preserves error info)
+        return result
 
     # Fallback: treat as relative to cwd
     return Path(path_str)
