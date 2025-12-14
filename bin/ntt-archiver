@@ -339,6 +339,8 @@ fi
 if [[ "$FORCE" == "false" ]] && [[ "$MEDIUM_TYPE" != "floppy" ]] && [[ "$MEDIUM_TYPE" != "manual" ]]; then
   log_info "Checking copy completion..."
 
+  # Only count non-excluded paths (exclude_reason IS NULL)
+  # Excluded files (pattern_match, etc.) are intentionally not copied
   COPY_STATUS=$(psql_as_user "$DB_URL" -tAc "
     SELECT
       COUNT(*) FILTER (WHERE copied = true) as copied,
@@ -346,6 +348,7 @@ if [[ "$FORCE" == "false" ]] && [[ "$MEDIUM_TYPE" != "floppy" ]] && [[ "$MEDIUM_
       COUNT(*) as total
     FROM paths
     WHERE medium_hash = '$MEDIUM_HASH'
+      AND exclude_reason IS NULL
   " 2>/dev/null | grep -v "^Pager" | grep "|")
 
   COPIED=$(echo "$COPY_STATUS" | cut -d'|' -f1)
