@@ -26,16 +26,25 @@ import logging
 import cProfile
 import pstats
 from io import StringIO
+import random
 
 # Import from same directory
 sys.path.insert(0, str(Path(__file__).parent))
 from chunk_file import fastcdc
 
 # Logging setup
+log_dir = Path('/var/log/ntt')
+log_dir.mkdir(parents=True, exist_ok=True)
+log_file = log_dir / 'chunk-orchestrator.log'
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[
+        logging.StreamHandler(),  # Console output
+        logging.FileHandler(log_file, mode='a')  # Append to log file
+    ]
 )
 logger = logging.getLogger(__name__)
 
@@ -45,6 +54,34 @@ def blobid_to_path(blobid: str) -> str:
     return f"/data/fast/ntt/by-hash/{blobid[:2]}/{blobid[2:4]}/{blobid}"
 
 
+def parse_size(size_str: str) -> int:
+    """Parse human-readable size to bytes (e.g., '10M' -> 10485760)."""
+    size_str = size_str.strip().upper()
+
+    units = {
+        'B': 1,
+        'K': 1024,
+        'M': 1024**2,
+        'G': 1024**3,
+        'T': 1024**4,
+    }
+
+    # Extract number and unit
+    if size_str[-1] in units:
+        try:
+            number = float(size_str[:-1])
+            unit = size_str[-1]
+            return int(number * units[unit])
+        except ValueError:
+            raise ValueError(f"Invalid size format: {size_str}")
+    else:
+        # Assume bytes if no unit
+        try:
+            return int(size_str)
+        except ValueError:
+            raise ValueError(f"Invalid size format: {size_str}")
+
+
 def chunk_file_worker(blobid: str, path: str, file_size: int, large_file_threshold: int = 100 * 1024 * 1024):
     """
     Worker function - runs in separate process.
@@ -52,15 +89,12 @@ def chunk_file_worker(blobid: str, path: str, file_size: int, large_file_thresho
     For large files (>100MB), yields progress updates.
     """
     try:
-        if not os.path.exists(path):
-            return None, f"File not found: {path}", []
-
         is_large = file_size > large_file_threshold
         chunks = []
         bytes_chunked = 0
 
         for off, sz, chash in fastcdc(path):
-            chunks.append((blobid, bytes(chash), off, sz))
+            chunks.append((blobid, chash, off, sz))
             bytes_chunked += sz
 
             # For large files, log progress every 1GB chunked
@@ -83,21 +117,23 @@ async def process_one(executor, loop, pool, blobid, path, size, sem, stats, stat
             logger.warning(error)
             async with stats_lock:
                 stats['errors'] += 1
-        elif chunks:
-            # Insert chunks to database and mark as complete
+        else:
+            # Insert chunks (if any) and mark as complete
             async with pool.acquire() as conn:
                 async with conn.transaction():
-                    await conn.executemany(
-                        "INSERT INTO file_chunks (blobid, chunk_hash, chunk_offset, chunk_size) "
-                        "VALUES ($1, $2, $3, $4)",
-                        chunks
-                    )
+                    if chunks:
+                        await conn.executemany(
+                            "INSERT INTO file_chunks (blobid, chunk_hash, chunk_offset, chunk_size) "
+                            "VALUES ($1, $2, $3, $4)",
+                            chunks
+                        )
                     await conn.execute(
                         "UPDATE blobs SET chunked_complete = true WHERE blobid = $1",
                         blobid
                     )
             async with stats_lock:
-                stats['chunks_inserted'] += len(chunks)
+                if chunks:
+                    stats['chunks_inserted'] += len(chunks)
 
         async with stats_lock:
             stats['processed'] += 1
@@ -126,17 +162,78 @@ async def main():
         help='Maximum files to process concurrently (default: 100)'
     )
     parser.add_argument(
+        '--max-size',
+        type=str,
+        default='10M',
+        help='Maximum file size to chunk (e.g., "10M", "1G"). Default: 10M'
+    )
+    parser.add_argument(
         '--profile',
         action='store_true',
         help='Enable cProfile profiling and save to /tmp/chunker.prof'
     )
     args = parser.parse_args()
 
+    # Parse max-size argument
+    max_size_bytes = parse_size(args.max_size)
+    max_size_human = args.max_size
+
     # Database connection
     db_url = os.environ.get('NTT_DB_URL', 'postgresql://localhost/copyjob')
     logger.info(f"Connecting to database: {db_url}")
+    logger.info(f"Filtering files: size >= 4KB AND size <= {max_size_human} ({max_size_bytes:,} bytes)")
 
     pool = await asyncpg.create_pool(dsn=db_url, min_size=2, max_size=10)
+
+    # Count existing chunks and unchunked blobs in size range at start
+    async with pool.acquire() as conn:
+        start_chunk_count = await conn.fetchval("SELECT COUNT(*) FROM file_chunks")
+        start_unchunked = await conn.fetchval(f"""
+            SELECT COUNT(*) FROM blobs
+            WHERE size >= 4096 AND size <= {max_size_bytes}
+            AND (chunked_complete IS NULL OR chunked_complete = false)
+        """)
+
+        # Log size distribution of ALL unchunked blobs
+        size_dist = await conn.fetch("""
+            SELECT
+                CASE
+                    WHEN size < 4096 THEN '< 4KB'
+                    WHEN size >= 4096 AND size <= 10485760 THEN '4KB - 10MB (target range)'
+                    WHEN size > 10485760 THEN '> 10MB'
+                    ELSE 'NULL size'
+                END as size_category,
+                COUNT(*) as blob_count,
+                ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 1) as pct,
+                SUM(COALESCE(size, 0)) as total_bytes
+            FROM blobs
+            WHERE NOT chunked_complete OR chunked_complete IS NULL
+            GROUP BY size_category
+            ORDER BY blob_count DESC
+        """)
+
+    logger.info(f"Starting chunk count: {start_chunk_count:,}")
+    logger.info(f"Starting unchunked blobs in size range: {start_unchunked:,}")
+    logger.info("")
+    logger.info("Size distribution of ALL unchunked blobs:")
+    for row in size_dist:
+        category = row['size_category']
+        count = row['blob_count']
+        pct = row['pct']
+        total_bytes = row['total_bytes']
+
+        # Format bytes nicely
+        if total_bytes >= 1024**3:  # GB
+            size_str = f"{total_bytes / 1024**3:.1f} GB"
+        elif total_bytes >= 1024**2:  # MB
+            size_str = f"{total_bytes / 1024**2:.0f} MB"
+        elif total_bytes >= 1024:  # KB
+            size_str = f"{total_bytes / 1024:.0f} KB"
+        else:
+            size_str = f"{total_bytes} B"
+
+        logger.info(f"  {category:30s}: {count:>8,d} ({pct:>4.1f}%) - {size_str:>10s}")
+    logger.info("")
 
     # Get unchunked blobs (exclude archives/compression - we don't need chunks for those)
     logger.info("Fetching unchunked blobs...")
@@ -162,23 +259,30 @@ async def main():
             blobs = await conn.fetch(f"""
                 SELECT b.blobid, b.size
                 FROM blobs b
-                WHERE b.size > 0
+                WHERE b.size >= 4096
+                  AND b.size <= {max_size_bytes}
                   AND (b.chunked_complete IS NULL OR b.chunked_complete = false)
                   AND (b.mime_type IS NULL OR b.mime_type NOT IN ({','.join(f"'{m}'" for m in archive_mimes)}))
                 LIMIT {args.limit}
             """)
-            # Sort in Python by size descending
+            # Sort in Python by size descending, then randomize
             blobs = sorted(blobs, key=lambda b: b['size'], reverse=True)
+            random.shuffle(blobs)
         else:
-            # No limit - just order by size descending
+            # No limit - fetch in manageable batch (50K at a time, ordered by size)
+            # This prevents loading millions of rows into memory
             blobs = await conn.fetch(f"""
                 SELECT b.blobid, b.size
                 FROM blobs b
-                WHERE b.size > 0
+                WHERE b.size >= 4096
+                  AND b.size <= {max_size_bytes}
                   AND (b.chunked_complete IS NULL OR b.chunked_complete = false)
                   AND (b.mime_type IS NULL OR b.mime_type NOT IN ({','.join(f"'{m}'" for m in archive_mimes)}))
                 ORDER BY b.size DESC
+                LIMIT 50000
             """)
+            # Randomize order to stabilize processing speed
+            random.shuffle(blobs)
 
     total_blobs = len(blobs)
     total_bytes = sum(b['size'] for b in blobs)
@@ -300,19 +404,12 @@ async def main():
 
     try:
         # Queue all tasks - semaphore controls concurrency
+        # Note: existence check moved into process_one to avoid blocking startup
         tasks = []
         for blob in blobs:
             blobid = blob['blobid']
             size = blob['size']
             path = blobid_to_path(blobid)
-
-            # Quick existence check
-            if not os.path.exists(path):
-                async with stats_lock:
-                    stats['processed'] += 1
-                    stats['bytes_processed'] += size
-                continue
-
             tasks.append(process_one(executor, loop, pool, blobid, path, size, sem, stats, stats_lock))
 
         # Process all concurrently (semaphore limits to max_concurrent in-flight)
@@ -330,17 +427,30 @@ async def main():
         except asyncio.CancelledError:
             pass
 
+        # Count chunks and unchunked blobs at end BEFORE closing pool
+        async with pool.acquire() as conn:
+            end_chunk_count = await conn.fetchval("SELECT COUNT(*) FROM file_chunks")
+            end_unchunked = await conn.fetchval(f"""
+                SELECT COUNT(*) FROM blobs
+                WHERE size >= 4096 AND size <= {max_size_bytes}
+                AND (chunked_complete IS NULL OR chunked_complete = false)
+            """)
+
         executor.shutdown(wait=True)
         await pool.close()
 
     # Final summary
     elapsed = (datetime.now() - start_time).total_seconds()
     mb_per_sec = (stats['bytes_processed'] / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+    net_chunks_added = end_chunk_count - start_chunk_count
+    net_blobs_completed = start_unchunked - end_unchunked
 
     logger.info("=" * 80)
     logger.info("CHUNKING COMPLETE")
     logger.info(f"Processed: {stats['processed']:,} blobs")
     logger.info(f"Chunks inserted: {stats['chunks_inserted']:,}")
+    logger.info(f"Net chunks added: {net_chunks_added:,} (start: {start_chunk_count:,}, end: {end_chunk_count:,})")
+    logger.info(f"Net blobs completed: {net_blobs_completed:,} (start: {start_unchunked:,}, end: {end_unchunked:,})")
     logger.info(f"Errors: {stats['errors']:,}")
     logger.info(f"Total time: {elapsed:.1f} seconds ({elapsed/60:.1f} minutes)")
     logger.info(f"Rate: {stats['processed']/elapsed:.1f} blobs/sec")
