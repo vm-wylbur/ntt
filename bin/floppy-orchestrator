@@ -28,6 +28,27 @@ DEFAULT_DRIVE="B"
 DEFAULT_FORMAT="ibm.1440"
 FLUX_REVS=5
 
+# ---------- duplicate detection ----------
+# Check if content hash already exists in any metadata.json
+# Returns the session_hash if found, empty string if not
+find_existing_content_hash() {
+  local content_hash="$1"
+
+  for meta in "$DISK_ROOT"/*/metadata.json; do
+    [[ -f "$meta" ]] || continue
+    local existing_hash=$(jq -r '.content_hash // ""' "$meta" 2>/dev/null)
+    if [[ "$existing_hash" == "$content_hash" ]]; then
+      local existing_session=$(jq -r '.session_hash' "$meta" 2>/dev/null)
+      local existing_message=$(jq -r '.message' "$meta" 2>/dev/null)
+      local existing_dest=$(jq -r '.dest // "?"' "$meta" 2>/dev/null)
+      echo "$existing_session|$existing_message|$existing_dest"
+      return 0
+    fi
+  done
+  echo ""
+  return 1
+}
+
 # ---------- logging functions ----------
 # NOTE: log_info/log_warn/log_error provided by bash-logger.sh
 
@@ -267,14 +288,21 @@ write_metadata() {
 }
 
 show_disks() {
-  echo "HASH   | N | STATUS  | FLUX | MRGD | SECTORS     | MESSAGE"
-  echo "-------|---|---------|------|------|-------------|$(printf '%.0s-' {1..50})"
+  echo "HASH   | N | STATUS  | FLUX | MRGD | SECTORS     | DEST  | MESSAGE"
+  echo "-------|---|---------|------|------|-------------|-------|$(printf '%.0s-' {1..45})"
 
   # Build index of all reads grouped by content_hash
   local temp_index="/tmp/floppy-index-$$"
   local temp_file="/tmp/floppy-show-$$"
   > "$temp_index"
   > "$temp_file"
+
+  # Dest counters
+  local dest_ntt=0
+  local dest_mjd=0
+  local dest_blank=0
+  local dest_skip=0
+  local dest_unset=0
 
   for meta in "$DISK_ROOT"/*/metadata.json; do
     [[ -f "$meta" ]] || continue
@@ -284,6 +312,7 @@ show_disks() {
     local content_hash=$(jq -r '.content_hash' "$meta" 2>/dev/null || echo "")
     local status=$(jq -r '.read_status' "$meta" 2>/dev/null || echo "unknown")
     local message=$(jq -r '.message' "$meta" 2>/dev/null || echo "")
+    local dest=$(jq -r '.dest // "?"' "$meta" 2>/dev/null || echo "?")
     local sectors_found=$(jq -r '.diagnostics.sectors_found // 0' "$meta" 2>/dev/null || echo "0")
     local sectors_total=$(jq -r '.diagnostics.sectors_total // 0' "$meta" 2>/dev/null || echo "0")
 
@@ -345,10 +374,10 @@ show_disks() {
     [[ "$status" == "failed" ]] && sort_key=1
     [[ "$status" == "partial" ]] && sort_key=2
 
-    # Store in index: message|session_hash|percent|status|flux_status|analyzed_status|sectors_found|sectors_total|sort_key|hash_prefix|dir
-    printf "%s|%s|%d|%s|%s|%s|%d|%d|%d|%s|%s\n" \
+    # Store in index: message|session_hash|percent|status|flux_status|analyzed_status|sectors_found|sectors_total|sort_key|hash_prefix|dir|dest
+    printf "%s|%s|%d|%s|%s|%s|%d|%d|%d|%s|%s|%s\n" \
       "$message" "$session_hash" "$percent" "$status" "$flux_status" "$analyzed_status" \
-      "$sectors_found" "$sectors_total" "$sort_key" "$hash_prefix" "$dir" \
+      "$sectors_found" "$sectors_total" "$sort_key" "$hash_prefix" "$dir" "$dest" \
       >> "$temp_index"
   done
 
@@ -365,8 +394,9 @@ show_disks() {
   local best_sectors_found=0
   local best_sectors_total=0
   local best_sort_key=0
+  local best_dest="?"
 
-  while IFS='|' read -r message session_hash percent status flux_status analyzed_status sectors_found sectors_total sort_key hash_prefix dir; do
+  while IFS='|' read -r message session_hash percent status flux_status analyzed_status sectors_found sectors_total sort_key hash_prefix dir dest; do
     if [[ "$message" != "$prev_message" ]]; then
       # New disk - output previous best if exists
       if [[ -n "$prev_message" ]]; then
@@ -378,15 +408,24 @@ show_disks() {
         local display_analyzed="    "
         [[ "$has_any_analyzed" == "true" ]] && display_analyzed="DONE"
 
-        # Truncate message to 50 characters
+        # Truncate message to 45 characters
         local truncated_message="$prev_message"
-        if [[ ${#truncated_message} -gt 50 ]]; then
-          truncated_message="${truncated_message:0:47}..."
+        if [[ ${#truncated_message} -gt 45 ]]; then
+          truncated_message="${truncated_message:0:42}..."
         fi
 
-        printf "%d|%s | %d | %-7s | %-4s | %-4s | %4d/%4d | %s\n" \
+        # Count dest values
+        case "$best_dest" in
+          ntt) dest_ntt=$((dest_ntt + 1)) ;;
+          mjd) dest_mjd=$((dest_mjd + 1)) ;;
+          blank) dest_blank=$((dest_blank + 1)) ;;
+          skip) dest_skip=$((dest_skip + 1)) ;;
+          *) dest_unset=$((dest_unset + 1)) ;;
+        esac
+
+        printf "%d|%s | %d | %-7s | %-4s | %-4s | %4d/%4d | %-5s | %s\n" \
           "$best_sort_key" "$best_hash_prefix" "$attempt_count" "$best_status" "$display_flux" "$display_analyzed" \
-          "$best_sectors_found" "$best_sectors_total" "$truncated_message" \
+          "$best_sectors_found" "$best_sectors_total" "$best_dest" "$truncated_message" \
           >> "$temp_file"
       fi
 
@@ -398,6 +437,7 @@ show_disks() {
       best_sectors_found=$sectors_found
       best_sectors_total=$sectors_total
       best_sort_key=$sort_key
+      best_dest="$dest"
       attempt_count=1
       has_any_flux=false
       has_any_analyzed=false
@@ -417,6 +457,7 @@ show_disks() {
         best_sectors_found=$sectors_found
         best_sectors_total=$sectors_total
         best_sort_key=$sort_key
+        best_dest="$dest"
       fi
     fi
   done < <(sort -t'|' -k1,1 "$temp_index")
@@ -430,23 +471,32 @@ show_disks() {
     local display_analyzed="    "
     [[ "$has_any_analyzed" == "true" ]] && display_analyzed="DONE"
 
-    # Truncate message to 50 characters
+    # Truncate message to 45 characters
     local truncated_message="$prev_message"
-    if [[ ${#truncated_message} -gt 50 ]]; then
-      truncated_message="${truncated_message:0:47}..."
+    if [[ ${#truncated_message} -gt 45 ]]; then
+      truncated_message="${truncated_message:0:42}..."
     fi
 
-    printf "%d|%s | %d | %-7s | %-4s | %-4s | %4d/%4d | %s\n" \
+    # Count dest values
+    case "$best_dest" in
+      ntt) dest_ntt=$((dest_ntt + 1)) ;;
+      mjd) dest_mjd=$((dest_mjd + 1)) ;;
+      blank) dest_blank=$((dest_blank + 1)) ;;
+      skip) dest_skip=$((dest_skip + 1)) ;;
+      *) dest_unset=$((dest_unset + 1)) ;;
+    esac
+
+    printf "%d|%s | %d | %-7s | %-4s | %-4s | %4d/%4d | %-5s | %s\n" \
       "$best_sort_key" "$best_hash_prefix" "$attempt_count" "$best_status" "$display_flux" "$display_analyzed" \
-      "$best_sectors_found" "$best_sectors_total" "$truncated_message" \
+      "$best_sectors_found" "$best_sectors_total" "$best_dest" "$truncated_message" \
       >> "$temp_file"
   fi
 
   # Count totals by status and flux BEFORE removing temp file
-  local total=$(wc -l < "$temp_file" 2>/dev/null || echo "0")
-  local need_flux=$(grep -c "| NEED |" "$temp_file" 2>/dev/null || echo "0")
-  local has_flux=$(grep -c "| FLUX |" "$temp_file" 2>/dev/null || echo "0")
-  local analyzed=$(grep -c "| DONE |" "$temp_file" 2>/dev/null || echo "0")
+  local total=$(wc -l < "$temp_file" 2>/dev/null | tr -d ' ')
+  local need_flux=$(grep -c "| NEED |" "$temp_file" 2>/dev/null || true)
+  local has_flux=$(grep -c "| FLUX |" "$temp_file" 2>/dev/null || true)
+  local analyzed=$(grep -c "| DONE |" "$temp_file" 2>/dev/null || true)
 
   # Sort and display (failed first, then partial, then success)
   sort -t'|' -k1,1n "$temp_file" | cut -d'|' -f2-
@@ -454,6 +504,47 @@ show_disks() {
 
   echo ""
   echo "Total disks: $total | Need flux: $need_flux | Has flux: $has_flux | Analyzed: $analyzed"
+  echo "Dest: NTT=$dest_ntt | MJD=$dest_mjd | Blank=$dest_blank | Skip=$dest_skip | Unset=$dest_unset"
+}
+
+# ---------- set destination ----------
+set_dest() {
+  local hash_prefix="$1"
+  local dest="$2"
+
+  # Validate dest value
+  if [[ "$dest" != "ntt" && "$dest" != "mjd" && "$dest" != "blank" && "$dest" != "skip" ]]; then
+    echo "Error: dest must be 'ntt', 'mjd', 'blank', or 'skip'" >&2
+    exit 1
+  fi
+
+  # Find matching directory
+  local found_dir=""
+  for dir in "$DISK_ROOT"/*/; do
+    local dirname=$(basename "$dir")
+    if [[ "$dirname" == "$hash_prefix"* ]]; then
+      found_dir="$dir"
+      break
+    fi
+  done
+
+  if [[ -z "$found_dir" ]]; then
+    echo "Error: No disk found matching hash prefix '$hash_prefix'" >&2
+    exit 1
+  fi
+
+  local meta="$found_dir/metadata.json"
+  if [[ ! -f "$meta" ]]; then
+    echo "Error: No metadata.json in $found_dir" >&2
+    exit 1
+  fi
+
+  # Update metadata with dest field
+  local tmp="/tmp/floppy-meta-$$.json"
+  jq --arg dest "$dest" '. + {dest: $dest}' "$meta" > "$tmp" && mv "$tmp" "$meta"
+
+  local full_hash=$(basename "$found_dir")
+  echo "Set dest=$dest for $full_hash"
 }
 
 # ---------- argparse ----------
@@ -462,6 +553,7 @@ usage() {
 Usage:
   $0 --message <description> [options]    # Read a floppy disk
   $0 --show                                # Show status of all disks
+  $0 --set-dest HASH DEST                  # Set destination (ntt|mjd|blank|skip)
 
 Orchestrates floppy disk reading with Greaseweazle.
 Creates session-based directory with .img and metadata.
@@ -471,6 +563,7 @@ Read Mode:
   --seq NUM         Sequence number (for disk sets)
   --drive DRIVE     Floppy drive (default: B)
   --format FORMAT   Disk format (default: ibm.1440)
+  --force           Force imaging even if content hash already exists
 
 Show Mode:
   --show            Display status report of all disks (sorted by status)
@@ -479,6 +572,10 @@ Read Status:
   success  = 100% sectors recovered
   partial  = 95-99% sectors recovered (flux capture also saved)
   failed   = <95% sectors recovered (flux capture also saved)
+
+Duplicate Detection:
+  By default, skips disks with matching content hash (already imaged).
+  Use --force to image anyway.
 
 Flux Capture:
   - Only for partial/failed reads
@@ -509,12 +606,28 @@ SEQUENCE="null"
 DRIVE="$DEFAULT_DRIVE"
 FORMAT="$DEFAULT_FORMAT"
 SHOW_MODE=false
+SET_DEST_MODE=false
+SET_DEST_HASH=""
+SET_DEST_VALUE=""
+FORCE_MODE=false
 
 while [[ $# -gt 0 ]]; do
   case $1 in
     --show)
       SHOW_MODE=true
       shift
+      ;;
+    --set-dest)
+      SET_DEST_MODE=true
+      shift
+      if [[ $# -ge 2 && "$1" != -* && "$2" != -* ]]; then
+        SET_DEST_HASH="$1"
+        SET_DEST_VALUE="$2"
+        shift 2
+      else
+        echo "Error: --set-dest requires HASH and DEST arguments" >&2
+        usage
+      fi
       ;;
     --message)
       shift
@@ -556,6 +669,10 @@ while [[ $# -gt 0 ]]; do
         usage
       fi
       ;;
+    --force)
+      FORCE_MODE=true
+      shift
+      ;;
     -h|--help)
       usage
       ;;
@@ -569,6 +686,12 @@ done
 # Handle --show mode
 if [[ "$SHOW_MODE" == "true" ]]; then
   show_disks
+  exit 0
+fi
+
+# Handle --set-dest mode
+if [[ "$SET_DEST_MODE" == "true" ]]; then
+  set_dest "$SET_DEST_HASH" "$SET_DEST_VALUE"
   exit 0
 fi
 
@@ -630,6 +753,35 @@ main() {
     log_info "Computing content hash..."
     content_hash=$(compute_content_hash "$img_file")
     log_info "Content checksum (disk image): $content_hash"
+
+    # Check for duplicate (skip-known is default behavior)
+    if [[ "$FORCE_MODE" != "true" && -n "$content_hash" ]]; then
+      local existing=$(find_existing_content_hash "$content_hash")
+      if [[ -n "$existing" ]]; then
+        # Parse: session|message|dest
+        local existing_session="${existing%%|*}"
+        local temp="${existing#*|}"
+        local existing_message="${temp%%|*}"
+        local existing_dest="${temp#*|}"
+
+        log_info "======================================"
+        log_info "DUPLICATE DETECTED - Skipping"
+        log_info "======================================"
+        log_info "Already imaged as: $existing_session"
+        log_info "Message: $existing_message"
+        log_info "Dest: $existing_dest"
+
+        # Clean up this session's work directory
+        log_info "Cleaning up duplicate session..."
+        cd "$DISK_ROOT"
+        rm -rf "$work_dir"
+
+        echo ""
+        echo "SKIP: Already imaged as $existing_session ($existing_message) [dest=$existing_dest]"
+        echo "      Use --force to image anyway"
+        exit 0
+      fi
+    fi
   fi
 
   # For partial or failed reads, also capture flux
